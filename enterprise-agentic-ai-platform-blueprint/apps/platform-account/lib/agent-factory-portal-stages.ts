@@ -26,16 +26,24 @@ import {
 } from "@agenticai/agent-factory-portal";
 import {
   AgentFactoryPortalAgentRegistryStack,
+  AgentFactoryPortalDiscoveryRegistryStack,
   AgentFactoryPortalEdgeStack,
   AgentFactoryPortalStack,
 } from "./agent-factory-portal-stack";
-import { AgentFactoryPortalFleetReaderStack } from "../../workload-account/lib/agent-factory-portal-fleet-reader-stack";
+import {
+  AgentFactoryPortalContainmentStack,
+  AgentFactoryPortalExternalReaderStack,
+  AgentFactoryPortalFleetReaderStack,
+} from "../../workload-account/lib/agent-factory-portal-fleet-reader-stack";
 
 export const AGENT_FACTORY_PORTAL_STAGES = [
   "agent-factory-portal-agent-registry",
+  "agent-factory-portal-discovery-registry",
   "agent-factory-portal-edge",
   "agent-factory-portal",
   "agent-factory-portal-fleet-reader",
+  "agent-factory-portal-containment",
+  "agent-factory-portal-external-reader",
 ] as const;
 
 const BLUEPRINT_ROOT = path.resolve(__dirname, "..", "..", "..");
@@ -128,6 +136,20 @@ function registryContext(
   return { id, arn };
 }
 
+function optionalList(app: App, key: string): string[] | undefined {
+  return context(app, key) === undefined ? undefined : listContext(app, key);
+}
+
+function positiveInteger(app: App, key: string): number | undefined {
+  const raw = context(app, key);
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 3650) {
+    throw new Error(`Context ${key} must be a whole number of days between 1 and 3650.`);
+  }
+  return value;
+}
+
 function portalTags(environment: PortalEnvironment): Record<string, string> {
   return {
     "application-id": "agent-factory-portal",
@@ -185,8 +207,20 @@ function cellsContext(app: App, environment: PortalEnvironment): PortalCell[] {
       externalId: text("externalId", true)!,
       alarmNamePrefix: text("alarmNamePrefix", false),
       pipelineName: text("pipelineName", false),
+      accountAlias: text("accountAlias", false),
+      containment: cell.containment === true || cell.containment === "true",
+      omniDomainUrl: httpsUrl(text("omniDomainUrl", false), `agenticai/portalCells[${index}].omniDomainUrl`),
+      omniRegion: text("omniRegion", false),
     };
   });
+}
+
+function httpsUrl(value: string | undefined, key: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (!/^https:\/\/[A-Za-z0-9.-]+(\/[^\s]*)?$/.test(value)) {
+    throw new Error(`${key} must be an https URL.`);
+  }
+  return value;
 }
 
 function builtAsset(app: App, key: string, fallback: string, what: string, marker: string): string {
@@ -228,6 +262,21 @@ export function addAgentFactoryPortalStage(
         },
       );
       for (const [key, value] of Object.entries(portalTags(environment))) Tags.of(stack).add(key, value);
+      return true;
+    }
+    case "agent-factory-portal-discovery-registry": {
+      const account = requireAccount(app, "agenticai/portalAccountId", stage);
+      const retain = context(app, "agenticai/portalRetainData");
+      const stack = new AgentFactoryPortalDiscoveryRegistryStack(
+        app,
+        "AgenticAI-AgentFactoryPortal-DiscoveryRegistry",
+        {
+          env: { account, region: deploymentRegion },
+          retain: retain === undefined ? undefined : retain === true || retain === "true",
+          description: "Agent Factory Portal: organization-scoped discovery Registry.",
+        },
+      );
+      Tags.of(stack).add("application-id", "agent-factory-portal");
       return true;
     }
     case "agent-factory-portal-edge": {
@@ -329,6 +378,14 @@ export function addAgentFactoryPortalStage(
           "agenticai/portalAgentRegistryId",
           "agenticai/portalAgentRegistryArn",
         ),
+        discoveryRegistry: registryContext(
+          app,
+          deploymentRegion,
+          "agenticai/portalDiscoveryRegistryId",
+          "agenticai/portalDiscoveryRegistryArn",
+        ),
+        ownerGroups: optionalList(app, "agenticai/portalOwnerGroups"),
+        inactiveDays: positiveInteger(app, "agenticai/portalInactiveDays"),
         description: `Agent Factory Portal (${environment}): sign-in, read-only API and web hosting.`,
       });
       applyTags(stack, environment);
@@ -358,6 +415,55 @@ export function addAgentFactoryPortalStage(
         },
       );
       applyTags(stack, environment);
+      return true;
+    }
+    case "agent-factory-portal-containment": {
+      const environment = requireEnvironment(app, stage);
+      const cellAccount = requireAccount(app, "agenticai/portalCellAccountId", stage);
+      const platformAccount = requireAccount(app, "agenticai/portalAccountId", stage);
+      const externalId = context(app, "agenticai/portalExternalId");
+      if (typeof externalId !== "string") {
+        throw new Error("agent-factory-portal-containment stage requires context 'agenticai/portalExternalId'.");
+      }
+      const stack = new AgentFactoryPortalContainmentStack(
+        app,
+        `AgenticAI-AgentFactoryPortal-Containment-${environment}`,
+        {
+          env: { account: cellAccount, region: deploymentRegion },
+          environment,
+          platformAccountId: platformAccount,
+          externalId,
+          description: `Agent Factory Portal (${environment}) containment authority for this cell.`,
+        },
+      );
+      for (const [key, value] of Object.entries(portalTags(environment))) Tags.of(stack).add(key, value);
+      return true;
+    }
+    case "agent-factory-portal-external-reader": {
+      const environment = requireEnvironment(app, stage);
+      const account = requireAccount(app, "agenticai/portalCellAccountId", stage);
+      const trusted = requireAccount(app, "agenticai/externalReaderTrustedAccountId", stage);
+      const externalId = context(app, "agenticai/externalReaderExternalId");
+      if (typeof externalId !== "string") {
+        throw new Error(
+          "agent-factory-portal-external-reader stage requires context 'agenticai/externalReaderExternalId'.",
+        );
+      }
+      const principal = context(app, "agenticai/externalReaderTrustedPrincipalArn");
+      const stack = new AgentFactoryPortalExternalReaderStack(
+        app,
+        `AgenticAI-AgentFactoryPortal-ExternalReader-${environment}`,
+        {
+          env: { account, region: deploymentRegion },
+          environment,
+          trustedAccountId: trusted,
+          trustedPrincipalArn: typeof principal === "string" ? principal : undefined,
+          externalId,
+          sourceIpv4Cidrs: optionalList(app, "agenticai/externalReaderSourceCidrs"),
+          description: `Agent Factory Portal (${environment}) read-only inventory role for an external governance tool.`,
+        },
+      );
+      for (const [key, value] of Object.entries(portalTags(environment))) Tags.of(stack).add(key, value);
       return true;
     }
     default:

@@ -1304,6 +1304,7 @@ def portal_role_arns(account: str) -> list[str]:
         # Governed actions (opt-in): the registrar and approver functions.
         iam_arn(account, "role/AgenticAI-RegistryRegistrar-*"),
         iam_arn(account, "role/AgenticAI-RegistryApprover-*"),
+        iam_arn(account, "role/AgenticAI-PortalContainment-*"),
     ]
 
 
@@ -1467,7 +1468,14 @@ def portal_cell_policy(account: str, region: str) -> dict[str, Any]:
         "Version": "2012-10-17",
         "Statement": [
             *portal_iam_statements(
-                account, [iam_arn(account, "role/AgenticAI-PortalFleetReader-*")]
+                account,
+                [
+                    iam_arn(account, "role/AgenticAI-PortalFleetReader-*"),
+                    # Opt-in per cell: containment authority and the external
+                    # inventory reader.
+                    iam_arn(account, "role/AgenticAI-PortalContainmentTarget-*"),
+                    iam_arn(account, "role/AgenticAI-ExternalInventoryReader-*"),
+                ],
             ),
             bootstrap_version_statement(account, [region]),
             read_iam_metadata_statement(),

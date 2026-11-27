@@ -1024,6 +1024,7 @@ def test_portal_policy_is_scoped_to_portal_stacks_roles_and_regions() -> None:
         f"arn:aws:iam::{PLATFORM}:role/AgenticAI-PortalApi-*",
         f"arn:aws:iam::{PLATFORM}:role/AgenticAI-RegistryRegistrar-*",
         f"arn:aws:iam::{PLATFORM}:role/AgenticAI-RegistryApprover-*",
+        f"arn:aws:iam::{PLATFORM}:role/AgenticAI-PortalContainment-*",
     ]
     table = statements["PortalAuditTable"]
     assert table["Resource"] == (
@@ -1080,7 +1081,9 @@ def test_portal_cell_policy_manages_only_the_fleet_reader_role() -> None:
         f"arn:aws:ssm:{REGION}:{WORKSTREAM}:parameter/cdk-bootstrap/*/version"
     ]
     assert statements["ManagePortalRoles"]["Resource"] == [
-        f"arn:aws:iam::{WORKSTREAM}:role/AgenticAI-PortalFleetReader-*"
+        f"arn:aws:iam::{WORKSTREAM}:role/AgenticAI-PortalFleetReader-*",
+        f"arn:aws:iam::{WORKSTREAM}:role/AgenticAI-PortalContainmentTarget-*",
+        f"arn:aws:iam::{WORKSTREAM}:role/AgenticAI-ExternalInventoryReader-*",
     ]
     actions = {
         action

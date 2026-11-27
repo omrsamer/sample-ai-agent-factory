@@ -110,6 +110,8 @@ def build_document(args: argparse.Namespace) -> dict[str, Any]:
     optional = {
         "applicationId": args.application_id,
         "contact": args.contact,
+        "sponsor": args.sponsor,
+        "reviewBy": args.review_by,
         "framework": args.framework,
         "runtimeArn": args.runtime_arn,
         "gatewayArn": args.gateway_arn,
@@ -258,6 +260,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--record-version", required=True, help="semantic version of this record")
     parser.add_argument("--application-id")
     parser.add_argument("--contact")
+    parser.add_argument("--sponsor", help="the accountable person for the agent")
+    parser.add_argument("--review-by", help="date (YYYY-MM-DD) by which the registration must be reviewed again")
     parser.add_argument("--framework")
     parser.add_argument("--golden-path-name")
     parser.add_argument("--golden-path-version")

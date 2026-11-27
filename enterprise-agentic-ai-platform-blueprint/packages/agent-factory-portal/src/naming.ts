@@ -77,3 +77,18 @@ export function registrySsmParameter(
 ): string {
   return `/agenticai/registry/v1/${environment}/${leaf}`;
 }
+
+/** Role of the portal's containment function (Platform account). */
+export function portalContainmentRoleName(environment: PortalEnvironment): string {
+  return `AgenticAI-PortalContainment-${environment}`;
+}
+
+/** Role the containment function assumes in a Workstream cell account. */
+export function portalContainmentTargetRoleName(environment: PortalEnvironment): string {
+  return `AgenticAI-PortalContainmentTarget-${environment}`;
+}
+
+/** Read-only role for an external governance or inventory tool. */
+export function portalExternalReaderRoleName(environment: PortalEnvironment): string {
+  return `AgenticAI-ExternalInventoryReader-${environment}`;
+}

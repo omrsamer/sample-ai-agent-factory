@@ -14,7 +14,9 @@ import { CfnOutput, Stack, type StackProps } from "aws-cdk-lib";
 import { Construct } from "constructs";
 
 import {
+  PortalContainmentTargetRole,
   PortalEnvironment,
+  PortalExternalReaderRole,
   PortalFleetReaderRole,
 } from "@agenticai/agent-factory-portal";
 
@@ -40,5 +42,57 @@ export class AgentFactoryPortalFleetReaderStack extends Stack {
       spansLogGroupNames,
     });
     new CfnOutput(this, "PortalFleetReaderRoleArn", { value: reader.role.roleArn });
+  }
+}
+
+export interface AgentFactoryPortalContainmentStackProps extends StackProps {
+  readonly environment: PortalEnvironment;
+  readonly platformAccountId: string;
+  readonly externalId: string;
+}
+
+/**
+ * Opt-in, per cell: grants the portal's containment function the authority to
+ * block and unblock invocation of this cell's Runtimes and stop their
+ * sessions (see PortalContainmentTargetRole). A cell that does not deploy
+ * this stack cannot be contained from the portal.
+ */
+export class AgentFactoryPortalContainmentStack extends Stack {
+  constructor(scope: Construct, id: string, props: AgentFactoryPortalContainmentStackProps) {
+    const { environment, platformAccountId, externalId, ...stackProps } = props;
+    super(scope, id, stackProps);
+    const target = new PortalContainmentTargetRole(this, "ContainmentTarget", {
+      environment,
+      platformAccountId,
+      externalId,
+    });
+    new CfnOutput(this, "PortalContainmentTargetRoleArn", { value: target.role.roleArn });
+  }
+}
+
+export interface AgentFactoryPortalExternalReaderStackProps extends StackProps {
+  readonly environment: PortalEnvironment;
+  readonly trustedAccountId: string;
+  readonly trustedPrincipalArn?: string;
+  readonly externalId: string;
+  readonly sourceIpv4Cidrs?: readonly string[];
+}
+
+/**
+ * Opt-in, per account: a keyless, read-only inventory role for an external
+ * governance tool (see PortalExternalReaderRole).
+ */
+export class AgentFactoryPortalExternalReaderStack extends Stack {
+  constructor(scope: Construct, id: string, props: AgentFactoryPortalExternalReaderStackProps) {
+    const { environment, trustedAccountId, trustedPrincipalArn, externalId, sourceIpv4Cidrs, ...stackProps } = props;
+    super(scope, id, stackProps);
+    const reader = new PortalExternalReaderRole(this, "ExternalReader", {
+      environment,
+      trustedAccountId,
+      trustedPrincipalArn,
+      externalId,
+      sourceIpv4Cidrs,
+    });
+    new CfnOutput(this, "ExternalInventoryReaderRoleArn", { value: reader.role.roleArn });
   }
 }

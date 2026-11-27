@@ -37,6 +37,7 @@ import {
   PortalIdentityProvider,
   PortalRole,
   portalApiRoleName,
+  portalContainmentTargetRoleName,
   portalFleetReaderRoleName,
 } from "./naming";
 
@@ -57,6 +58,40 @@ export interface PortalCell {
   readonly alarmNamePrefix?: string;
   /** Workload pipeline (in the Platform account) that releases the cell. */
   readonly pipelineName?: string;
+  /** Name shown instead of the account id. */
+  readonly accountAlias?: string;
+  /** The cell has deployed the containment target role (agent-factory-portal-containment stage). */
+  readonly containment?: boolean;
+  /** URL of the cell's CloudWatch Omni domain, for "Open in Omni". */
+  readonly omniDomainUrl?: string;
+  /** Region of the cell's Omni space. */
+  readonly omniRegion?: string;
+}
+
+/** Cell configuration as the portal functions read it (PORTAL_CELLS). */
+export function portalCellsEnvironment(
+  cells: readonly PortalCell[],
+  environment: PortalEnvironment,
+  partition: string,
+): Record<string, unknown>[] {
+  return cells.map((c) => ({
+    tenantId: c.tenantId,
+    agentId: c.agentId,
+    applicationId: c.applicationId,
+    environment: c.environment,
+    accountId: c.accountId,
+    accountAlias: c.accountAlias,
+    region: c.region,
+    readerRoleArn: `arn:${partition}:iam::${c.accountId}:role/${portalFleetReaderRoleName(environment)}`,
+    externalId: c.externalId,
+    alarmNamePrefix: c.alarmNamePrefix,
+    pipelineName: c.pipelineName,
+    containmentRoleArn: c.containment
+      ? `arn:${partition}:iam::${c.accountId}:role/${portalContainmentTargetRoleName(environment)}`
+      : undefined,
+    omniDomainUrl: c.omniDomainUrl,
+    omniRegion: c.omniRegion,
+  }));
 }
 
 /** Read-only Registry actions of the portal API in the Platform account. */
@@ -96,6 +131,15 @@ export interface PortalApiProps {
    * there and tool records from the Platform Registry.
    */
   readonly agentRegistry?: { readonly id: string; readonly arn: string };
+  /**
+   * Organization-scoped discovery Registry (PortalDiscoveryRegistry). When
+   * set, the inventory also shows what AWS Agent Registry detects.
+   */
+  readonly discoveryRegistry?: { readonly id: string; readonly arn: string };
+  /** Owner groups that exist in the identity source; others are flagged ownerless. */
+  readonly ownerGroups?: readonly string[];
+  /** Days without an invocation after which an agent is flagged inactive. */
+  readonly inactiveDays?: number;
   readonly cells: readonly PortalCell[];
   /** Browser origins allowed to call the API. */
   readonly allowedOrigins: readonly string[];
@@ -207,6 +251,9 @@ export class PortalApi extends Construct {
           ...(props.agentRegistry
             ? [props.agentRegistry.arn, `${props.agentRegistry.arn}/record/*`]
             : []),
+          ...(props.discoveryRegistry
+            ? [props.discoveryRegistry.arn, `${props.discoveryRegistry.arn}/record/*`]
+            : []),
         ],
       }),
     );
@@ -274,18 +321,29 @@ export class PortalApi extends Construct {
       );
     }
 
-    const cellsEnv = props.cells.map((c) => ({
-      tenantId: c.tenantId,
-      agentId: c.agentId,
-      applicationId: c.applicationId,
-      environment: c.environment,
-      accountId: c.accountId,
-      region: c.region,
-      readerRoleArn: `arn:${Aws.PARTITION}:iam::${c.accountId}:role/${portalFleetReaderRoleName(props.environment)}`,
-      externalId: c.externalId,
-      alarmNamePrefix: c.alarmNamePrefix,
-      pipelineName: c.pipelineName,
-    }));
+    const cellsEnv = portalCellsEnvironment(props.cells, props.environment, Aws.PARTITION);
+
+    // Omni Context Graph of the portal's own account (the space's READ access
+    // grant for this role is created by operators). Other accounts' spaces
+    // are not reachable: an Omni space is read from its own account only.
+    const omniRegions = [
+      ...new Set(
+        props.cells
+          .filter((c) => c.accountId === stack.account && c.omniRegion)
+          .map((c) => c.omniRegion as string),
+      ),
+    ];
+    if (omniRegions.length > 0) {
+      policy.addStatements(
+        new PolicyStatement({
+          sid: "PortalReadOmniContextGraph",
+          effect: Effect.ALLOW,
+          actions: ["cloudwatch:GetContextGraph"],
+          resources: ["*"],
+          conditions: { StringEquals: { "aws:RequestedRegion": omniRegions } },
+        }),
+      );
+    }
 
     // The function must not start before its permissions exist.
     this.handler = new LambdaFunction(this, "Handler", {
@@ -307,6 +365,9 @@ export class PortalApi extends Construct {
         PORTAL_REGISTRY_ID: props.registryId,
         PORTAL_REGISTRY_REGION: stack.region,
         ...(props.agentRegistry ? { PORTAL_AGENT_REGISTRY_ID: props.agentRegistry.id } : {}),
+        ...(props.discoveryRegistry ? { PORTAL_DISCOVERY_REGISTRY_ID: props.discoveryRegistry.id } : {}),
+        ...(props.ownerGroups ? { PORTAL_OWNER_GROUPS: JSON.stringify(props.ownerGroups) } : {}),
+        ...(props.inactiveDays ? { PORTAL_INACTIVE_DAYS: String(props.inactiveDays) } : {}),
         PORTAL_CELLS: stack.toJsonString(cellsEnv),
         PORTAL_IDENTITY_PROVIDER: props.identityProvider,
         PORTAL_GROUP_ROLE_MAP: JSON.stringify(props.groupRoleMap),

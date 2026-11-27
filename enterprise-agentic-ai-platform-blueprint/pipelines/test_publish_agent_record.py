@@ -94,7 +94,10 @@ def test_document_carries_required_and_optional_fields_and_matches_the_schema():
         "--subscribed-tool-id", "tool-ping", "--subscribed-tool-id", "tool-echo", "--subscribed-tool-id", "tool-echo",
         "--golden-path-name", "agenticai-task-agent", "--golden-path-version", "1.2.0",
         "--evaluation-verdict", "passed", "--evaluation-run-id", "exec-1",
+        "--sponsor", "jane.doe@example.com", "--review-by", "2027-06-30",
     )
+    assert doc["sponsor"] == "jane.doe@example.com"
+    assert doc["reviewBy"] == "2027-06-30"
     assert doc["schemaVersion"] == "agenticai.agent-governance/1.0"
     assert doc["subscribedToolIds"] == ["tool-echo", "tool-ping"]
     assert doc["goldenPath"] == {"name": "agenticai-task-agent", "version": "1.2.0"}
@@ -110,6 +113,7 @@ def test_document_carries_required_and_optional_fields_and_matches_the_schema():
         (["--record-version", "v1"], "recordVersion does not match"),
         (["--golden-path-name", "only-name"], "go together"),
         (["--policy-engine-mode", "MAYBE"], "policyEngineMode must be one of"),
+        (["--review-by", "next year"], "reviewBy does not match"),
     ],
 )
 def test_invalid_input_is_refused_before_any_call(extra, message):

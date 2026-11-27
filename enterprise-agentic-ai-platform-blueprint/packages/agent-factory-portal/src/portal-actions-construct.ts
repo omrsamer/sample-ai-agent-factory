@@ -2,7 +2,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: MIT-0
  */
-import { Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
+import { Aws, Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
 import { HttpApi, HttpMethod, IHttpRouteAuthorizer } from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import { AttributeType, BillingMode, Table, TableEncryption } from "aws-cdk-lib/aws-dynamodb";
@@ -12,7 +12,13 @@ import { Architecture, Code, Function as LambdaFunction, Runtime, Tracing } from
 import { LogGroup, RetentionDays } from "aws-cdk-lib/aws-logs";
 import { NagSuppressions } from "cdk-nag";
 import { Construct } from "constructs";
-import { PortalEnvironment, PortalRole } from "./naming";
+import {
+  PortalEnvironment,
+  PortalRole,
+  portalContainmentRoleName,
+  portalContainmentTargetRoleName,
+} from "./naming";
+import { PortalCell, portalCellsEnvironment } from "./portal-api-construct";
 
 /**
  * Registry actions of the registrar function. It can create, change, submit
@@ -106,15 +112,21 @@ export interface PortalActionsProps {
   readonly allowedOrigins: readonly string[];
   readonly logRetention?: RetentionDays;
   readonly logsKey?: IKey;
+  /** Cells; those with `containment` set can be contained from the portal. */
+  readonly cells?: readonly PortalCell[];
 }
 
 interface ActionFunctionSpec {
   readonly id: string;
-  readonly actionRole: "registrar" | "approver";
+  readonly actionRole: "registrar" | "approver" | "containment";
   readonly roleName: string;
   readonly handler: string;
-  readonly registryActions: readonly string[];
+  /** Registry actions on the agent Registry, when the function writes records. */
+  readonly registryActions?: readonly string[];
   readonly auditActions: readonly string[];
+  /** Extra statements of this function only. */
+  readonly statements?: PolicyStatement[];
+  readonly environment?: Record<string, string>;
   readonly description: string;
 }
 
@@ -128,6 +140,8 @@ interface ActionFunctionSpec {
 export class PortalActions extends Construct {
   readonly registrarRole: Role;
   readonly approverRole: Role;
+  /** Present when at least one cell has deployed the containment target role. */
+  readonly containmentRole?: Role;
 
   constructor(scope: Construct, id: string, props: PortalActionsProps) {
     super(scope, id);
@@ -161,12 +175,17 @@ export class PortalActions extends Construct {
             actions: ["xray:PutTraceSegments", "xray:PutTelemetryRecords"],
             resources: ["*"],
           }),
-          new PolicyStatement({
-            sid: "RegistryRecords",
-            effect: Effect.ALLOW,
-            actions: [...spec.registryActions],
-            resources: [props.registryArn, recordsArn],
-          }),
+          ...(spec.registryActions
+            ? [
+                new PolicyStatement({
+                  sid: "RegistryRecords",
+                  effect: Effect.ALLOW,
+                  actions: [...spec.registryActions],
+                  resources: [props.registryArn, recordsArn],
+                }),
+              ]
+            : []),
+          ...(spec.statements ?? []),
           new PolicyStatement({
             sid: "AuditTrail",
             effect: Effect.ALLOW,
@@ -197,6 +216,7 @@ export class PortalActions extends Construct {
           PORTAL_GROUP_ROLE_MAP: JSON.stringify(props.groupRoleMap),
           PORTAL_GROUP_TENANT_MAP: JSON.stringify(props.groupTenantMap),
           PORTAL_ALLOWED_ORIGINS: stack.toJsonString(props.allowedOrigins),
+          ...(spec.environment ?? {}),
         },
       });
       fn.node.addDependency(policy);
@@ -267,6 +287,54 @@ export class PortalActions extends Construct {
     });
     this.registrarRole = registrar.role;
     this.approverRole = approver.role;
+
+    // Incident containment: its own function and role. The role can only
+    // assume the containment target role of cells that deployed one, and
+    // append to and read the audit trail. It holds no AgentCore permission of
+    // its own and no Registry permission.
+    const containmentCells = (props.cells ?? []).filter((c) => c.containment);
+    if (containmentCells.length > 0) {
+      const targets = [
+        ...new Set(
+          containmentCells.map(
+            (c) =>
+              `arn:${Aws.PARTITION}:iam::${c.accountId}:role/${portalContainmentTargetRoleName(props.environment)}`,
+          ),
+        ),
+      ];
+      const containment = build({
+        id: "Containment",
+        actionRole: "containment",
+        roleName: portalContainmentRoleName(props.environment),
+        handler: "containment_handler.handler",
+        auditActions: PORTAL_APPROVER_AUDIT_ACTIONS,
+        statements: [
+          new PolicyStatement({
+            sid: "AssumeCellContainmentTarget",
+            effect: Effect.ALLOW,
+            actions: ["sts:AssumeRole"],
+            resources: targets,
+          }),
+        ],
+        environment: {
+          PORTAL_CELLS: stack.toJsonString(
+            portalCellsEnvironment(props.cells ?? [], props.environment, Aws.PARTITION),
+          ),
+        },
+        description:
+          "Agent Factory Portal containment: blocks and unblocks invocation of a Runtime and stops its sessions, through the containment target role of the agent's cell. Cannot invoke, change or delete anything.",
+      });
+      this.containmentRole = containment.role;
+      const containmentIntegration = new HttpLambdaIntegration("PortalContainment", containment.fn);
+      for (const action of ["contain", "release"]) {
+        props.httpApi.addRoutes({
+          path: `/api/v1/agents/{agent_id}/containment/${action}`,
+          methods: [HttpMethod.POST],
+          integration: containmentIntegration,
+          authorizer: props.authorizer,
+        });
+      }
+    }
 
     const registrarIntegration = new HttpLambdaIntegration("PortalRegistrar", registrar.fn);
     const approverIntegration = new HttpLambdaIntegration("PortalApprover", approver.fn);

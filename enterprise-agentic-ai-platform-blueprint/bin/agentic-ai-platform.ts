@@ -1974,9 +1974,12 @@ switch (stage) {
     break;
   }
   case "agent-factory-portal-agent-registry":
+  case "agent-factory-portal-discovery-registry":
   case "agent-factory-portal-edge":
   case "agent-factory-portal":
-  case "agent-factory-portal-fleet-reader": {
+  case "agent-factory-portal-fleet-reader":
+  case "agent-factory-portal-containment":
+  case "agent-factory-portal-external-reader": {
     // Agent Factory Portal (opt-in): edge web ACL, portal, and the read-only
     // fleet reader role of a Workstream cell. See docs/AGENT_FACTORY_PORTAL.md.
     addAgentFactoryPortalStage(app, stage, deploymentRegion());
@@ -1984,11 +1987,11 @@ switch (stage) {
   }
   case undefined:
     throw new Error(
-      "Missing required CDK context 'stage'. Pass --context stage=<management|omni-domain|omni-hub-keys|omni-hub|platform|workload|sandbox|d03-platform|d03-workload|d03-workstream-gateway|pipeline|workload-inference|runtime-router|gap-closure|agent-factory-portal-agent-registry|agent-factory-portal-edge|agent-factory-portal|agent-factory-portal-fleet-reader>.",
+      "Missing required CDK context 'stage'. Pass --context stage=<management|omni-domain|omni-hub-keys|omni-hub|platform|workload|sandbox|d03-platform|d03-workload|d03-workstream-gateway|pipeline|workload-inference|runtime-router|gap-closure|agent-factory-portal-agent-registry|agent-factory-portal-discovery-registry|agent-factory-portal-edge|agent-factory-portal|agent-factory-portal-fleet-reader|agent-factory-portal-containment|agent-factory-portal-external-reader>.",
     );
   default:
     throw new Error(
-      `Unknown stage '${stage}'. Valid stages: management | omni-domain | omni-hub-keys | omni-hub | platform | workload | sandbox | d03-platform | d03-workload | d03-workstream-gateway | pipeline | workload-inference | runtime-router | gap-closure | agent-factory-portal-agent-registry | agent-factory-portal-edge | agent-factory-portal | agent-factory-portal-fleet-reader.`,
+      `Unknown stage '${stage}'. Valid stages: management | omni-domain | omni-hub-keys | omni-hub | platform | workload | sandbox | d03-platform | d03-workload | d03-workstream-gateway | pipeline | workload-inference | runtime-router | gap-closure | agent-factory-portal-agent-registry | agent-factory-portal-discovery-registry | agent-factory-portal-edge | agent-factory-portal | agent-factory-portal-fleet-reader | agent-factory-portal-containment | agent-factory-portal-external-reader.`,
     );
 }
 

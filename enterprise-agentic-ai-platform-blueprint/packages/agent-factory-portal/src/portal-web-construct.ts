@@ -16,7 +16,6 @@ import {
   HttpVersion,
   PriceClass,
   ResponseHeadersPolicy,
-  SecurityPolicyProtocol,
   ViewerProtocolPolicy,
 } from "aws-cdk-lib/aws-cloudfront";
 import { S3BucketOrigin } from "aws-cdk-lib/aws-cloudfront-origins";
@@ -133,7 +132,6 @@ export class PortalWebHosting extends Construct {
       comment: `Agent Factory Portal (${props.environment})`,
       defaultRootObject: "index.html",
       httpVersion: HttpVersion.HTTP2_AND_3,
-      minimumProtocolVersion: SecurityPolicyProtocol.TLS_V1_2_2021,
       priceClass: PriceClass.PRICE_CLASS_100,
       webAclId: props.webAclArn,
       enableLogging: true,
@@ -199,7 +197,7 @@ export class PortalWebHosting extends Construct {
         {
           id: "AwsSolutions-CFR4",
           reason:
-            "SEC-043: the distribution uses the default CloudFront certificate, for which CloudFront fixes the viewer security policy; a deployment with its own domain and certificate gets TLS 1.2 (2021) from minimumProtocolVersion.",
+            "SEC-043: the distribution uses the default CloudFront certificate, for which CloudFront fixes the viewer security policy; a deployment that adds its own domain and certificate sets a TLS 1.2 (2021) minimum there.",
         },
       ],
       true,

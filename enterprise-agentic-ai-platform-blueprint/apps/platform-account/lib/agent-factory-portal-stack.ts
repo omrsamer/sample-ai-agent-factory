@@ -33,6 +33,7 @@ import {
   PortalAgentRegistry,
   PortalApi,
   PortalAuditTrail,
+  PortalDiscoveryRegistry,
   PortalCell,
   PortalCognitoIdentity,
   PortalEdgeWebAcl,
@@ -114,6 +115,12 @@ export interface AgentFactoryPortalStackProps extends StackProps {
    * record is approved automatically and would never reach an approver.
    */
   readonly agentRegistry?: { readonly id: string; readonly arn: string };
+  /** Organization-scoped discovery Registry (agent-factory-portal-discovery-registry stage). */
+  readonly discoveryRegistry?: { readonly id: string; readonly arn: string };
+  /** Owner groups that exist in the identity source; others are flagged ownerless. */
+  readonly ownerGroups?: readonly string[];
+  /** Days without an invocation after which an agent is flagged inactive. */
+  readonly inactiveDays?: number;
   /**
    * Registry the portal reads and, with governed actions, writes agent
    * records to. Defaults to the Platform Registry of the environment
@@ -146,6 +153,9 @@ export class AgentFactoryPortalStack extends Stack {
       governedActions,
       registry,
       agentRegistry,
+      discoveryRegistry,
+      ownerGroups,
+      inactiveDays,
       ...stackProps
     } = props;
     super(scope, id, stackProps);
@@ -235,6 +245,9 @@ export class AgentFactoryPortalStack extends Stack {
       auditTable: audit?.table,
       groupTenantMap: governedActions?.groupTenantMap,
       agentRegistry,
+      discoveryRegistry,
+      ownerGroups,
+      inactiveDays,
     });
 
     if (governedActions && audit) {
@@ -251,7 +264,14 @@ export class AgentFactoryPortalStack extends Stack {
         groupTenantMap: governedActions.groupTenantMap,
         allowedOrigins: [web.origin],
         logsKey,
+        cells,
       });
+      if (actions.containmentRole) {
+        new CfnOutput(this, "PortalContainmentRoleArn", {
+          value: actions.containmentRole.roleArn,
+          description: "The only principal each cell's containment target role trusts.",
+        });
+      }
       new CfnOutput(this, "PortalRegistrarRoleArn", { value: actions.registrarRole.roleArn });
       new CfnOutput(this, "PortalApproverRoleArn", {
         value: actions.approverRole.roleArn,
@@ -303,6 +323,31 @@ export class AgentFactoryPortalAgentRegistryStack extends Stack {
     new CfnOutput(this, "PortalAgentRegistryArn", {
       value: registry.registryArn,
       description: "Pass to the agent-factory-portal stage as agenticai/portalAgentRegistryArn.",
+    });
+  }
+}
+
+export interface AgentFactoryPortalDiscoveryRegistryStackProps extends StackProps {
+  readonly retain?: boolean;
+}
+
+/**
+ * Organization-scoped discovery Registry (see PortalDiscoveryRegistry).
+ * Deployed by operators into the account registered as delegated
+ * administrator for AWS Agent Registry.
+ */
+export class AgentFactoryPortalDiscoveryRegistryStack extends Stack {
+  constructor(scope: Construct, id: string, props: AgentFactoryPortalDiscoveryRegistryStackProps = {}) {
+    const { retain, ...stackProps } = props;
+    super(scope, id, stackProps);
+    const registry = new PortalDiscoveryRegistry(this, "DiscoveryRegistry", { retain });
+    new CfnOutput(this, "PortalDiscoveryRegistryId", {
+      value: registry.registryId,
+      description: "Pass to the agent-factory-portal stage as agenticai/portalDiscoveryRegistryId.",
+    });
+    new CfnOutput(this, "PortalDiscoveryRegistryArn", {
+      value: registry.registryArn,
+      description: "Pass to the agent-factory-portal stage as agenticai/portalDiscoveryRegistryArn.",
     });
   }
 }

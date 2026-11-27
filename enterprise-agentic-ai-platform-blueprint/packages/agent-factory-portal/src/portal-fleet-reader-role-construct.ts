@@ -37,6 +37,8 @@ export const PORTAL_FLEET_READER_AGENTCORE_ACTIONS: readonly string[] = [
   "bedrock-agentcore:ListTagsForResource",
   "bedrock-agentcore:ListPolicies",
   "bedrock-agentcore:GetPolicy",
+  // Whether a Runtime is contained (the deny statement is in its policy).
+  "bedrock-agentcore:GetResourcePolicy",
 ];
 
 /** CloudWatch reads. Alarm reads take alarm ARNs; metric data has no resource type. */

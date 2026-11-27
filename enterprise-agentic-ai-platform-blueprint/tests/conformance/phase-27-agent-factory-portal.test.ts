@@ -404,9 +404,12 @@ describe("Phase 27 — stage routing is opt-in", () => {
   it("handles only the portal stages", () => {
     expect([...AGENT_FACTORY_PORTAL_STAGES]).toEqual([
       "agent-factory-portal-agent-registry",
+      "agent-factory-portal-discovery-registry",
       "agent-factory-portal-edge",
       "agent-factory-portal",
       "agent-factory-portal-fleet-reader",
+      "agent-factory-portal-containment",
+      "agent-factory-portal-external-reader",
     ]);
     expect(addAgentFactoryPortalStage(new App(), "platform", REGION)).toBe(false);
   });
