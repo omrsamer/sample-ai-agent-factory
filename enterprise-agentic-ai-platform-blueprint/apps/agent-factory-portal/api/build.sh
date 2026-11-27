@@ -24,7 +24,7 @@ mkdir -p dist
   -r requirements.txt
 
 cp -R portal_api dist/portal_api
-cp handler.py registrar_handler.py approver_handler.py dist/
+cp handler.py registrar_handler.py approver_handler.py containment_handler.py dist/
 mkdir -p dist/schemas
 cp schemas/*.json dist/schemas/
 

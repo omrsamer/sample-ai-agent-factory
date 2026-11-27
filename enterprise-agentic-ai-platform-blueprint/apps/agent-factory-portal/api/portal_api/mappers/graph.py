@@ -31,7 +31,7 @@ def derive_links(entry: AgentEntry, gateways: list[GatewayEntry]) -> list[Gatewa
     tags all equal the runtime's. Nothing derivable means no links.
     """
     runtime = entry.runtime
-    if runtime is None:
+    if runtime is None or runtime.cell is None:
         return []
     same_scope = [g for g in gateways if g.cell.scope == runtime.cell.scope]
     if runtime.gateway_url:

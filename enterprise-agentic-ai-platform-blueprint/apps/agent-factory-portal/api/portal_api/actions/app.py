@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""FastAPI applications of the two action functions.
+"""FastAPI applications of the action functions (registrar, approver, containment).
 
 Each function serves only its own routes. Anything else, including the other
 function's routes and every read route, is answered with 404. A function whose
@@ -24,12 +24,19 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from portal_api.actions.containment_flow import ContainmentService
 from portal_api.actions.engine import ActionEngine, ActionError
-from portal_api.aws.session import BOTO_CONFIG
+from portal_api.aws.session import BOTO_CONFIG, AwsClients
 from portal_api.config import ACTION_ROLES, ActionSettings, ConfigError, get_action_settings
 from portal_api.identity.deps import principal_from_request
 from portal_api.identity.provider import NotAuthenticated, NotAuthorized, Principal
-from portal_api.models.portal import ActionResult, DecisionInput, RegistrationInput
+from portal_api.models.portal import (
+    ActionResult,
+    ContainmentInput,
+    ContainmentResult,
+    DecisionInput,
+    RegistrationInput,
+)
 
 logger = logging.getLogger("portal_api.actions")
 
@@ -130,6 +137,43 @@ def _approver_router() -> APIRouter:
     return router
 
 
+def containment_clients(settings: ActionSettings = Depends(get_action_settings)) -> Any:
+    """Assumed-role clients for the cells' containment roles, reused across invocations."""
+    key = f"containment:{settings.registry_region}"
+    with _lock:
+        if key not in _clients:
+            _clients[key] = AwsClients(home_region=settings.registry_region)
+        return _clients[key]
+
+
+def containment_service(
+    settings: ActionSettings = Depends(get_action_settings),
+    principal: Principal = Depends(action_principal),
+    registry: Any = Depends(registry_client),
+    dynamodb: Any = Depends(dynamodb_client),
+    clients: Any = Depends(containment_clients),
+) -> ContainmentService:
+    return ContainmentService(settings, clients, registry, dynamodb, principal)
+
+
+Containment = Annotated[ContainmentService, Depends(containment_service)]
+AgentId = Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")]
+
+
+def _containment_router() -> APIRouter:
+    router = APIRouter(prefix="/agents", tags=["containment"])
+
+    @router.post("/{agent_id}/containment/contain", response_model=ContainmentResult)
+    def contain(agent_id: AgentId, body: ContainmentInput, service: Containment) -> ContainmentResult:
+        return service.run("contain", agent_id, body)
+
+    @router.post("/{agent_id}/containment/release", response_model=ContainmentResult)
+    def release(agent_id: AgentId, body: ContainmentInput, service: Containment) -> ContainmentResult:
+        return service.run("release", agent_id, body)
+
+    return router
+
+
 def _allowed_origins() -> list[str]:
     try:
         origins = json.loads(os.environ.get("PORTAL_ALLOWED_ORIGINS") or "[]")
@@ -140,7 +184,7 @@ def _allowed_origins() -> list[str]:
 
 def create_action_app(role: str) -> FastAPI:
     if role not in ACTION_ROLES:
-        raise ValueError("role must be registrar or approver")
+        raise ValueError("role must be registrar, approver or containment")
     logging.getLogger().setLevel(os.environ.get("PORTAL_LOG_LEVEL", "INFO"))
     app = FastAPI(
         title=f"Agent Factory Portal {role} API", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None
@@ -151,7 +195,7 @@ def create_action_app(role: str) -> FastAPI:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=origins,
-            allow_methods=["POST", "PUT", "DELETE"] if role == "registrar" else ["POST"],
+            allow_methods=["POST", "PUT", "DELETE"] if role == "registrar" else ["POST"],  # approver, containment
             allow_headers=["authorization", "content-type"],
             max_age=600,
         )
@@ -187,5 +231,6 @@ def create_action_app(role: str) -> FastAPI:
         ]
         return JSONResponse({"detail": detail}, status_code=422)
 
-    app.include_router(_registrar_router() if role == "registrar" else _approver_router(), prefix=API_PREFIX)
+    routers = {"registrar": _registrar_router, "approver": _approver_router, "containment": _containment_router}
+    app.include_router(routers[role](), prefix=API_PREFIX)
     return app

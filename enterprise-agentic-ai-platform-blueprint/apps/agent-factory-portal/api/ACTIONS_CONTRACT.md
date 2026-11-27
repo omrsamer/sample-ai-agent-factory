@@ -37,7 +37,8 @@ Rules the functions enforce (the reason text is returned in `detail`):
   `platform` role (`REG-11-N`). The submitter is whoever last submitted it through the portal.
 - On an APPROVED record, an update that changes `runtime_arn`, `gateway_arn`,
   `subscribed_tool_ids`, `risk_class` or `data_classification` is refused
-  (`REG-12-N`, with a `hint`). Register a new record instead.
+  (`REG-12-N`, with a `hint`). Register a new record instead. `sponsor` and
+  `review_by` are not governed: changing them is an ordinary update.
 
 ## Record status
 
@@ -96,6 +97,8 @@ interface RegistrationDocument {
   record_version: string;
   application_id?: string;
   contact?: string;
+  sponsor?: string;                // the accountable person (name or email)
+  review_by?: string;              // YYYY-MM-DD: when the registration must be reviewed again
   framework?: string;
   golden_path?: { name: string; version: string };
   runtime_arn?: string;
@@ -120,6 +123,8 @@ interface RegistrationInput {
   cost_centre: string;             // 1 to 128 characters
   application_id?: string | null;  // 1 to 128 characters
   contact?: string | null;         // 1 to 256 characters
+  sponsor?: string | null;         // 1 to 256 characters; the accountable person
+  review_by?: string | null;       // YYYY-MM-DD and a real calendar date
   framework?: string | null;       // up to 64 characters
   golden_path?: { name: string; version: string } | null;
   runtime_arn?: string | null;     // an AgentCore runtime ARN

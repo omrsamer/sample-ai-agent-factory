@@ -33,6 +33,8 @@ class UserInfo(BaseModel):
     # Which registration actions to offer. The action functions enforce this themselves.
     can_register: bool = False
     can_approve: bool = False
+    can_contain: bool = False
+    can_release: bool = False  # still subject to the two-person rule, see contained_by_me
     authorities: list[str] = Field(default_factory=list)  # "registrar", "approver"
     # Tenants the caller acts for: ["*"] for every tenant, null when the read API is not told.
     registration_tenants: list[str] | None = None
@@ -50,6 +52,8 @@ class AgentGovernance(BaseModel):
     environment: str | None = None
     owner_group: str | None = None
     contact: str | None = None
+    sponsor: str | None = None  # the accountable person
+    review_by: str | None = None  # YYYY-MM-DD
     business_purpose: str | None = None
     risk_class: str | None = None
     data_classification: str | None = None
@@ -65,6 +69,29 @@ class AgentGovernance(BaseModel):
     source_revision: str | None = None
     evaluation: dict[str, Any] | None = None
     record_version: str | None = None
+
+
+class AgentFlags(BaseModel):
+    """Portal addition. Each flag is true, false, or null when it cannot be known."""
+
+    unmanaged: bool | None = None  # no APPROVED registration
+    ownerless: bool | None = None  # registered, but no accountable owner
+    review_overdue: bool | None = None  # the registration's review date has passed
+    inactive: bool | None = None  # no invocation in the inactivity window
+    contained: bool | None = None  # the Runtime's resource policy holds the containment statement
+
+
+class RiskReason(BaseModel):
+    code: str
+    severity: str  # low | medium | high | critical
+    detail: str
+
+
+class AgentRisk(BaseModel):
+    """Portal addition. ``level`` is the highest severity among ``reasons``; ``low`` when there are none."""
+
+    level: str = "low"
+    reasons: list[RiskReason] = Field(default_factory=list)
 
 
 class Agent(BaseModel):
@@ -97,6 +124,20 @@ class Agent(BaseModel):
     created_by: str | None = None
     # portal additions
     registration: Literal["registered", "discovered"] = "registered"
+    # registered_and_detected | registered_only | detected_only
+    inventory_state: str = "registered_only"
+    detection_sources: list[str] = Field(default_factory=list)  # organization_registry, cell_reader
+    inbound_authorizer: str | None = None  # "AWS_IAM" | "CUSTOM_JWT"; null when not known
+    flags: AgentFlags = Field(default_factory=AgentFlags)
+    risk: AgentRisk = Field(default_factory=AgentRisk)
+    last_invoked_on: str | None = None  # last day with an invocation inside the inactivity window
+    sponsor: str | None = None  # the accountable person, from the registration
+    review_by: str | None = None  # YYYY-MM-DD, from the registration
+    omni_url: str | None = None  # the cell account's CloudWatch Omni domain, to link out to
+    account_alias: str | None = None  # the configured alias of the agent's account; null when none is configured
+    # "ok", "unreachable" (a reader is configured but could not be used) or "none" (no reader in the
+    # agent's account: status, traces, metrics and containment state cannot be read).
+    reader_status: str = "none"
     record_name: str | None = None  # the registry record's name, for a registered agent
     registry_status: str | None = None
     environment: str | None = None
@@ -339,6 +380,7 @@ class McpServer(BaseModel):
     environment: str | None = None
     account_id: str | None = None
     agent_id: str | None = None
+    detection_sources: list[str] = Field(default_factory=list)  # organization_registry, cell_reader
 
 
 class CedarPolicyRow(BaseModel):

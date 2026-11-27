@@ -12,6 +12,8 @@ from collections.abc import Iterable, Mapping
 
 REGISTRAR_ROLES = frozenset({"platform", "developer"})
 APPROVER_ROLES = frozenset({"platform", "approver", "security"})
+CONTAIN_ROLES = frozenset({"security", "platform", "sre"})
+RELEASE_ROLES = frozenset({"security", "platform"})
 ALL_TENANTS = "*"
 
 

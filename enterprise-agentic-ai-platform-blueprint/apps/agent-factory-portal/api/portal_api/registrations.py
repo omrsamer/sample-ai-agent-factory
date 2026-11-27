@@ -8,6 +8,7 @@ JSON, the same record name and the same schema.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import re
@@ -46,6 +47,7 @@ _SNAKE = {
     "policyEngineMode": "policy_engine_mode",
     "sourceRevision": "source_revision",
     "recordVersion": "record_version",
+    "reviewBy": "review_by",
     "runId": "run_id",
     "completedAt": "completed_at",
 }
@@ -177,6 +179,8 @@ def build_document(body: RegistrationInput, record_version: str) -> dict[str, An
     optional = {
         "applicationId": body.application_id,
         "contact": body.contact,
+        "sponsor": body.sponsor,
+        "reviewBy": body.review_by,
         "framework": body.framework,
         "runtimeArn": body.runtime_arn,
         "gatewayArn": body.gateway_arn,
@@ -198,6 +202,12 @@ def build_document(body: RegistrationInput, record_version: str) -> dict[str, An
             evaluation["completedAt"] = body.evaluation.completed_at
         document["evaluation"] = evaluation
     validate_document(document)
+    review_by = document.get("reviewBy")
+    if review_by is not None:
+        try:
+            dt.date.fromisoformat(review_by)
+        except ValueError as exc:
+            raise DocumentError("document.reviewBy is not a calendar date", "document.reviewBy") from exc
     return document
 
 

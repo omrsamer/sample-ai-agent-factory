@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 
+from portal_api import export
 from portal_api.deps import CurrentPrincipal, EntityId, Service
+from portal_api.models.portal import ContainmentView
 from portal_api.models.wire import (
     Agent,
     AgentMcpGrant,
@@ -46,6 +49,29 @@ def list_agents(
         if value is not None:
             agents = [a for a in agents if getattr(a, name) == value]
     return agents
+
+
+@router.get("/export")
+def export_agents(
+    _: CurrentPrincipal,
+    service: Service,
+    format: Annotated[str, Query(pattern="^(csv|json)$")] = "csv",  # noqa: A002 - the query parameter's name
+) -> Response:
+    """The whole inventory as a downloadable file. Declared before the agent id route on purpose."""
+    rows = service.export_rows()
+    stamp = dt.datetime.now(dt.UTC).date().isoformat()
+    if format == "json":
+        body, media_type = export.to_json(rows), "application/json"
+    else:
+        body, media_type = export.to_csv(rows), "text/csv; charset=utf-8"
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="agents-{stamp}.{format}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get("/{agent_id}", response_model=Agent)
@@ -98,6 +124,11 @@ def metrics(
 @router.get("/{agent_id}/evals/runs", response_model=EvalRuns)
 def eval_runs(agent_id: EntityId, _: CurrentPrincipal, service: Service) -> EvalRuns:
     return service.eval_runs(agent_id)
+
+
+@router.get("/{agent_id}/containment", response_model=ContainmentView)
+def containment(agent_id: EntityId, principal: CurrentPrincipal, service: Service) -> ContainmentView:
+    return service.containment_view(agent_id, principal.subject)
 
 
 @router.get("/{agent_id}/mcp-grants", response_model=list[AgentMcpGrant])

@@ -38,6 +38,7 @@ CELLS = [
         "readerRoleArn": f"arn:aws:iam::{CELL_ACCOUNT}:role/agenticai-portal-reader",
         "externalId": "portal-ext-id",
         "pipelineName": "agenticai-workload-ws1-travel-agent",
+        "containmentRoleArn": f"arn:aws:iam::{CELL_ACCOUNT}:role/agenticai-portal-containment",
     },
     {
         "tenantId": "ws2",
@@ -64,6 +65,8 @@ BASE_ENV = {
             "devs2": "developer",
             "approvers": "approver",
             "approvers2": "approver",
+            "sre-team": "sre",
+            "sre-team2": "sre",
             "viewers": "readonly",
         }
     ),
@@ -75,6 +78,8 @@ BASE_ENV = {
             "devs2": ["ws2"],
             "approvers": ["ws1"],
             "approvers2": ["ws2"],
+            "sre-team": ["ws1"],
+            "sre-team2": ["ws2"],
         }
     ),
     "PORTAL_AUDIT_TABLE": "agenticai-portal-audit-test",
@@ -134,6 +139,8 @@ def agent_document(**overrides: Any) -> dict[str, Any]:
         "environment": "nonprod",
         "ownerGroup": "travel-owners",
         "contact": "travel-owners@example.com",
+        "sponsor": "Sam Sponsor",
+        "reviewBy": "2099-12-31",
         "businessPurpose": "Plans trips for employees.",
         "riskClass": "limited",
         "dataClassification": "confidential",

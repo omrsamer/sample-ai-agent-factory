@@ -10,33 +10,41 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from botocore.exceptions import ClientError
 
 from portal_api import registrations as registration_helpers
-from portal_api.aws import agentcore, cloudwatch, guardrails, logs, pipelines, registry
+from portal_api import risk
+from portal_api.aws import agentcore, cloudwatch, guardrails, logs, omni, pipelines, registry
 from portal_api.aws import audit as audit_reader
 from portal_api.aws.cache import TTLCache
 from portal_api.aws.parallel import pmap
 from portal_api.aws.session import AwsClients, error_code
 from portal_api.config import Cell, ConfigError, Settings
 from portal_api.mappers import agents as agent_mapper
+from portal_api.mappers import discovery as discovery_mapper
 from portal_api.mappers import graph as graph_mapper
 from portal_api.mappers import guardrails as guardrail_mapper
 from portal_api.mappers import health as health_mapper
 from portal_api.mappers import mcp as mcp_mapper
 from portal_api.mappers import observability as observability_mapper
+from portal_api.mappers import omni as omni_mapper
 from portal_api.mappers import registry as registry_mapper
 from portal_api.mappers import release as release_mapper
 from portal_api.mappers.agents import AgentEntry, Runtime
 from portal_api.mappers.common import arn_parts, arn_resource_id, now_iso
 from portal_api.mappers.mcp import GatewayEntry
 from portal_api.models.portal import (
+    AgentAttention,
     CatalogModel,
     CatalogTool,
+    ContainmentView,
     FleetHealth,
+    FleetSummary,
+    ObservedServices,
+    OmniDomain,
     Registration,
     RegistrationDetail,
     RegistrationHistory,
@@ -45,6 +53,7 @@ from portal_api.models.wire import (
     AgentMcpGrant,
     AgentMetricRow,
     AgentMetrics,
+    AgentRisk,
     CedarPolicySet,
     Deployment,
     EvalRuns,
@@ -53,6 +62,7 @@ from portal_api.models.wire import (
     GuardrailTemplate,
     MetricTotals,
     PrincipalDetail,
+    RiskReason,
     RuntimeStatus,
     ScopeMetrics,
     TracePage,
@@ -61,6 +71,8 @@ from portal_api.models.wire import (
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_CHECKS_PER_CELL = 25
+FLAG_NAMES = ("unmanaged", "ownerless", "review_overdue", "inactive", "contained")
+NO_RUNTIME = "This agent has no Runtime."
 MAX_WINDOW = dt.timedelta(days=31)
 
 
@@ -90,6 +102,8 @@ class Inventory:
     agents: list[AgentEntry] = field(default_factory=list)
     gateways: list[GatewayEntry] = field(default_factory=list)
     unreachable: dict[tuple[Any, ...], str] = field(default_factory=dict)
+    # "disabled" (no discovery registry configured), "ok", or the error code when it could not be read.
+    discovery: str = "disabled"
 
     def gateway_index(self) -> dict[str, GatewayEntry]:
         return {g.server.id: g for g in self.gateways}
@@ -158,9 +172,22 @@ class PortalService:
         agent_records = registry_mapper.agent_records(self.agent_registry_records())
         scopes = self._scopes()
 
-        def discover(cells: list[Cell]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        def discover(
+            cells: list[Cell],
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str | None] | None]:
             client = self.clients.cell(cells[0], "bedrock-agentcore-control")
-            return agentcore.list_runtimes(client), agentcore.list_gateways(client)
+            runtime_bundles, gateway_bundles = agentcore.list_runtimes(client), agentcore.list_gateways(client)
+            # One metric request per cell account for all of its Runtimes, never one per agent.
+            activity: dict[str, str | None] | None = None
+            try:
+                activity = cloudwatch.runtime_activity(
+                    self.clients.cell(cells[0], "cloudwatch"),
+                    [bundle["summary"]["agentRuntimeArn"] for bundle in runtime_bundles],
+                    self.settings.inactive_days,
+                )
+            except Exception as exc:  # noqa: BLE001 - activity is then unknown, not an error
+                logger.warning("Runtime activity could not be read: %s", error_code(exc))
+            return runtime_bundles, gateway_bundles, activity
 
         inventory = Inventory()
         runtimes: dict[str, Runtime] = {}
@@ -172,15 +199,35 @@ class PortalService:
                 logger.warning("Cell account %s in %s could not be read: %s", scope[0], scope[1], code)
                 inventory.unreachable[scope] = code
                 continue
-            runtime_bundles, gateway_bundles = result
+            runtime_bundles, gateway_bundles, activity = result
             for bundle in runtime_bundles:
                 matched = _cell_for_tags(cells, bundle.get("tags") or {})
                 runtime = agent_mapper.runtime_from_bundle(bundle, matched or cells[0])
+                if activity is not None and runtime.arn in activity:
+                    runtime = replace(runtime, activity_known=True, last_invoked_on=activity[runtime.arn])
                 runtimes[runtime.arn] = runtime
                 runtime_cells[runtime.arn] = matched
             for bundle in gateway_bundles:
                 matched = _cell_for_tags(cells, bundle.get("tags") or {})
                 inventory.gateways.append(mcp_mapper.gateway_entry(bundle, matched or cells[0], tool_index))
+
+        # The organization-scoped discovery registry: a Runtime seen by both sources is one agent.
+        gateway_arns: set[str] = set()
+        for detection in self._detections(inventory, set(runtimes)):
+            if detection.kind == "gateway":
+                gateway_arns.add(detection.arn)
+            elif detection.arn in runtimes:
+                runtimes[detection.arn] = agent_mapper.with_source(
+                    runtimes[detection.arn], agent_mapper.SOURCE_ORGANIZATION_REGISTRY, detection.authorizer_type
+                )
+            else:
+                runtimes[detection.arn] = agent_mapper.runtime_from_detection(detection)
+                runtime_cells[detection.arn] = None
+        for gateway in inventory.gateways:
+            gateway.server.detection_sources = sorted(
+                {agent_mapper.SOURCE_CELL_READER}
+                | ({agent_mapper.SOURCE_ORGANIZATION_REGISTRY} if gateway.arn in gateway_arns else set())
+            )
 
         referenced: set[str] = set()
         for record in agent_records:
@@ -202,7 +249,112 @@ class PortalService:
 
         inventory.agents.sort(key=lambda e: (e.agent.name.lower(), e.agent.id))
         inventory.gateways.sort(key=lambda g: (g.server.name.lower(), g.server.id))
+        self._assess(inventory)
         return inventory
+
+    def _cell_states(self) -> dict[str, str]:
+        """Fleet-health state per cell key, for the cells that could be read."""
+        try:
+            fleet = self.fleet_health()
+        except Exception as exc:  # noqa: BLE001 - health is then unknown for every agent
+            logger.warning("Fleet health could not be read for risk: %s", error_code(exc))
+            return {}
+        return {f"{c.tenant_id}/{c.agent_id}/{c.environment}": c.state for c in fleet.cells if c.reachable}
+
+    def _assess(self, inventory: Inventory) -> None:
+        """Set every agent's flags and risk from the facts gathered for the inventory."""
+        gateways = inventory.gateway_index()
+        cell_states = self._cell_states()
+        today = dt.datetime.now(dt.UTC).date().isoformat()
+        aliases = {c.account_id: c.account_alias for c in self.settings.cells if c.account_alias}
+        roster = self.settings.owner_groups
+        for entry in inventory.agents:
+            agent, runtime, governance = entry.agent, entry.runtime, entry.agent.governance
+            registered = agent.registration == "registered"
+            omni_cell = entry.cell or entry.access_cell
+            agent.omni_url = omni_cell.omni_domain_url if omni_cell else None
+            agent.account_alias = aliases.get(agent.account_id or "")
+            if entry.access_cell is None:
+                agent.reader_status = "none"
+            else:
+                agent.reader_status = "unreachable" if entry.access_cell.scope in inventory.unreachable else "ok"
+            flags = agent.flags
+            flags.unmanaged = not (registered and agent.lifecycle_state == "approved")
+            # The accountable owner of an agent is its owner group. Sponsor and contact are optional
+            # and only produce a low nudge when both are absent.
+            group_missing: bool | None = None
+            group_in_roster: bool | None = None
+            sponsor_missing: bool | None = None
+            if registered and governance is not None:
+                owner_group = (governance.owner_group or "").strip()
+                group_missing = not owner_group
+                if roster is not None and not group_missing:
+                    group_in_roster = owner_group in roster
+                flags.ownerless = group_missing or group_in_roster is False
+                sponsor_missing = not governance.sponsor and not governance.contact
+                flags.review_overdue = bool(governance.review_by and governance.review_by < today)
+            if runtime is not None:
+                flags.contained = runtime.contained
+                if runtime.activity_known:
+                    flags.inactive = runtime.last_invoked_on is None
+                    agent.last_invoked_on = runtime.last_invoked_on
+
+            modes = [gateways[link.gateway_id].enforcement_mode for link in entry.links if link.gateway_id in gateways]
+            verdict = (governance.evaluation or {}).get("verdict") if governance else None
+            facts = risk.RiskFacts(
+                risk_class=governance.risk_class if governance else None,
+                data_classification=governance.data_classification if governance else None,
+                registered=registered,
+                registry_status=(agent.registry_status or "").upper() or None if registered else None,
+                runtime_known=runtime is not None,
+                owner_group_missing=group_missing,
+                owner_group_in_roster=group_in_roster,
+                sponsor_missing=sponsor_missing,
+                review_overdue=flags.review_overdue,
+                inactive=flags.inactive,
+                gateway_policy_mode=risk.weakest_policy_mode(modes),
+                guardrail_configured=runtime.guardrail_configured if runtime else None,
+                authorizer_type=runtime.authorizer_type if runtime else None,
+                # A registered agent with no recorded verdict has not been evaluated.
+                evaluation_verdict=verdict or ("not_run" if registered else None),
+                cell_health_state=cell_states.get(entry.cell.key) if entry.cell else None,
+            )
+            assessed = risk.assess(facts)
+            agent.risk = AgentRisk(
+                level=assessed.level,
+                reasons=[RiskReason(code=r.code, severity=r.severity, detail=r.detail) for r in assessed.reasons],
+            )
+
+    def _detections(self, inventory: Inventory, known_runtime_arns: set[str]) -> list[discovery_mapper.Detection]:
+        """What the discovery registry detected. Its absence or failure never fails the inventory."""
+        registry_id = self.settings.discovery_registry_id
+        if not registry_id:
+            return []
+        try:
+            client = self._registry_client()
+            summaries = registry.list_summaries(client, registry_id)
+            found = discovery_mapper.detections(summaries)
+            # Summaries name the source. The authorizer of a Runtime that no cell reader saw is in
+            # the full record, so only those are fetched.
+            wanted = [
+                d.record_id
+                for d in found
+                if d.kind == "runtime" and d.arn not in known_runtime_arns and d.record_id and d.authorizer_type is None
+            ]
+            if wanted:
+                detailed = {
+                    d.arn: d
+                    for d in discovery_mapper.detections(
+                        list(registry.get_records(client, registry_id, wanted).values())
+                    )
+                }
+                found = [detailed.get(d.arn, d) for d in found]
+            inventory.discovery = "ok"
+            return found
+        except Exception as exc:  # noqa: BLE001 - the cell readers still cover the configured cells
+            inventory.discovery = error_code(exc)
+            logger.warning("Discovery registry could not be read: %s", inventory.discovery)
+            return []
 
     def _access_cell(self, arn: str | None) -> Cell | None:
         """A configured cell whose reader role covers the account and Region of ``arn``."""
@@ -253,12 +405,57 @@ class PortalService:
     def agent_mcp_grants(self, agent_id: str) -> list[AgentMcpGrant]:
         return graph_mapper.agent_mcp_grants(self.agent(agent_id), self.inventory().gateway_index())
 
+    def containment_view(self, agent_id: str, caller_subject: str) -> ContainmentView:
+        """Whether the agent's Runtime is contained (read fresh through the cell reader), by whom, and the events."""
+        entry = self.agent(agent_id)
+        cell = entry.access_cell
+        view = ContainmentView(
+            agent_id=entry.agent.id,
+            state="unknown",
+            runtime_arn=entry.runtime_arn,
+            enabled=bool(
+                entry.runtime_arn
+                and any(
+                    c.containment_role_arn
+                    for c in self.settings.cells
+                    if (c.account_id, c.region) == (entry.agent.account_id, entry.agent.region)
+                )
+            ),
+        )
+        if not entry.runtime_arn:
+            view.detail = NO_RUNTIME
+        elif cell is None:
+            view.detail = agent_mapper.NO_READER.format(what="its containment state")
+        else:
+            state = agentcore.contained(self.clients.cell(cell, "bedrock-agentcore-control"), entry.runtime_arn)
+            view.state = "unknown" if state is None else ("contained" if state else "not_contained")
+            if state is None:
+                view.detail = "The Runtime's resource policy could not be read."
+        if self.settings.audit_table:
+            dynamodb = self.clients.platform("dynamodb", self.settings.registry_region)
+            view.events = audit_reader.query_events(
+                dynamodb, self.settings.audit_table, audit_reader.containment_key(entry.agent.id)
+            )
+            holder = audit_reader.container(view.events)
+            if holder is not None and view.state != "not_contained":
+                view.contained_by, view.contained_by_label = holder.actor_subject, holder.actor_label
+                view.contained_at, view.reason = holder.at, holder.reason
+                view.contained_by_me = holder.actor_subject == caller_subject
+                result = next(
+                    (e for e in view.events if e.request_id == holder.request_id and e.phase == "result"), None
+                )
+                # Partial: sessions were left running, or their discovery was not clean.
+                view.partial = result is None or bool(result.sessions_failed) or result.detail not in (None, "ok")
+        return view
+
     # --- traces and metrics --------------------------------------------------
 
     def traces(self, agent_id: str, page: int, limit: int, hours: int) -> TracePage:
         entry = self.agent(agent_id)
-        if not entry.runtime_arn or entry.access_cell is None:
-            return TracePage(warnings=["This agent has no runtime in a configured cell."])
+        if not entry.runtime_arn:
+            return TracePage(warnings=[NO_RUNTIME])
+        if entry.access_cell is None:
+            return TracePage(warnings=[agent_mapper.NO_READER.format(what="its traces")])
         end = dt.datetime.now(dt.UTC)
         start = end - dt.timedelta(hours=hours)
         fetch = min(page * limit, logs.MAX_TRACE_ROWS)
@@ -294,9 +491,8 @@ class PortalService:
         entry = self.agent(agent_id)
         start, end = self.window(date_from, date_to)
         if not entry.runtime_arn or entry.access_cell is None:
-            return observability_mapper.agent_metrics(
-                {}, "m", start, end, warnings=["This agent has no runtime in a configured cell."]
-            )
+            why = NO_RUNTIME if not entry.runtime_arn else agent_mapper.NO_READER.format(what="its metrics")
+            return observability_mapper.agent_metrics({}, "m", start, end, warnings=[why])
         cell, arn = entry.access_cell, entry.runtime_arn
         warnings: list[str] = []
         series: dict[str, dict[str, float]] = {}
@@ -623,6 +819,170 @@ class PortalService:
             raise NotFound("No history for this registration")
         events.sort(key=lambda e: (e.at, e.event_id), reverse=True)
         return RegistrationHistory(record_id=record_id, events=events)
+
+    # --- fleet summary and export --------------------------------------------
+
+    def fleet_summary(self) -> FleetSummary:
+        inventory = self.inventory()
+        summary = FleetSummary(
+            generated_at=now_iso(),
+            agents_total=len(inventory.agents),
+            by_inventory_state=dict.fromkeys(
+                (agent_mapper.REGISTERED_AND_DETECTED, agent_mapper.REGISTERED_ONLY, agent_mapper.DETECTED_ONLY), 0
+            ),
+            by_risk_level=dict.fromkeys(risk.SEVERITIES, 0),
+            flags=dict.fromkeys(FLAG_NAMES, 0),
+            flags_unknown=dict.fromkeys(FLAG_NAMES, 0),
+            gateways_total=len(inventory.gateways),
+            gateways_by_policy_mode=dict.fromkeys(("enforce", "log_only", "none"), 0),
+            organization_registry=inventory.discovery,
+            unreachable_cells=len(inventory.unreachable),
+            inactive_days=self.settings.inactive_days,
+        )
+        for entry in inventory.agents:
+            agent = entry.agent
+            summary.by_inventory_state[agent.inventory_state] = (
+                summary.by_inventory_state.get(agent.inventory_state, 0) + 1
+            )
+            summary.by_lifecycle[agent.lifecycle_state] = summary.by_lifecycle.get(agent.lifecycle_state, 0) + 1
+            summary.by_risk_level[agent.risk.level] = summary.by_risk_level.get(agent.risk.level, 0) + 1
+            for name in FLAG_NAMES:
+                value = getattr(agent.flags, name)
+                if value is True:
+                    summary.flags[name] += 1
+                elif value is None:
+                    summary.flags_unknown[name] += 1
+        for gateway in inventory.gateways:
+            mode = gateway.enforcement_mode
+            summary.gateways_by_policy_mode[mode] = summary.gateways_by_policy_mode.get(mode, 0) + 1
+        seen: set[str] = set()
+        for cell in self.settings.cells:
+            if cell.omni_domain_url and cell.omni_domain_url not in seen:
+                seen.add(cell.omni_domain_url)
+                summary.omni_domains.append(
+                    OmniDomain(
+                        account_alias=cell.account_alias or f"account-{cell.account_id[-4:]}",
+                        region=cell.omni_region,
+                        url=cell.omni_domain_url,
+                    )
+                )
+        summary.omni_url = summary.omni_domains[0].url if len(summary.omni_domains) == 1 else None
+        urgent = [e.agent for e in inventory.agents if e.agent.risk.level in ("critical", "high")]
+        urgent.sort(key=lambda a: (-risk.SEVERITIES.index(a.risk.level), -len(a.risk.reasons), a.name.lower(), a.id))
+        summary.needs_attention = [
+            AgentAttention(
+                agent_id=agent.id,
+                name=agent.name,
+                risk_level=agent.risk.level,
+                flags=[name for name in FLAG_NAMES if getattr(agent.flags, name) is True],
+                reasons=[reason.model_dump() for reason in agent.risk.reasons],
+            )
+            for agent in urgent[:20]
+        ]
+        if inventory.unreachable:
+            summary.warnings.append(f"{len(inventory.unreachable)} cell account(s) could not be read.")
+        if inventory.discovery not in ("ok", "disabled"):
+            summary.warnings.append(f"The organization registry could not be read ({inventory.discovery}).")
+        return summary
+
+    # --- CloudWatch Omni hand-off ------------------------------------------------
+
+    def observed_services(self, cell_key: str | None, own_account_id: str | None, hours: int) -> ObservedServices:
+        """Agents the Omni Context Graph observes in telemetry, for the cells in the portal's own account.
+
+        The graph is read with the function's own role (a same-account SigV4
+        call needs only the IAM action, no Omni access grant). An Omni domain
+        sees its own Region, so what it reports can be an agent that is
+        neither registered nor detected: ``inventory_state`` is then
+        ``observed_only``. Cells in other accounts are skipped with a warning.
+        """
+        end = dt.datetime.now(dt.UTC)
+        start = end - dt.timedelta(hours=hours)
+        result = ObservedServices(checked_at=now_iso(), window_hours=hours)
+        cells = list(self.settings.cells)
+        if cell_key:
+            cells = [c for c in cells if c.key == cell_key or c.key.rsplit("/", 1)[0] == cell_key]
+            if not cells:
+                raise NotFound("Cell not found")
+        known = {
+            entry.runtime_arn: omni_mapper.KnownAgent(
+                agent_id=entry.agent.id,
+                registered=entry.agent.registration == "registered",
+                detected=entry.runtime is not None,
+                inventory_state=entry.agent.inventory_state,
+            )
+            for entry in self.inventory().agents
+            if entry.runtime_arn
+        }
+        by_account: dict[str, list[Cell]] = {}
+        for cell in cells:
+            by_account.setdefault(cell.account_id, []).append(cell)
+        for account_id, account_cells in by_account.items():
+            alias = next((c.account_alias for c in account_cells if c.account_alias), f"account-{account_id[-4:]}")
+            if own_account_id is None or account_id != own_account_id:
+                result.warnings.append(f"{alias}: skipped, Omni is read only in the portal's own account.")
+                continue
+            regions = list(dict.fromkeys(c.omni_region for c in account_cells if c.omni_region))
+            if not regions:
+                result.warnings.append(f"{alias}: no Omni Region is configured for this account's cells.")
+                continue
+            for region in regions:
+                url = next(
+                    (c.omni_domain_url for c in account_cells if c.omni_region == region and c.omni_domain_url), None
+                )
+                domain = OmniDomain(account_alias=alias, region=region, url=url)
+                try:
+                    client = self.clients.platform("cloudwatchomni", region)
+                    found, truncated = omni.agent_nodes(client, account_id, start, end)
+                except Exception as exc:  # noqa: BLE001 - reported per account, never fatal
+                    logger.warning("Omni Context Graph could not be read: %s", error_code(exc))
+                    result.warnings.append(
+                        f"{alias}: the Omni Context Graph in {region} could not be read ({error_code(exc)})."
+                    )
+                    continue
+                result.domains.append(domain)
+                result.omni_url = result.omni_url or url
+                result.services.extend(omni_mapper.observed_services(found, known, domain))
+                if truncated:
+                    result.warnings.append(f"{alias}: only the first {omni.MAX_NODES} agents in {region} are listed.")
+        result.services.sort(key=lambda s: (s.last_observed_at or "", s.name), reverse=True)
+        return result
+
+    def export_rows(self) -> list[dict[str, Any]]:
+        """One row per agent, for the inventory export. No raw account id outside an ARN."""
+        rows = []
+        for entry in self.agents():
+            agent, governance = entry.agent, entry.agent.governance
+            cell = entry.cell or entry.access_cell
+            if cell is not None and cell.account_alias:
+                alias = cell.account_alias
+            else:
+                alias = f"account-{agent.account_id[-4:]}" if agent.account_id else ""
+            rows.append(
+                {
+                    "agent_id": agent.id,
+                    "name": agent.name,
+                    "record_name": agent.record_name,
+                    "tenant_id": agent.tenant_id,
+                    "environment": agent.environment,
+                    "owner_group": governance.owner_group if governance else None,
+                    "sponsor": governance.sponsor if governance else None,
+                    "contact": governance.contact if governance else None,
+                    "risk_class": governance.risk_class if governance else None,
+                    "data_classification": governance.data_classification if governance else None,
+                    "inventory_state": agent.inventory_state,
+                    "detection_sources": list(agent.detection_sources),
+                    "lifecycle_state": agent.lifecycle_state,
+                    **{name: getattr(agent.flags, name) for name in FLAG_NAMES},
+                    "risk_level": agent.risk.level,
+                    "risk_reasons": [reason.code for reason in agent.risk.reasons],
+                    "runtime_arn": agent.agent_arn,
+                    "account_alias": alias,
+                    "region": agent.region,
+                    "updated_at": agent.updated_at,
+                }
+            )
+        return rows
 
     # --- catalogue -----------------------------------------------------------
 

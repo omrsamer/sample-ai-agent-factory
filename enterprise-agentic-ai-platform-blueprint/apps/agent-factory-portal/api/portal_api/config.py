@@ -37,6 +37,7 @@ _ROLE_ARN = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512}$")
 _SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _ALARM_PREFIX = re.compile(r"^[A-Za-z0-9_.\-/ ]{1,255}$")
 _PIPELINE_NAME = re.compile(r"^[A-Za-z0-9.@_-]{1,100}$")
+_HTTPS_URL = re.compile(r"^https://[A-Za-z0-9.-]{1,253}(:\d{1,5})?(/[A-Za-z0-9._~/-]{0,512})?$")
 _TABLE_NAME = re.compile(r"^[A-Za-z0-9_.-]{3,255}$")
 _TENANT = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _EXTERNAL_ID = re.compile(r"^[\w+=,.@:/-]{2,1224}$")
@@ -61,6 +62,11 @@ class Cell:
     alarm_name_prefix: str | None = None
     pipeline_name: str | None = None
     account_alias: str | None = None
+    # Opt-in per cell: the role the containment function assumes (with the cell's external id).
+    containment_role_arn: str | None = None
+    # The cell account's CloudWatch Omni domain, for linking out, and the Region it lives in.
+    omni_domain_url: str | None = None
+    omni_region: str | None = None
 
     @property
     def key(self) -> str:
@@ -101,6 +107,12 @@ class Settings:
     # Optional: a separate registry (manual approval) that holds the agent governance records.
     # Unset means one registry holds both tool and agent records.
     agent_registry_id: str | None = None
+    # Optional: the organization-scoped discovery registry (auto-detected Runtimes and Gateways).
+    discovery_registry_id: str | None = None
+    # Optional: the owner groups that exist. An agent whose owner group is not among them is ownerless.
+    owner_groups: tuple[str, ...] | None = None
+    # An agent whose Runtime had no invocation for this many days is inactive.
+    inactive_days: int = 30
     # Optional in the read API: only the registration history route needs the audit table.
     audit_table: str | None = None
     # Optional in the read API: lets /users/me say which tenants the caller can register for.
@@ -174,7 +186,12 @@ def _parse_cells(raw: Any) -> tuple[Cell, ...]:
             alarm_name_prefix=_optional(_ALARM_PREFIX, item.get("alarmNamePrefix"), f"{label}.alarmNamePrefix"),
             pipeline_name=_optional(_PIPELINE_NAME, item.get("pipelineName"), f"{label}.pipelineName"),
             account_alias=_optional(_SLUG, item.get("accountAlias"), f"{label}.accountAlias"),
+            containment_role_arn=_optional(_ROLE_ARN, item.get("containmentRoleArn"), f"{label}.containmentRoleArn"),
+            omni_domain_url=_optional(_HTTPS_URL, item.get("omniDomainUrl"), f"{label}.omniDomainUrl"),
+            omni_region=_optional(_REGION, item.get("omniRegion"), f"{label}.omniRegion"),
         )
+        if cell.containment_role_arn and f":{cell.account_id}:" not in cell.containment_role_arn:
+            raise ConfigError(f"{label}.containmentRoleArn is not in the cell account")
         if f":{cell.account_id}:" not in cell.reader_role_arn:
             raise ConfigError(f"{label}.readerRoleArn is not in the cell account")
         if cell.key in seen:
@@ -228,6 +245,26 @@ def _parse_models(raw: Any, default_regions: tuple[str, ...]) -> tuple[ModelEntr
             raise ConfigError(f"{label} provider and status must be strings")
         entries.append(ModelEntry(model_id=model_id, provider=provider, regions=tuple(regions), status=status))
     return tuple(entries)
+
+
+def _parse_owner_groups(env: Mapping[str, str]) -> tuple[str, ...] | None:
+    raw = _json(env, "PORTAL_OWNER_GROUPS", required=False, default=None)
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(g, str) and g for g in raw):
+        raise ConfigError("PORTAL_OWNER_GROUPS must be a JSON list of group names")
+    return tuple(raw)
+
+
+def _parse_inactive_days(env: Mapping[str, str]) -> int:
+    raw = (env.get("PORTAL_INACTIVE_DAYS") or "30").strip()
+    try:
+        days = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PORTAL_INACTIVE_DAYS must be an integer") from exc
+    if not 1 <= days <= 365:
+        raise ConfigError("PORTAL_INACTIVE_DAYS must be between 1 and 365")
+    return days
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
@@ -287,6 +324,11 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         agent_registry_id=_optional(
             _SLUG, (env.get("PORTAL_AGENT_REGISTRY_ID") or "").strip(), "PORTAL_AGENT_REGISTRY_ID"
         ),
+        owner_groups=_parse_owner_groups(env),
+        inactive_days=_parse_inactive_days(env),
+        discovery_registry_id=_optional(
+            _SLUG, (env.get("PORTAL_DISCOVERY_REGISTRY_ID") or "").strip(), "PORTAL_DISCOVERY_REGISTRY_ID"
+        ),
         audit_table=_optional(_TABLE_NAME, env.get("PORTAL_AUDIT_TABLE", "").strip(), "PORTAL_AUDIT_TABLE"),
         group_tenant_map=(
             _parse_tenant_map(_json(env, "PORTAL_GROUP_TENANT_MAP"), role_map)
@@ -310,6 +352,9 @@ _CONFIG_KEYS = (
     "PORTAL_CACHE_TTL_SECONDS",
     "PORTAL_AUDIT_TABLE",
     "PORTAL_AGENT_REGISTRY_ID",
+    "PORTAL_DISCOVERY_REGISTRY_ID",
+    "PORTAL_OWNER_GROUPS",
+    "PORTAL_INACTIVE_DAYS",
     "PORTAL_GROUP_TENANT_MAP",
     "PORTAL_ACTION_ROLE",
 )
@@ -331,17 +376,17 @@ def get_settings() -> Settings:
     return settings
 
 
-ACTION_ROLES = ("registrar", "approver")
+ACTION_ROLES = ("registrar", "approver", "containment")
 ALL_TENANTS = "*"  # same marker as portal_api.authorities.ALL_TENANTS
 
 
 @dataclass(frozen=True)
 class ActionSettings:
-    """Configuration of one action function (registrar or approver).
+    """Configuration of one action function (registrar, approver or containment).
 
-    Deliberately smaller than ``Settings``: an action function reads the
-    registry and the audit table and nothing else, so it does not need cells,
-    guardrail tags or the model allow-list.
+    Deliberately smaller than ``Settings``: an action function does not need
+    guardrail tags or the model allow-list. Only the containment function needs
+    the cells, to find the containment role of an agent's cell.
     """
 
     env: str
@@ -353,6 +398,7 @@ class ActionSettings:
     group_tenant_map: Mapping[str, tuple[str, ...]]
     audit_table: str
     allowed_origins: tuple[str, ...] = ()
+    cells: tuple[Cell, ...] = ()
 
 
 def _parse_tenant_map(raw: Any, role_map: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
@@ -380,7 +426,7 @@ def load_action_settings(env: Mapping[str, str] | None = None) -> ActionSettings
         raise ConfigError("PORTAL_ENV must be nonprod or prod")
     action_role = _required(env, "PORTAL_ACTION_ROLE")
     if action_role not in ACTION_ROLES:
-        raise ConfigError("PORTAL_ACTION_ROLE must be registrar or approver")
+        raise ConfigError("PORTAL_ACTION_ROLE must be registrar, approver or containment")
     provider = _required(env, "PORTAL_IDENTITY_PROVIDER")
     if provider not in ("cognito", "entra"):
         raise ConfigError("PORTAL_IDENTITY_PROVIDER must be cognito or entra")
@@ -398,6 +444,7 @@ def load_action_settings(env: Mapping[str, str] | None = None) -> ActionSettings
         group_tenant_map=_parse_tenant_map(_json(env, "PORTAL_GROUP_TENANT_MAP"), role_map),
         audit_table=_match(_TABLE_NAME, _required(env, "PORTAL_AUDIT_TABLE"), "PORTAL_AUDIT_TABLE"),
         allowed_origins=tuple(origins),
+        cells=_parse_cells(_json(env, "PORTAL_CELLS")) if action_role == "containment" else (),
     )
 
 

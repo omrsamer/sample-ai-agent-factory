@@ -50,18 +50,24 @@ class AwsClients:
             return client
 
     def cell(self, cell: Cell, service: str) -> Any:
-        credentials = self._credentials_for(cell)
-        key = ("cell", cell.scope, service, credentials["AccessKeyId"])
+        """A client in the cell's account, through the cell's reader role."""
+        return self.assumed(cell.reader_role_arn, cell.external_id, cell.region, service)
+
+    def assumed(self, role_arn: str, external_id: str | None, region: str, service: str) -> Any:
+        """A client that uses a role assumed with the given external id."""
+        scope = (role_arn, external_id, region)
+        credentials = self._credentials_for(role_arn, external_id, region)
+        key = ("cell", scope, service, credentials["AccessKeyId"])
         with self._lock:
             client = self._clients.get(key)
             if client is None:
                 # Drop clients built on credentials that have since been rotated.
-                stale = [k for k in self._clients if k[:3] == ("cell", cell.scope, service)]
+                stale = [k for k in self._clients if k[:3] == ("cell", scope, service)]
                 for old in stale:
                     del self._clients[old]
                 client = self._session.client(
                     service,
-                    region_name=cell.region,
+                    region_name=region,
                     config=BOTO_CONFIG,
                     aws_access_key_id=credentials["AccessKeyId"],
                     aws_secret_access_key=credentials["SecretAccessKey"],
@@ -70,26 +76,27 @@ class AwsClients:
                 self._clients[key] = client
             return client
 
-    def _credentials_for(self, cell: Cell) -> dict[str, str]:
+    def _credentials_for(self, role_arn: str, external_id: str | None, region: str) -> dict[str, str]:
         now = dt.datetime.now(dt.UTC)
+        scope = (role_arn, external_id)
         with self._lock:
-            cached = self._cell_credentials.get(cell.scope)
+            cached = self._cell_credentials.get(scope)
             if cached is not None and cached[0] - _REFRESH_MARGIN > now:
                 return cached[1]
         params: dict[str, Any] = {
-            "RoleArn": cell.reader_role_arn,
+            "RoleArn": role_arn,
             "RoleSessionName": _SESSION_NAME,
             "DurationSeconds": _SESSION_DURATION_SECONDS,
         }
-        if cell.external_id:
-            params["ExternalId"] = cell.external_id
-        response = self.platform("sts", self._home_region or cell.region).assume_role(**params)
+        if external_id:
+            params["ExternalId"] = external_id
+        response = self.platform("sts", self._home_region or region).assume_role(**params)
         credentials = response["Credentials"]
         expiry = credentials["Expiration"]
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=dt.UTC)
         with self._lock:
-            self._cell_credentials[cell.scope] = (expiry, credentials)
+            self._cell_credentials[scope] = (expiry, credentials)
         return credentials
 
 

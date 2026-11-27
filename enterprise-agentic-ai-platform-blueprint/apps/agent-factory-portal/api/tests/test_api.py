@@ -37,6 +37,8 @@ VIEWER_CLAIMS = {"sub": "user-2", "email": "viewer@example.com", "cognito:groups
 ALL_DATA_PATHS = [
     "/users/me",
     "/agents",
+    "/agents/export",
+    "/fleet/summary",
     "/agents/recAgent0001",
     "/agents/recAgent0001/runtime",
     "/agents/recAgent0001/deployments",
@@ -420,6 +422,8 @@ def test_current_user_shape(call):
         "read_only": True,
         "can_register": True,
         "can_approve": True,
+        "can_contain": True,
+        "can_release": True,
         "authorities": ["registrar", "approver"],
         "registration_tenants": ["*"],
     }
@@ -444,6 +448,16 @@ def test_current_user_registration_authorities(call, monkeypatch):
     assert (developer["authorities"], approver["authorities"]) == (["registrar"], ["approver"])
     viewer = me("[viewers]")
     assert viewer["authorities"] == []
+    assert [
+        (me(g)["can_contain"], me(g)["can_release"])
+        for g in ("[sec]", "[platform-admins]", "[sre-team]", "[devs]", "[viewers]")
+    ] == [
+        (True, True),
+        (True, True),
+        (True, False),
+        (False, False),
+        (False, False),
+    ]
     assert (viewer["can_register"], viewer["can_approve"], viewer["registration_tenants"]) == (False, False, [])
     monkeypatch.delenv("PORTAL_GROUP_TENANT_MAP")
     assert me("[devs]")["registration_tenants"] is None
@@ -668,6 +682,184 @@ def test_fleet_health_and_catalogue(call):
         "version",
         "target_arn",
     }
+
+
+def raw(backend, path: str, query: str = "", claims: dict | None = PLATFORM_CLAIMS):
+    """The handler's raw response, for endpoints that do not answer with JSON."""
+    from mangum import Mangum
+
+    service, _ = backend
+    app = create_app()
+    app.dependency_overrides[deps.get_service] = lambda: service
+    response = Mangum(app, lifespan="off")(event(path, "GET", claims, query=query), None)
+    return response["statusCode"], response["body"], {k.lower(): v for k, v in response["headers"].items()}
+
+
+def test_export_csv(backend, monkeypatch):
+    import csv as csv_module
+    import io
+
+    from portal_api import export
+
+    hostile = agent_record(
+        record_id="recHostile01",
+        agentId="hostile-agent",
+        runtimeArn=None,
+        gatewayArn=None,
+        ownerGroup='=HYPERLINK("https://evil.example.com","x")',
+        sponsor="+1 555 0100",
+        contact='@SUM(1,1), "quoted", and a\nnew line',
+    )
+    monkeypatch.setattr(
+        registry, "list_records", lambda client, registry_id: [tool_record("tool-echo"), agent_record(), hostile]
+    )
+    status, body, headers = raw(backend, "/agents/export")
+    assert status == 200
+    assert headers["content-type"] == "text/csv; charset=utf-8"
+    assert headers["content-disposition"].startswith('attachment; filename="agents-20') and headers[
+        "content-disposition"
+    ].endswith('.csv"')
+    assert headers["cache-control"] == "no-store"
+    rows = list(csv_module.reader(io.StringIO(body)))
+    assert tuple(rows[0]) == export.COLUMNS
+    assert all(len(row) == len(export.COLUMNS) for row in rows)
+    by_id = {row[0]: dict(zip(export.COLUMNS, row, strict=True)) for row in rows[1:]}
+    assert set(by_id) == {"recAgent0001", "recHostile01", "orphan_agent-ZyXwVu9876"}
+
+    registered = by_id["recAgent0001"]
+    assert (registered["name"], registered["tenant_id"], registered["environment"]) == (
+        "travel-agent",
+        "ws1",
+        "nonprod",
+    )
+    assert (registered["owner_group"], registered["sponsor"], registered["contact"]) == (
+        "travel-owners",
+        "Sam Sponsor",
+        "travel-owners@example.com",
+    )
+    assert (registered["risk_class"], registered["data_classification"]) == ("limited", "confidential")
+    assert (registered["inventory_state"], registered["detection_sources"], registered["lifecycle_state"]) == (
+        "registered_and_detected",
+        "cell_reader",
+        "approved",
+    )
+    assert (registered["unmanaged"], registered["ownerless"], registered["review_overdue"]) == (
+        "false",
+        "false",
+        "false",
+    )
+    assert registered["risk_level"] in ("low", "medium", "high", "critical")
+    assert registered["runtime_arn"] == RUNTIME_ARN and registered["region"] == "eu-west-1"
+    assert registered["account_alias"] == "account-4444"
+
+    # Formula injection is neutralised and the awkward characters survive a round trip.
+    bad = by_id["recHostile01"]
+    assert bad["owner_group"] == "'" + '=HYPERLINK("https://evil.example.com","x")'
+    assert bad["sponsor"] == "'+1 555 0100"
+    assert bad["contact"] == "'" + '@SUM(1,1), "quoted", and a\nnew line'
+    assert '"\'=HYPERLINK(""https://evil.example.com"",""x"")"' in body  # quoted, with doubled quotes
+    for line in body.split("\r\n"):
+        assert not line.startswith(("=", "+", "-", "@"))
+
+    discovered = by_id["orphan_agent-ZyXwVu9876"]
+    assert (discovered["owner_group"], discovered["ownerless"], discovered["unmanaged"]) == ("", "", "true")
+    assert "UNREGISTERED" in discovered["risk_reasons"].split(";")
+    # An account id appears only inside an ARN.
+    import re
+
+    for row in rows[1:]:
+        for column, value in zip(export.COLUMNS, row, strict=True):
+            if column != "runtime_arn":
+                assert not re.search(r"\d{12}", value), (column, value)
+
+
+def test_export_file_name_is_readable_by_a_cross_origin_script(backend):
+    from mangum import Mangum
+
+    service, _ = backend
+    app = create_app()
+    app.dependency_overrides[deps.get_service] = lambda: service
+    request = event("/agents/export", "GET", PLATFORM_CLAIMS, headers={"origin": "https://portal.example.com"})
+    headers = {k.lower(): v for k, v in Mangum(app, lifespan="off")(request, None)["headers"].items()}
+    assert headers["access-control-allow-origin"] == "https://portal.example.com"
+    assert "content-disposition" in headers["access-control-expose-headers"].lower()
+
+
+def test_export_json_and_parameters(backend):
+    status, body, headers = raw(backend, "/agents/export", "format=json")
+    assert status == 200 and headers["content-type"] == "application/json"
+    assert headers["content-disposition"].endswith('.json"')
+    rows = json.loads(body)
+    assert {row["agent_id"] for row in rows} == {"recAgent0001", "orphan_agent-ZyXwVu9876"}
+    first = next(row for row in rows if row["agent_id"] == "recAgent0001")
+    assert first["unmanaged"] is False and isinstance(first["risk_reasons"], list)
+    assert first["detection_sources"] == ["cell_reader"]
+    assert raw(backend, "/agents/export", "format=xlsx")[0] == 422
+    assert raw(backend, "/agents/export", claims=None)[0] == 401
+    assert raw(backend, "/agents/export", claims={"sub": "x", "cognito:groups": "[strangers]"})[0] == 403
+
+
+def test_csv_cell_rules():
+    from portal_api import export
+
+    assert [export.cell(v) for v in (None, True, False, 3, "plain", ["a", "b"], [])] == [
+        "",
+        "true",
+        "false",
+        "3",
+        "plain",
+        "a;b",
+        "",
+    ]
+    for hostile in ("=1+1", "+1", "-1", "@x", "\tx", "\rx"):
+        assert export.cell(hostile) == "'" + hostile
+    assert export.cell(["=x", "y"]) == "'=x;y"
+    assert export.cell("a=b") == "a=b" and export.cell("x-1") == "x-1"
+    text = export.to_csv([{"agent_id": 'a"b', "name": "x,y", "contact": "line1\nline2"}])
+    assert text.splitlines()[0] == ",".join(export.COLUMNS)
+    assert '"a""b","x,y"' in text and '"line1\nline2"' in text and text.endswith("\r\n")
+
+
+def test_fleet_summary_endpoint(call):
+    status, body, _ = call("/fleet/summary")
+    assert status == 200
+    assert body["agents_total"] == 2
+    assert body["by_inventory_state"] == {"registered_and_detected": 1, "registered_only": 0, "detected_only": 1}
+    assert body["by_lifecycle"] == {"approved": 1, "discovered": 1}
+    assert (
+        set(body["by_risk_level"]) == {"low", "medium", "high", "critical"} and sum(body["by_risk_level"].values()) == 2
+    )
+    assert (
+        set(body["flags"])
+        == set(body["flags_unknown"])
+        == {"unmanaged", "ownerless", "review_overdue", "inactive", "contained"}
+    )
+    assert body["flags"]["unmanaged"] == 1
+    assert body["gateways_by_policy_mode"] == {"enforce": 0, "log_only": 1, "none": 0}
+    assert (body["organization_registry"], body["unreachable_cells"]) == ("disabled", 1)
+    assert body["warnings"] == ["1 cell account(s) could not be read."]
+    urgent = body["needs_attention"]
+    assert [a["agent_id"] for a in urgent] == ["orphan_agent-ZyXwVu9876"]
+    assert urgent[0]["risk_level"] == "high" and urgent[0]["flags"][0] == "unmanaged"
+    assert urgent[0]["reasons"][0] == {
+        "code": "UNREGISTERED",
+        "severity": "high",
+        "detail": "The agent has no registration.",
+    }
+    assert call("/fleet/summary", claims=None)[0] == 401
+
+
+def test_agents_carry_flags_and_risk(call):
+    agents = {a["id"]: a for a in call("/agents")[1]}
+    registered = agents["recAgent0001"]
+    assert set(registered["flags"]) == {"unmanaged", "ownerless", "review_overdue", "inactive", "contained"}
+    assert registered["flags"]["unmanaged"] is False
+    assert (registered["sponsor"], registered["review_by"]) == ("Sam Sponsor", "2099-12-31")
+    assert registered["risk"]["level"] in ("low", "medium", "high", "critical")
+    assert all(set(r) == {"code", "severity", "detail"} for r in registered["risk"]["reasons"])
+    discovered = agents["orphan_agent-ZyXwVu9876"]
+    assert discovered["flags"]["unmanaged"] is True and discovered["risk"]["level"] == "high"
+    assert (discovered["inventory_state"], discovered["lifecycle_state"]) == ("detected_only", "discovered")
 
 
 def test_an_unreachable_cell_does_not_fail_the_inventory(call, backend):

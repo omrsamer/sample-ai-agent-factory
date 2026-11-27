@@ -7,7 +7,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from portal_api.deps import CurrentPrincipal, Service
-from portal_api.models.portal import FleetHealth
+from portal_api.models.portal import FleetHealth, FleetSummary
 
 router = APIRouter(prefix="/fleet", tags=["fleet"])
 
@@ -15,3 +15,8 @@ router = APIRouter(prefix="/fleet", tags=["fleet"])
 @router.get("/health", response_model=FleetHealth)
 def health(_: CurrentPrincipal, service: Service) -> FleetHealth:
     return service.fleet_health_with_agents()
+
+
+@router.get("/summary", response_model=FleetSummary)
+def summary(_: CurrentPrincipal, service: Service) -> FleetSummary:
+    return service.fleet_summary()

@@ -41,6 +41,8 @@ def me(principal: CurrentPrincipal, settings: Settings = Depends(get_settings)) 
         identity_provider=settings.identity_provider,
         can_register=principal.role in authorities.REGISTRAR_ROLES,
         can_approve=principal.role in authorities.APPROVER_ROLES,
+        can_contain=principal.role in authorities.CONTAIN_ROLES,
+        can_release=principal.role in authorities.RELEASE_ROLES,
         authorities=[
             name
             for name, roles in (("registrar", authorities.REGISTRAR_ROLES), ("approver", authorities.APPROVER_ROLES))

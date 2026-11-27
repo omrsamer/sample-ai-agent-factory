@@ -46,12 +46,14 @@ READ_OPERATIONS = {
     "get_gateway_target": {"bedrock-agentcore:GetGatewayTarget"},
     "list_policies": {"bedrock-agentcore:ListPolicies"},
     "get_policy": {"bedrock-agentcore:GetPolicy"},
+    "get_resource_policy": {"bedrock-agentcore:GetResourcePolicy"},
     "describe_alarms": {"cloudwatch:DescribeAlarms"},
     "describe_alarm_history": {"cloudwatch:DescribeAlarmHistory"},
     "get_metric_data": {"cloudwatch:GetMetricData"},
     "start_query": {"logs:StartQuery"},
     "get_query_results": {"logs:GetQueryResults"},
     "query": {"dynamodb:Query"},
+    "get_context_graph": {"cloudwatch:GetContextGraph"},
 }
 REGISTRAR_OPERATIONS = {
     "list_registry_records": {"agent-registry:ListRegistryRecords"},
@@ -67,6 +69,34 @@ APPROVER_OPERATIONS = {
     "update_registry_record_status": {"agent-registry:UpdateRegistryRecordStatus"},
     "query": {"dynamodb:Query"},
     "put_item": {"dynamodb:PutItem"},
+}
+
+CONTAINMENT_FILES = [
+    ACTIONS / "containment.py",
+    ACTIONS / "containment_flow.py",
+    ACTIONS / "containment_rules.py",
+    ACTIONS / "audit_writer.py",
+    PACKAGE / "aws" / "audit.py",
+    PACKAGE / "aws" / "logs.py",
+    PACKAGE / "aws" / "session.py",
+    PACKAGE / "containment_policy.py",
+]
+# With the function's own role, and with the cell's containment role.
+CONTAINMENT_FUNCTION_OPERATIONS = {
+    "assume_role": {"sts:AssumeRole"},
+    "get_registry_record": {"agent-registry:GetRegistryRecord"},
+    "query": {"dynamodb:Query"},
+    "put_item": {"dynamodb:PutItem"},
+}
+CONTAINMENT_CELL_OPERATIONS = {
+    "get_resource_policy": {"bedrock-agentcore:GetResourcePolicy"},
+    "put_resource_policy": {"bedrock-agentcore:PutResourcePolicy"},
+    "delete_resource_policy": {"bedrock-agentcore:DeleteResourcePolicy"},
+    "stop_runtime_session": {"bedrock-agentcore:StopRuntimeSession"},
+    "list_agent_runtime_endpoints": {"bedrock-agentcore:ListAgentRuntimeEndpoints"},
+    "start_query": {"logs:StartQuery"},
+    "get_query_results": {"logs:GetQueryResults"},
+    "describe_log_streams": {"logs:DescribeLogStreams"},
 }
 
 MUTATING = re.compile(
@@ -128,6 +158,22 @@ def test_approver_calls_only_its_allow_listed_operations():
     }
 
 
+def test_containment_calls_only_its_allow_listed_operations():
+    found = operations(CONTAINMENT_FILES)
+    assert found == set(CONTAINMENT_FUNCTION_OPERATIONS) | set(CONTAINMENT_CELL_OPERATIONS)
+    # It never changes a registry record, and never invokes or deletes a Runtime.
+    assert not found & set(REGISTRAR_OPERATIONS) - {"get_registry_record", "put_item"}
+    assert not {op for op in found if op.startswith(("invoke_", "delete_agent", "update_agent", "create_"))}
+    # It reads the names of log streams, never a log event.
+    assert not found & {"get_log_events", "filter_log_events", "get_log_record"}
+
+
+def test_only_the_containment_code_changes_a_resource_policy():
+    writers = {"put_resource_policy", "delete_resource_policy", "stop_runtime_session"}
+    for files in (READ_FILES, REGISTRAR_FILES, APPROVER_FILES):
+        assert not operations([f for f in files if f not in CONTAINMENT_FILES or f in READ_FILES]) & writers
+
+
 def test_no_action_code_can_rewrite_the_audit_trail():
     everything = operations(sorted(PACKAGE.rglob("*.py")))
     assert not everything & {"update_item", "delete_item", "batch_write_item", "transact_write_items", "delete_table"}
@@ -139,10 +185,13 @@ def test_iam_actions_document_matches_the_code_per_role():
     read_platform = documented("Read role")
     cell_reader = documented("Cell reader role")
     assert read_platform | cell_reader == actions_of(READ_OPERATIONS)
-    assert not {a for a in read_platform if a.startswith(("bedrock-agentcore:", "cloudwatch:", "logs:"))}
+    in_cells_only = {a for a in read_platform if a.startswith(("bedrock-agentcore:", "cloudwatch:", "logs:"))}
+    assert in_cells_only == {"cloudwatch:GetContextGraph"}  # the only CloudWatch read made in the platform account
     assert {a.split(":")[0] for a in cell_reader} == {"bedrock-agentcore", "cloudwatch", "logs"}
     assert documented("Registrar role") == actions_of(REGISTRAR_OPERATIONS)
     assert documented("Approver role") == actions_of(APPROVER_OPERATIONS)
+    assert documented("Containment function role") == actions_of(CONTAINMENT_FUNCTION_OPERATIONS)
+    assert documented("Cell containment role") == actions_of(CONTAINMENT_CELL_OPERATIONS)
 
 
 def test_read_role_document_has_no_mutating_action():

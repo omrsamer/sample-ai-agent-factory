@@ -96,6 +96,22 @@ def traces_by_user_query(runtime_arn: str) -> str:
     )
 
 
+SESSION_LOOKBACK_HOURS = 8  # the maximum lifetime of a Runtime session
+MAX_SESSIONS = 200
+
+
+def sessions_query(runtime_arn: str, limit: int = MAX_SESSIONS) -> str:
+    """Runtime session ids seen in the Runtime's spans, most recent first, with the endpoint they used."""
+    return (
+        f"{_runtime_filter(runtime_arn)}"
+        " | filter ispresent(attributes.session.id)"
+        " | stats max(@timestamp) as last_seen, latest(resource.attributes.cloud.resource_id) as resource_id"
+        " by attributes.session.id as session_id"
+        " | sort last_seen desc"
+        f" | limit {safe_limit(limit, MAX_SESSIONS)}"
+    )
+
+
 # No interpolation at all: one row per runtime endpoint in the account.
 TOKENS_BY_RUNTIME_QUERY = (
     "filter name like /^invoke_agent/"

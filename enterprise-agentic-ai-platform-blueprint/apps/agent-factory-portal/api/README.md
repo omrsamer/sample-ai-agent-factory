@@ -5,13 +5,14 @@ blueprint's planes (developer experience, platform control, assurance and
 operations). It serves blueprint data in the response shapes the portal front
 end (`../web`) already uses.
 
-The bundle holds three Lambda functions, each with its own IAM role:
+The bundle holds four Lambda functions, each with its own IAM role:
 
 | Handler | Purpose |
 | --- | --- |
 | `handler.handler` | The read API. Every route is a `GET` |
 | `registrar_handler.handler` | Create, update, submit and delete agent records |
 | `approver_handler.handler` | Approve or reject a submitted agent record |
+| `containment_handler.handler` | Contain or release an agent's Runtime |
 
 The read API is read-only by construction:
 
@@ -50,11 +51,37 @@ caller with a mapped role.
 | `/observability/settings`, `/observability/metrics` | CloudWatch back end marker; fleet metrics per agent |
 | `/guardrails`, `/guardrails/{id}` | Amazon Bedrock guardrails in the platform account. Filtered to those that carry the configured tag when one is set; otherwise all of them |
 | `/fleet/health` | Per cell: CloudWatch alarms by name prefix, reduced to `healthy`, `needs_attention`, `critical` or `no_data`. An unreachable cell is reported, not fatal |
+| `/fleet/summary` | Counts of agents by inventory state, lifecycle, risk level and flag, and of gateways by policy mode |
+| `/agents/export` | The inventory as a CSV or JSON download |
+| `/agents/{id}/containment` | Whether the agent's Runtime is contained, by whom, and the containment events |
+| `/omni/observed-services` | Services the CloudWatch Omni Context Graph observes in the portal's own account, marked registered or not |
 | `/catalog/models` | `PORTAL_MODEL_ALLOWLIST` |
 | `/catalog/tools` | Registry tool records |
 | `/registrations` | Agent governance records in the registry, with `status` and `tenant_id` filters |
 | `/registrations/{record_id}` | One record, with who created, submitted and decided it (from the audit trail) |
 | `/registrations/{record_id}/history` | The record's audit trail, newest first |
+
+Inventory states. Every agent carries `inventory_state` and `detection_sources`:
+
+| `inventory_state` | Meaning |
+| --- | --- |
+| `registered_and_detected` | A registration whose Runtime at least one source detects |
+| `registered_only` | A registration whose Runtime nothing detects, or that names no Runtime |
+| `detected_only` | A Runtime with no registration. Its `lifecycle_state` stays `discovered` |
+
+The sources are `cell_reader` (the reader role of a configured cell listed the
+Runtime) and `organization_registry` (a record of the discovery registry names
+it). The join is on the Runtime ARN, so a Runtime seen by both is one agent. A
+Runtime that only the discovery registry sees is listed with its ARN, account,
+Region, name (from the ARN) and inbound authorizer. This is the normal case
+for an account the portal has no cell in. Such an agent has
+`reader_status: "none"`, and every per-cell read degrades instead of failing:
+its Runtime status is `unknown`, its traces, metrics and containment state
+answer with "There is no reader in this agent's account, ...", and its
+`inactive` and `contained` flags are null. `account_alias` is the configured
+alias of the agent's account, or null when none is configured (`account_id`
+is always there). If the discovery registry cannot be read, the inventory is
+still served from the cell readers.
 
 Things to know about the data:
 
@@ -80,6 +107,169 @@ Things to know about the data:
 
 The agent governance document is defined in
 [schemas/agent-governance-1.0.json](schemas/agent-governance-1.0.json).
+
+## Flags and risk
+
+Every agent carries `flags` and `risk`. Each flag is `true`, `false`, or
+`null` when it cannot be known.
+
+| Flag | True when | Null when |
+| --- | --- | --- |
+| `unmanaged` | The agent has no registration in status APPROVED (including every `detected_only` agent) | never |
+| `ownerless` | The registration names no owner group, or `PORTAL_OWNER_GROUPS` is set and the owner group is not in it. The accountable owner is the owner group; `sponsor` and `contact` are optional and do not enter this flag | the agent has no registration |
+| `review_overdue` | The registration's `review_by` date is before today (UTC). No date means not overdue | the agent has no registration |
+| `inactive` | The Runtime had no invocation in the last `PORTAL_INACTIVE_DAYS` days (default 30), from its CloudWatch invocation metric read through the cell reader | the metric could not be read, or no cell reader covers the Runtime |
+| `contained` | The Runtime's resource policy holds the portal's containment statement | the policy could not be read, or no cell reader covers the Runtime |
+
+`risk` is `{ level, reasons: [{ code, severity, detail }] }`. It is computed by
+one pure function, `portal_api/risk.py`, from facts the API already has. There
+are no weights and no scores:
+
+- Each rule below looks at one fact (two for the rules that also need a Runtime to be known). When it applies it adds one reason with a fixed severity.
+- Every reason shown is true of that agent. A rule names the cause it found: an agent nobody registered (`UNREGISTERED`, high) and a registration that waits for an approver (`REGISTRATION_NOT_APPROVED`, medium) are different findings. The `unmanaged` flag is true for both; it is a count for the fleet tile, not a reason.
+- `level` is the highest severity among the reasons (`critical` beats `high` beats `medium` beats `low`), and `low` when no rule applies.
+- A fact that is not known triggers no rule, so an unknown never raises or lowers the level.
+- Reasons are listed most severe first, and in the order of this table within a severity.
+
+| Code | Severity | Applies when |
+| --- | --- | --- |
+| `RISK_CLASS_UNACCEPTABLE` | critical | The registration's risk class is `unacceptable` |
+| `INBOUND_AUTH_NONE` | critical | The Runtime's inbound authorizer is `NONE` (unauthenticated calls) |
+| `UNREGISTERED` | high | The agent has no registration at all (every `detected_only` agent) |
+| `REGISTRATION_REJECTED` | high | The registration's status is `REJECTED` and a detection source still sees its Runtime |
+| `REGISTRATION_DEPRECATED` | high | The registration's status is `DEPRECATED` and a detection source still sees its Runtime |
+| `RISK_CLASS_HIGH` | high | The registration's risk class is `high` |
+| `DATA_RESTRICTED` | high | The data classification is `restricted` |
+| `OWNERLESS` | high | The registration names no owner group |
+| `OWNER_GROUP_NOT_IN_ROSTER` | high | `PORTAL_OWNER_GROUPS` is set and the registration's owner group is not in it |
+| `EVALUATION_FAILED` | high | The recorded evaluation verdict is `failed` |
+| `CELL_HEALTH_CRITICAL` | high | The fleet-health state of the agent's cell is `critical` |
+| `REGISTRATION_NOT_APPROVED` | medium | The registration exists but is not approved yet: `DRAFT`, `PENDING_APPROVAL`, or being created or updated |
+| `GATEWAY_POLICY_NONE` | medium | A Tool Gateway the agent is linked to has no policy engine |
+| `GUARDRAIL_NOT_CONFIGURED` | medium | The Runtime's configuration names neither a guardrail nor the inference gateway |
+| `DATA_CONFIDENTIAL` | medium | The data classification is `confidential` |
+| `REVIEW_OVERDUE` | medium | The `review_overdue` flag is true |
+| `EVALUATION_NOT_RUN` | medium | The verdict is `not_run`, or a registered agent has no recorded verdict |
+| `CELL_HEALTH_NEEDS_ATTENTION` | medium | The fleet-health state of the agent's cell is `needs_attention` |
+| `SPONSOR_MISSING` | low | The registration names neither a `sponsor` nor a `contact` |
+| `GATEWAY_POLICY_LOG_ONLY` | low | The weakest policy mode among the agent's Tool Gateways is `log_only` |
+| `INACTIVE` | low | The `inactive` flag is true |
+
+Notes on the facts: the Tool Gateway policy mode is the weakest among the
+gateways the agent is linked to (`none`, then `log_only`, then `enforce`), and
+is unknown for an agent with no linked gateway. `contained` is a flag only and
+does not change the risk level.
+
+Guardrail coverage is derived from the names of the Runtime's environment
+variables, read through the cell reader. In the blueprint a guardrail is
+applied to every model call at the inference gateway, so a Runtime counts as
+covered when its configuration names either of these with a non-empty value:
+
+- a guardrail: any variable whose name contains `GUARDRAIL`, for example
+  `AGENTCORE_GUARDRAIL_ID` (set by the blueprint's generated agent) or
+  `GUARDRAIL_ID`;
+- the inference gateway: `AGENTCORE_INFERENCE_GATEWAY_URL`, the one name the
+  blueprint uses for the platform inference gateway URL.
+
+A Runtime that names neither gets `GUARDRAIL_NOT_CONFIGURED`. The fact is
+unknown, and the rule silent, when the Runtime's configuration cannot be read.
+Only names and emptiness are looked at: no environment value is ever returned
+or logged.
+
+`GET /fleet/summary` counts agents by inventory state, lifecycle and risk
+level, counts each flag (and for how many agents it is unknown), counts
+gateways by policy mode, and lists the agents at risk level high or critical
+(`needs_attention`, at most 20, most severe first). Counts are never null: a
+flag that could not be evaluated for an agent is counted in `flags_unknown`.
+
+`GET /agents/export?format=csv|json` returns one row per agent as a download.
+In CSV, a cell that starts with `=`, `+`, `-`, `@` or a tab is prefixed with a
+single quote so that a spreadsheet does not run it as a formula; lists are
+joined with `;`; an unknown flag is an empty cell. The export never contains a
+raw account id outside an ARN: accounts appear as the cell's `accountAlias` or
+a masked label. The response exposes `Content-Disposition` to cross-origin
+scripts so the front end can read the file name.
+
+## Containment
+
+Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md).
+
+- **What it changes.** One statement, Sid `AgenticAIPortalContainment`, in the
+  Runtime's resource policy: `Effect: Deny`, `Principal: "*"`, and `Resource`
+  set to exactly the Runtime's ARN (the service accepts only a single resource
+  equal to the policy's own). An invocation through any endpoint is authorized
+  against the Runtime as well, and an explicit deny wins, so the one statement
+  covers every endpoint.
+- **Which actions it denies.** The six invoke actions the service documents
+  for a Runtime policy: `InvokeAgentRuntime`, `InvokeAgentRuntimeCommand` and
+  the per-user, shell and WebSocket variants. The service accepts that list
+  (measured live). Should it ever reject it, the function writes the statement
+  with the two core actions (`InvokeAgentRuntime`,
+  `InvokeAgentRuntimeCommand`) instead, and the response and audit event say
+  so (`denied_actions`).
+- **Enforcement takes time.** A policy change is enforced within about 30
+  seconds, not instantly. Responses report the state as `contained` once the
+  statement is verified and carry `enforcement_delay_seconds`. The function
+  never invokes the Runtime to test the block; its role cannot.
+  Every other statement is kept as it was (`portal_api/containment_policy.py`,
+  pure functions). Release removes exactly that statement and deletes the
+  policy only if nothing else remains.
+- **Sessions.** No API lists a Runtime's sessions, so the session ids of the
+  last eight hours (the maximum session lifetime) come from two independent
+  sources, read in parallel and merged without duplicates:
+  the Runtime's spans (`attributes.session.id`; only an instrumented agent has
+  them), and the names of its session log streams, `runtime-logs-<session id>`
+  in `/aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>` for each of the
+  Runtime's endpoints (any agent that writes output has them; no log event is
+  read). Each session is stopped, most recent first, at most 200 and within a
+  time budget. A session that is unknown or already ended counts as needing no
+  stop. If one source cannot be read the other is used and the response names
+  the one that failed; if neither can, containment still holds and the
+  response and audit event say that the stop was not performed and why.
+- **Who.** `portal_api/actions/containment_rules.py` (pure): contain needs
+  `security`, `platform` or `sre`; release needs `security` or `platform` and a
+  different person from the one who contained it; the caller must hold the
+  agent's tenant.
+- **Where.** Everything in the cell is done by assuming the cell's
+  `containmentRoleArn` with the cell's `externalId`. A cell without one
+  cannot be contained (409).
+- **Resolving the agent.** A registered agent's Runtime ARN and tenant are
+  read from its registry record, never taken from the request. An agent with
+  no registration is addressed by its Runtime id.
+- **Audit.** Same table and discipline as registrations, under
+  `pk = CONTAINMENT#<agent id>`: an intent event before anything is changed and
+  a result event that says what was and was not done. A repeated contain is
+  recorded as `unchanged` and does not replace the original container.
+- **Not atomic.** The policy is read, changed and written without a lock.
+  Another tool changing the same policy at the same moment could be overwritten.
+
+## CloudWatch Omni hand-off
+
+Nothing from Omni is embedded. Where a cell configures `omniDomainUrl`, the
+agents of that cell, its row in `/fleet/health` and `/fleet/summary` carry
+`omni_url` so the front end can link out.
+
+`GET /omni/observed-services?cell=<tenant>/<agent>&hours=24` lists the agents
+the Omni Context Graph observes in telemetry in the portal's own account.
+
+- **Agents only.** The Context Graph holds every service and resource of an
+  account (functions, compute, networks). The request filters on the category
+  `GEN_AI_AGENT`, and anything else is dropped.
+- **Matched against the inventory.** Each row carries the Runtime ARN (the
+  node's resource id cut at the endpoint part), `registered`, `detected`,
+  `matched_agent_id` and `inventory_state`. An agent that nobody registered and
+  no source detected has `inventory_state: "observed_only"`: it is visible in
+  telemetry only.
+- **Where it was observed.** An Omni domain sees the Region it lives in, which
+  can differ from the cells' Region. The response lists the domains it read
+  (`domains`: account alias, Region, URL), and each row carries `omni_region`
+  and `account_alias`.
+- **Times.** A node known from configuration only reports the epoch as its
+  observation time; that is returned as null.
+- **Access.** The graph is read with the function's own role in the cell's
+  `omniRegion`. A same-account call needs only `cloudwatch:GetContextGraph`;
+  no Omni access grant is involved. Cells in other accounts are skipped with a
+  warning. Without `cell`, every cell in the portal's own account is covered.
 
 ## Registration and approval
 
@@ -134,9 +324,12 @@ mapped role wins. No claims is `401`; no mapped group is `403`.
 | --- | --- | --- |
 | `PORTAL_ENV` | yes | `nonprod` or `prod` |
 | `PORTAL_REGISTRY_ID` | yes | Id of the platform Agent Registry (tool records; also agent records unless the next variable is set) |
+| `PORTAL_DISCOVERY_REGISTRY_ID` | no | Id of the organization-scoped discovery registry (AWS Agent Registry auto-detection), in the same Region. Adds `organization_registry` as a detection source |
+| `PORTAL_OWNER_GROUPS` | no | The owner roster: a JSON list of the owner groups that exist. An agent whose `owner_group` is not in it is flagged `ownerless` (reason `OWNER_GROUP_NOT_IN_ROSTER`). Unset means the roster is unknown and that rule never applies |
+| `PORTAL_INACTIVE_DAYS` | no | Days without an invocation after which an agent is flagged `inactive`. Default `30`, 1 to 365 |
 | `PORTAL_AGENT_REGISTRY_ID` | no | Id of a separate registry, in the same Region, that holds the agent governance records. Use it when the platform registry auto-approves, so that agent records wait for a person |
 | `PORTAL_REGISTRY_REGION` | yes | Region of the registry. Also used for the other platform-account reads (pipelines, guardrails) |
-| `PORTAL_CELLS` | yes | JSON list of `{ tenantId, agentId, applicationId?, environment, accountId, region, readerRoleArn, externalId?, alarmNamePrefix?, pipelineName?, accountAlias? }` |
+| `PORTAL_CELLS` | yes | JSON list of `{ tenantId, agentId, applicationId?, environment, accountId, region, readerRoleArn, externalId?, alarmNamePrefix?, pipelineName?, accountAlias?, containmentRoleArn?, omniDomainUrl?, omniRegion? }` |
 | `PORTAL_IDENTITY_PROVIDER` | yes | `cognito` or `entra` |
 | `PORTAL_GROUP_ROLE_MAP` | yes | JSON object, group or app role name to portal role |
 | `PORTAL_GUARDRAIL_TAG_KEY`, `PORTAL_GUARDRAIL_TAG_VALUE` | no | Tag that marks a guardrail as part of the blueprint. Both empty (the default): every guardrail in the account and Region is listed and tags are not read. Set both or neither |
@@ -152,7 +345,8 @@ The action functions read a smaller set, all required unless noted:
 
 | Variable | Meaning |
 | --- | --- |
-| `PORTAL_ACTION_ROLE` | `registrar` or `approver`; must match the handler |
+| `PORTAL_ACTION_ROLE` | `registrar`, `approver` or `containment`; must match the handler |
+| `PORTAL_CELLS` | Containment function only, required there: the cells, with `containmentRoleArn` and `externalId` on those that opt in |
 | `PORTAL_ENV`, `PORTAL_REGISTRY_ID`, `PORTAL_REGISTRY_REGION` | As above, except that `PORTAL_REGISTRY_ID` here is the registry that holds the agent records (the agent registry when there are two). The audit table is read in the registry's Region |
 | `PORTAL_IDENTITY_PROVIDER`, `PORTAL_GROUP_ROLE_MAP` | As above |
 | `PORTAL_GROUP_TENANT_MAP` | JSON object, group or app role name to a list of tenant ids. `"*"` is allowed only for a group mapped to `platform` |
@@ -187,7 +381,8 @@ assume each cell's reader role.
 ```
 
 Produces `dist/` for arm64, Python 3.13 Lambda functions, with `handler.py`,
-`registrar_handler.py` and `approver_handler.py` at its root. Zip the contents of `dist/`. boto3 and botocore are bundled
+`registrar_handler.py`, `approver_handler.py` and `containment_handler.py` at
+its root. Zip the contents of `dist/`. boto3 and botocore are bundled
 at pinned versions on purpose: the Agent Registry control-plane client is newer
 than the SDK included in the Lambda runtime.
 

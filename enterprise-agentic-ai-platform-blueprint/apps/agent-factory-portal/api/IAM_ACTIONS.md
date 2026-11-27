@@ -4,14 +4,15 @@ This file lists every IAM action the code calls, per role, and nothing else.
 `tests/test_readonly.py` fails if a role's code calls an operation that is not
 in its table, or if a table lists an action that role's code does not call.
 
-There are three Lambda functions, each with its own role, plus the reader role
-in each cell account:
+There are four Lambda functions, each with its own role, plus the reader role
+in each cell account and, where a cell opts in, a containment role:
 
 | Function | Handler | Role | Can change |
 | --- | --- | --- | --- |
 | Read API | `handler.handler` | read role | Nothing |
 | Registrar | `registrar_handler.handler` | registrar role | Registry records (create, update, submit, delete); appends audit events |
 | Approver | `approver_handler.handler` | approver role | A registry record's status; appends audit events |
+| Containment | `containment_handler.handler` | containment function role, and each opted-in cell's containment role | One deny statement in a Runtime's resource policy; stops Runtime sessions; appends audit events |
 
 The read API has no code path that creates, updates, deletes, tags or invokes
 anything, and it does not import the action code at all.
@@ -27,11 +28,12 @@ Region for every platform-account call is `PORTAL_REGISTRY_REGION`.
 | Action | Resource it can be narrowed to | Needed by |
 | --- | --- | --- |
 | `sts:AssumeRole` | The `readerRoleArn` of each entry in `PORTAL_CELLS` (exact role ARNs, no wildcard) | Every endpoint that reads a cell: `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/fleet/health` |
-| `agent-registry:ListRegistryRecords` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>` and, when `PORTAL_AGENT_REGISTRY_ID` is set, `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_AGENT_REGISTRY_ID>` | `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/catalog/tools`, `/registrations`, `/registrations/{record_id}` |
-| `agent-registry:GetRegistryRecord` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>/record/*` and, when `PORTAL_AGENT_REGISTRY_ID` is set, `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_AGENT_REGISTRY_ID>/record/*` | Same as `ListRegistryRecords` (the list operation does not return descriptors) |
+| `agent-registry:ListRegistryRecords` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>` and, when set, the registries named in `PORTAL_AGENT_REGISTRY_ID` and `PORTAL_DISCOVERY_REGISTRY_ID` | `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/catalog/tools`, `/registrations`, `/registrations/{record_id}` |
+| `agent-registry:GetRegistryRecord` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>/record/*` and, when set, the records of the registries named in `PORTAL_AGENT_REGISTRY_ID` and `PORTAL_DISCOVERY_REGISTRY_ID` | Same as `ListRegistryRecords` (the list operation does not return descriptors) |
 | `codepipeline:ListPipelineExecutions` | `arn:aws:codepipeline:REGION:PLATFORM:<pipelineName>` for each `pipelineName` in `PORTAL_CELLS` | `/agents/{id}/evals/runs` |
 | `codepipeline:ListActionExecutions` | Same pipeline ARNs | `/agents/{id}/evals/runs` (EvaluationGate action result) |
 | `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | `/registrations/{record_id}`, `/registrations/{record_id}/history` |
+| `cloudwatch:GetContextGraph` | `*`; can be limited to the Omni Region (the cells' `omniRegion`) with an `aws:RequestedRegion` condition | `/omni/observed-services` |
 | `bedrock:ListGuardrails` | `*` (list operation) | `/guardrails`, `/guardrails/{id}` |
 | `bedrock:ListTagsForResource` | `arn:aws:bedrock:REGION:PLATFORM:guardrail/*` | `/guardrails`, `/guardrails/{id}`. Called only when `PORTAL_GUARDRAIL_TAG_KEY` is set (tag filter); not needed when it is empty |
 | `bedrock:GetGuardrail` | `arn:aws:bedrock:REGION:PLATFORM:guardrail/*` | `/guardrails/{id}` |
@@ -41,6 +43,22 @@ read actions on both registries: tool records (`/catalog/tools`, the tool join
 on gateways) are read from `PORTAL_REGISTRY_ID`, and agent governance records
 (`/agents*`, `/registrations*`, the governance graph and everything derived
 from them) from `PORTAL_AGENT_REGISTRY_ID`. Without it, one registry holds both.
+
+With `PORTAL_DISCOVERY_REGISTRY_ID` set, the read role needs the same two
+actions on that registry too. It is read for `/agents*`, `/mcp-servers*`,
+`/governance-graph`, `/fleet/summary` and the export: its records name the
+Runtimes and Gateways the organization-scoped auto-detection found.
+`GetRegistryRecord` is called there only for a detected Runtime that no cell
+reader also saw.
+
+`cloudwatch:GetContextGraph` is the CloudWatch Omni Context Graph read (the
+SDK client `cloudwatchomni` signs requests with the service name
+`cloudwatch`). The action name was verified live with a session policy that
+held only this action: the call succeeds, and it is denied without the action
+or when the policy pins the action to another Region. A SigV4 call from a
+principal of the same account needs no Omni access grant. The call is made
+only for cells in the portal's own account, in the cell's `omniRegion`, and
+asks for agent nodes only.
 
 The function also needs its own log delivery permissions (the AWS managed
 basic execution policy or an equivalent scoped to its log group). That is
@@ -57,6 +75,7 @@ cell sets `externalId`. Session duration used by the code is 900 seconds.
 | --- | --- | --- |
 | `bedrock-agentcore:ListAgentRuntimes` | `*` (list operation) | `/agents*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/mcp-servers/{id}/grants` |
 | `bedrock-agentcore:GetAgentRuntime` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Same as `ListAgentRuntimes` (creation time and the configured Tool Gateway URL) |
+| `bedrock-agentcore:GetResourcePolicy` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Same as `ListAgentRuntimes` (whether the Runtime's resource policy holds the containment statement). Optional: without it `contained` reads as unknown |
 | `bedrock-agentcore:ListAgentRuntimeVersions` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | `/agents/{id}/deployments` |
 | `bedrock-agentcore:ListGateways` | `*` (list operation) | `/mcp-servers*`, `/agents*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics` |
 | `bedrock-agentcore:GetGateway` | `arn:aws:bedrock-agentcore:REGION:CELL:gateway/*` | Same as `ListGateways` (URL, authorizer type, policy engine configuration) |
@@ -65,9 +84,9 @@ cell sets `externalId`. Session duration used by the code is 900 seconds.
 | `bedrock-agentcore:ListTagsForResource` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` and `arn:aws:bedrock-agentcore:REGION:CELL:gateway/*` | Same as `ListAgentRuntimes` and `ListGateways` (tenant, agent and environment tags). Optional: without it, tags read as empty |
 | `bedrock-agentcore:ListPolicies` | `arn:aws:bedrock-agentcore:REGION:CELL:policy-engine/*` | `/mcp-servers/{id}/policies` |
 | `bedrock-agentcore:GetPolicy` | `arn:aws:bedrock-agentcore:REGION:CELL:policy-engine/*/policy/*` | `/mcp-servers/{id}/policies` (only when the list response omits the Cedar statement) |
-| `cloudwatch:DescribeAlarms` | `arn:aws:cloudwatch:REGION:CELL:alarm:*` | `/fleet/health` |
-| `cloudwatch:DescribeAlarmHistory` | `arn:aws:cloudwatch:REGION:CELL:alarm:<alarm name prefix>*` | `/fleet/health` (only for alarms whose state changed in the last 24 hours) |
-| `cloudwatch:GetMetricData` | `*` (no resource-level permissions) | `/agents/{id}/metrics`, `/observability/metrics` |
+| `cloudwatch:DescribeAlarms` | `arn:aws:cloudwatch:REGION:CELL:alarm:*` | `/fleet/health`; also every endpoint that returns agents with their risk (`/agents*`, `/agents/export`, `/fleet/summary`, `/governance-graph`), because the cell's health state is a risk fact |
+| `cloudwatch:DescribeAlarmHistory` | `arn:aws:cloudwatch:REGION:CELL:alarm:<alarm name prefix>*` | Same as `DescribeAlarms` (only for alarms whose state changed in the last 24 hours) |
+| `cloudwatch:GetMetricData` | `*` (no resource-level permissions) | `/agents/{id}/metrics`, `/observability/metrics`; also every endpoint that returns agents (the `inactive` flag: one request per cell account covers all of its Runtimes) |
 | `logs:StartQuery` | `arn:aws:logs:REGION:CELL:log-group:aws/spans:*` | `/agents/{id}/traces`, `/agents/{id}/metrics`, `/observability/metrics` |
 | `logs:GetQueryResults` | `*` (no resource-level permissions) | `/agents/{id}/traces`, `/agents/{id}/metrics`, `/observability/metrics` |
 
@@ -123,7 +142,54 @@ can be added but never changed or removed through the API. The approver role
 cannot create, update or delete a record; the registrar role cannot set a
 record's status.
 
-## 5. Notes on the action set
+## 5. Containment function role (platform account)
+
+Function `containment_handler.handler`, `PORTAL_ACTION_ROLE=containment`.
+
+| Action | Resource it can be narrowed to | Needed by |
+| --- | --- | --- |
+| `sts:AssumeRole` | The `containmentRoleArn` of each cell that opts in (exact role ARNs) | Both containment routes. Everything in the cell is done with that role |
+| `agent-registry:GetRegistryRecord` | The records of the registry that holds the agent records (this function's `PORTAL_REGISTRY_ID`) | Both routes, for a registered agent: its Runtime ARN and tenant are read from its record, never taken from the request |
+| `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Both routes (who contained the agent, for the two-person rule; strongly consistent read) |
+| `dynamodb:PutItem` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Both routes (audit events) |
+
+This role can read a record of that one registry and nothing more of it: it
+cannot list records, cannot change any record's content or status, cannot
+assume a cell's reader role, and has no `bedrock-agentcore` permission of its
+own.
+
+## 6. Cell containment role (each cell that opts in)
+
+Trust: the containment function's role only, with the cell's external id.
+
+| Action | Resource it can be narrowed to | Needed by |
+| --- | --- | --- |
+| `bedrock-agentcore:GetResourcePolicy` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Contain and release (read before the change, and again to verify) |
+| `bedrock-agentcore:PutResourcePolicy` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Contain (add the deny statement); release when other statements remain |
+| `bedrock-agentcore:DeleteResourcePolicy` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Release, only when the containment statement was the policy's only statement |
+| `bedrock-agentcore:StopRuntimeSession` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Contain (stop the Runtime's recent sessions) |
+| `bedrock-agentcore:ListAgentRuntimeEndpoints` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Contain (the Runtime's endpoint names, to find its session log groups). Without it only the DEFAULT endpoint is checked |
+| `logs:StartQuery` | `arn:aws:logs:REGION:CELL:log-group:aws/spans:*` | Contain (find the Runtime's recent session ids in its spans) |
+| `logs:GetQueryResults` | `*` (no resource-level permissions) | Contain (same query) |
+| `logs:DescribeLogStreams` | `arn:aws:logs:REGION:CELL:log-group:/aws/bedrock-agentcore/runtimes/*` | Contain (find the Runtime's recent session ids in the names of its session log streams) |
+
+`bedrock-agentcore:ListSessions` is not used and should not be granted for
+this purpose: it lists the sessions of a Memory resource
+(`/memories/{memoryId}/actor/{actorId}/sessions`), not of a Runtime. No API
+lists a Runtime's sessions, so the session ids come from two independent
+sources: the Runtime's spans (only an instrumented agent has them) and the
+names of its session log streams, `runtime-logs-<session id>` in
+`/aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>` (only an agent that
+writes output has them). If one source cannot be read the other is used and
+the response names the one that failed. If neither can be read, containment
+still works (invocation is denied) and the response says that running
+sessions could not be listed.
+
+The role reads stream names only. It has no permission to read a log event
+(`logs:GetLogEvents`, `logs:FilterLogEvents`), and the code calls neither. It
+cannot invoke the Runtime or read its configuration.
+
+## 7. Notes on the action set
 
 **Tag reads in the cell reader role:** `bedrock-agentcore:ListTagsForResource`
 on `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` and

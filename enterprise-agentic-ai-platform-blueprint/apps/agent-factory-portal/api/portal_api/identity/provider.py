@@ -154,7 +154,7 @@ class CognitoProvider:
 
 
 class EntraProvider:
-    """Microsoft Entra ID tokens: app roles in ``roles``, groups in ``groups``, subject ``oid``."""
+    """Entra ID tokens: app roles in ``roles``, groups in ``groups``, subject ``oid``."""
 
     name = "entra"
 

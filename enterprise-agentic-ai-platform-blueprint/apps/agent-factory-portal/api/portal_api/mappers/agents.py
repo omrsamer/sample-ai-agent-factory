@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from portal_api.config import Cell
@@ -29,6 +29,16 @@ RUNTIME_STATUS = {
     "DELETING": "unknown",
 }
 
+# Said wherever a per-cell read is not possible because the agent's account has no reader role.
+NO_READER = "There is no reader in this agent's account, so {what} cannot be read."
+
+SOURCE_CELL_READER = "cell_reader"
+SOURCE_ORGANIZATION_REGISTRY = "organization_registry"
+
+REGISTERED_AND_DETECTED = "registered_and_detected"
+REGISTERED_ONLY = "registered_only"
+DETECTED_ONLY = "detected_only"
+
 TAG_TENANT = "tenant-id"
 TAG_AGENT = "agent-id"
 TAG_APPLICATION = "application-id"
@@ -50,9 +60,17 @@ class Runtime:
     updated_at: str | None
     tags: dict[str, str]
     gateway_url: str | None
-    cell: Cell
+    # The cell whose reader role read this Runtime; None when only the discovery registry detected it.
+    cell: Cell | None
     account_id: str
     region: str
+    sources: tuple[str, ...] = (SOURCE_CELL_READER,)
+    authorizer_type: str | None = None  # "AWS_IAM" | "CUSTOM_JWT"
+    guardrail_configured: bool | None = None
+    contained: bool | None = None
+    # Whether the invocation metric could be read, and the last day with an invocation in the window.
+    activity_known: bool = False
+    last_invoked_on: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +115,48 @@ def runtime_from_bundle(bundle: dict[str, Any], cell: Cell) -> Runtime:
         cell=cell,
         account_id=parts.get("account") or cell.account_id,
         region=parts.get("region") or cell.region,
+        authorizer_type=text(detail.get("authorizerType")),
+        guardrail_configured=detail.get("guardrailConfigured"),
+        contained=detail.get("contained"),
+    )
+
+
+def runtime_from_detection(detection: Any) -> Runtime:
+    """A Runtime known only from the discovery registry: identity and authorizer, no status or tags."""
+    parts = arn_parts(detection.arn) or {}
+    runtime_id = arn_resource_id(detection.arn) or detection.arn
+    return Runtime(
+        arn=detection.arn,
+        runtime_id=runtime_id,
+        name=runtime_id.rsplit("-", 1)[0] or runtime_id,
+        status="UNKNOWN",
+        version=None,
+        description=None,
+        created_at=None,
+        updated_at=iso(detection.detected_at),
+        tags={},
+        gateway_url=None,
+        cell=None,
+        account_id=parts.get("account") or "",
+        region=parts.get("region") or "",
+        sources=(SOURCE_ORGANIZATION_REGISTRY,),
+        authorizer_type=detection.authorizer_type,
+    )
+
+
+def with_source(runtime: Runtime, source: str, authorizer_type: str | None = None) -> Runtime:
+    """The same Runtime, also seen by ``source``."""
+    return replace(
+        runtime,
+        sources=tuple(dict.fromkeys((*runtime.sources, source))),
+        authorizer_type=runtime.authorizer_type or authorizer_type,
+    )
+
+
+def _auth_type(runtime: Runtime | None) -> str:
+    """The console's ``auth_type`` for the Runtime's inbound authorizer."""
+    return {"AWS_IAM": "aws_iam", "CUSTOM_JWT": "custom_jwt"}.get(
+        (runtime.authorizer_type if runtime else "") or "", "none"
     )
 
 
@@ -139,6 +199,12 @@ def registered_agent(
         account_id=parts.get("account") or (cell.account_id if cell else None),
         runtime_status=RUNTIME_STATUS.get(runtime.status, "unknown") if runtime else None,
         governance=governance,
+        sponsor=governance.sponsor,
+        review_by=governance.review_by,
+        auth_type=_auth_type(runtime),
+        inbound_authorizer=runtime.authorizer_type if runtime else None,
+        inventory_state=REGISTERED_AND_DETECTED if runtime else REGISTERED_ONLY,
+        detection_sources=sorted(runtime.sources) if runtime else [],
     )
     links = (
         [GatewayLink(gateway_id, governance.gateway_arn, "registry", tuple(governance.subscribed_tool_ids))]
@@ -151,7 +217,7 @@ def registered_agent(
         runtime=runtime,
         runtime_arn=runtime_arn,
         cell=cell,
-        access_cell=runtime.cell if runtime else access_cell,
+        access_cell=runtime.cell if runtime and runtime.cell else access_cell,
         links=links,
     )
 
@@ -159,7 +225,8 @@ def registered_agent(
 def discovered_agent(runtime: Runtime, cell: Cell | None = None) -> AgentEntry:
     """A runtime that no registry record references yet."""
     tags = runtime.tags
-    environment = tags.get(TAG_ENVIRONMENT) or runtime.cell.environment
+    # A Runtime only the discovery registry saw has no tags and no cell: its environment is not known.
+    environment = tags.get(TAG_ENVIRONMENT) or (runtime.cell.environment if runtime.cell else "unknown")
     updated = runtime.updated_at or runtime.created_at or EPOCH_ISO
     agent = Agent(
         id=runtime.runtime_id,
@@ -178,6 +245,10 @@ def discovered_agent(runtime: Runtime, cell: Cell | None = None) -> AgentEntry:
         environment=environment,
         account_id=runtime.account_id,
         runtime_status=RUNTIME_STATUS.get(runtime.status, "unknown"),
+        auth_type=_auth_type(runtime),
+        inbound_authorizer=runtime.authorizer_type,
+        inventory_state=DETECTED_ONLY,
+        detection_sources=sorted(runtime.sources),
     )
     return AgentEntry(agent=agent, runtime=runtime, runtime_arn=runtime.arn, cell=cell, access_cell=runtime.cell)
 
@@ -202,6 +273,15 @@ def runtime_status(entry: AgentEntry, reachable: bool) -> RuntimeStatus:
             detail=detail,
         )
     runtime = entry.runtime
+    if runtime.cell is None:
+        return RuntimeStatus(
+            agent_id=agent.id,
+            stage=stage,
+            status="unknown",
+            runtime_arn=runtime.arn,
+            checked_at=now_iso(),
+            detail=NO_READER.format(what="its Runtime status"),
+        )
     return RuntimeStatus(
         agent_id=agent.id,
         stage=stage,

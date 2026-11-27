@@ -113,6 +113,8 @@ def agent_governance(record: dict[str, Any]) -> AgentGovernance:
         environment=text(document.get("environment")),
         owner_group=text(document.get("ownerGroup")),
         contact=text(document.get("contact")),
+        sponsor=text(document.get("sponsor")),
+        review_by=text(document.get("reviewBy")),
         business_purpose=text(document.get("businessPurpose")),
         risk_class=text(document.get("riskClass")),
         data_classification=text(document.get("dataClassification")),

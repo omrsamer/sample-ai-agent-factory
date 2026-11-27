@@ -257,6 +257,37 @@ def test_type_errors_use_the_same_list_form(world):
     assert all(set(e) == {"loc", "msg", "type"} for e in body["detail"])
 
 
+def test_sponsor_and_review_date_are_stored_and_are_not_governed_references(world):
+    code, body = world.create(sponsor="Sam Sponsor", review_by="2099-06-30")
+    assert code == 201
+    document = body["registration"]["document"]
+    assert (document["sponsor"], document["review_by"]) == ("Sam Sponsor", "2099-06-30")
+    record_id = body["registration"]["record_id"]
+    stored = json.loads(world.registry.records[record_id]["descriptors"]["custom"]["data"])
+    assert (stored["sponsor"], stored["reviewBy"]) == ("Sam Sponsor", "2099-06-30")
+    assert world.submit(record_id)[0] == 200 and world.decide("approve", record_id)[0] == 200
+    # Changing them on an approved record is an ordinary update, not a change of an approved reference.
+    code, body = world.update(record_id, sponsor="Nia Newsponsor", review_by="2100-01-31")
+    assert code == 200 and body["registration"]["document"]["sponsor"] == "Nia Newsponsor"
+    assert authority.approved_references({**stored, "sponsor": "x", "reviewBy": "2000-01-01"}) == (
+        authority.approved_references(stored)
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "loc"),
+    [
+        ({"review_by": "2026-13-45"}, ["body", "review_by"]),
+        ({"review_by": "31/12/2026"}, ["body", "review_by"]),
+        ({"review_by": "2026-02-30"}, ["body", "review_by"]),
+        ({"sponsor": "s" * 257}, ["body", "sponsor"]),
+    ],
+)
+def test_sponsor_and_review_date_validation(world, changes, loc):
+    code, body = world.create(**changes)
+    assert code == 422 and body["detail"][0]["loc"] == loc
+
+
 def test_malformed_json_body_is_422(world):
     assert world.call("registrar", "POST", "/registrations", DEV, "{not json")[0] == 422
 

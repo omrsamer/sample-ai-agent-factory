@@ -94,3 +94,26 @@ def get_metric_data(
             for day in bucket:
                 bucket[day] = bucket[day] / max(counts[query_id][day], 1)
     return series
+
+
+def runtime_activity(client: Any, runtime_arns: list[str], days: int) -> dict[str, str | None]:
+    """For each Runtime, the last day (ISO date) it was invoked in the window, or ``None`` if it was not.
+
+    One GetMetricData request covers up to 500 Runtimes, so this is one call per
+    cell account, not one per agent. A Runtime missing from the result could not be read.
+    """
+    end = dt.datetime.now(dt.UTC)
+    start = (end - dt.timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    queries = []
+    for index, arn in enumerate(runtime_arns):
+        expression = (
+            f"SEARCH('{{{NAMESPACE},Resource,Operation,Name}} "
+            f'Resource="{safe_runtime_arn(arn)}" MetricName="Invocations"\', \'Sum\', 86400)'
+        )
+        queries.append({"Id": f"a{index}_invocations", "Expression": expression, "ReturnData": True})
+    series = get_metric_data(client, queries, start, end) if queries else {}
+    activity: dict[str, str | None] = {}
+    for index, arn in enumerate(runtime_arns):
+        invoked = [day for day, value in (series.get(f"a{index}_invocations") or {}).items() if value > 0]
+        activity[arn] = max(invoked) if invoked else None
+    return activity

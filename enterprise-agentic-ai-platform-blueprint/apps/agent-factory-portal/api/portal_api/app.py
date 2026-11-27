@@ -26,6 +26,7 @@ from portal_api.routes import (
     guardrails,
     mcp_servers,
     observability,
+    omni,
     registrations,
     users,
 )
@@ -85,6 +86,8 @@ def create_app() -> FastAPI:
             allow_origins=origins,
             allow_methods=["GET"],
             allow_headers=["authorization", "content-type"],
+            # Lets a browser script read the export's file name.
+            expose_headers=["content-disposition"],
             max_age=600,
         )
 
@@ -134,6 +137,17 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(health, prefix=API_PREFIX)
-    for module in (users, agents, mcp_servers, governance, observability, guardrails, fleet, catalog, registrations):
+    for module in (
+        users,
+        agents,
+        mcp_servers,
+        governance,
+        observability,
+        guardrails,
+        fleet,
+        catalog,
+        registrations,
+        omni,
+    ):
         app.include_router(module.router, prefix=API_PREFIX)
     return app

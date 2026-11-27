@@ -25,6 +25,12 @@ _FIELDS = (
     "document_sha256",
     "status_before",
     "status_after",
+    "agent_id",
+    "runtime_arn",
+    "sessions_found",
+    "sessions_stopped",
+    "sessions_failed",
+    "detail",
 )
 
 
@@ -35,6 +41,28 @@ def record_key(record_id: str) -> str:
 def name_key(record_name: str) -> str:
     """Partition for decisions taken before a record id exists (a create, allowed or denied)."""
     return f"RECORD#NAME#{record_name}"
+
+
+def containment_key(agent_id: str) -> str:
+    return f"CONTAINMENT#{agent_id}"
+
+
+def container(events: list[AuditEvent]) -> AuditEvent | None:
+    """The event that names who contained the agent, or ``None`` when the trail shows it released.
+
+    ``events`` is newest first. Only an action that changed something counts: a
+    repeated contain (outcome ``unchanged``) never replaces the original
+    container, so the two-person rule cannot be dodged by containing again. As
+    for submissions, an intent whose result is missing still counts.
+    """
+    results = {e.request_id: e for e in events if e.phase == "result"}
+    for event in events:
+        if event.action not in ("contain", "release") or event.outcome != "allowed":
+            continue
+        if event.phase == "intent" and event.request_id in results:
+            continue  # its result event decides
+        return event if event.action == "contain" else None
+    return None
 
 
 def from_item(item: dict[str, Any]) -> AuditEvent:

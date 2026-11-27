@@ -51,6 +51,7 @@ def cell_health(cell: Cell, states: list[str], entered_alarm_last_24h: bool) -> 
         alarms_in_alarm=sum(1 for state in states if state == ALARM),
         alarms_total=len(states),
         reachable=True,
+        omni_url=cell.omni_domain_url,
     )
 
 
@@ -64,6 +65,7 @@ def unreachable(cell: Cell, detail: str) -> CellHealth:
         state="no_data",
         reachable=False,
         detail=detail,
+        omni_url=cell.omni_domain_url,
     )
 
 
