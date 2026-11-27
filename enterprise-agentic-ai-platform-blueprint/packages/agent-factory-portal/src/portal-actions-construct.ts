@@ -49,6 +49,12 @@ export const PORTAL_APPROVER_REGISTRY_ACTIONS: readonly string[] = [
  */
 export const PORTAL_REGISTRAR_AUDIT_ACTIONS: readonly string[] = ["dynamodb:PutItem"];
 export const PORTAL_APPROVER_AUDIT_ACTIONS: readonly string[] = ["dynamodb:PutItem", "dynamodb:Query"];
+/**
+ * The containment function reads one record of the agent Registry, to resolve
+ * a registered agent's Runtime and tenant. It cannot create, change, submit,
+ * approve or delete a record.
+ */
+export const PORTAL_CONTAINMENT_REGISTRY_ACTIONS: readonly string[] = ["agent-registry:GetRegistryRecord"];
 export const PORTAL_AUDIT_READER_ACTIONS: readonly string[] = ["dynamodb:Query"];
 
 export function portalRegistrarRoleName(environment: PortalEnvironment): string {
@@ -289,9 +295,10 @@ export class PortalActions extends Construct {
     this.approverRole = approver.role;
 
     // Incident containment: its own function and role. The role can only
-    // assume the containment target role of cells that deployed one, and
-    // append to and read the audit trail. It holds no AgentCore permission of
-    // its own and no Registry permission.
+    // assume the containment target role of cells that deployed one, read one
+    // record of the agent Registry (to resolve a registered agent's Runtime
+    // and tenant), and append to and read the audit trail. It holds no
+    // AgentCore permission of its own and cannot change a Registry record.
     const containmentCells = (props.cells ?? []).filter((c) => c.containment);
     if (containmentCells.length > 0) {
       const targets = [
@@ -307,6 +314,7 @@ export class PortalActions extends Construct {
         actionRole: "containment",
         roleName: portalContainmentRoleName(props.environment),
         handler: "containment_handler.handler",
+        registryActions: PORTAL_CONTAINMENT_REGISTRY_ACTIONS,
         auditActions: PORTAL_APPROVER_AUDIT_ACTIONS,
         statements: [
           new PolicyStatement({

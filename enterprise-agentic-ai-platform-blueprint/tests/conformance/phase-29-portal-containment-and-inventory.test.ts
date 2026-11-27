@@ -5,13 +5,14 @@
  * Containment is the one deliberate exception to "central visibility must not
  * become central write access". This suite pins how narrow it is:
  *   - a cell is containable only when it deploys the target role;
- *   - the target role holds four actions on that cell's Runtimes (resource
- *     policy read, put and delete; stop a session), may query the spans log
- *     group to find the sessions, and trusts only
- *     the portal's containment function role, with the cell's external id;
- *   - the containment function's own role can only assume those target roles
- *     and append to and read the audit trail: no AgentCore, Registry or other
- *     permission of its own;
+ *   - the target role holds five actions on that cell's Runtimes (resource
+ *     policy read, put and delete; stop a session; list endpoints), may find
+ *     the sessions in the spans log group and in the names of the Runtimes'
+ *     log streams, and trusts only the portal's containment function role,
+ *     with the cell's external id;
+ *   - the containment function's own role can only assume those target roles,
+ *     read one record of the agent Registry and append to and read the audit
+ *     trail: no AgentCore permission of its own, and no Registry write;
  *   - the write routes go to that function, behind the JWT authorizer;
  *   - without a containable cell the function, role and routes do not exist.
  *
@@ -29,6 +30,7 @@ import { Annotations, Match, Template } from "aws-cdk-lib/assertions";
 import { AwsSolutionsChecks, NIST80053R5Checks } from "cdk-nag";
 
 import {
+  PORTAL_CONTAINMENT_REGISTRY_ACTIONS,
   PORTAL_CONTAINMENT_TARGET_ACTIONS,
   PORTAL_EXTERNAL_READER_AGENTCORE_ACTIONS,
   PORTAL_EXTERNAL_READER_METRIC_ACTIONS,
@@ -127,21 +129,37 @@ describe("Phase 29 — containment target role (Workstream cell)", () => {
   const template = Template.fromStack(stack);
   const statements = statementsOfRole(template, "AgenticAI-PortalContainmentTarget-nonprod");
 
-  it("holds exactly the four containment actions on this cell's Runtimes, and the span query that finds sessions", () => {
+  it("holds exactly the five containment actions on this cell's Runtimes, and the two reads that find sessions", () => {
+    expect([...PORTAL_CONTAINMENT_TARGET_ACTIONS].sort()).toEqual([
+      "bedrock-agentcore:DeleteResourcePolicy",
+      "bedrock-agentcore:GetResourcePolicy",
+      "bedrock-agentcore:ListAgentRuntimeEndpoints",
+      "bedrock-agentcore:PutResourcePolicy",
+      "bedrock-agentcore:StopRuntimeSession",
+    ]);
     const runtime = statements.find((s) => s.Sid === "ContainRuntimes")!;
     expect(actions([runtime]).sort()).toEqual([...PORTAL_CONTAINMENT_TARGET_ACTIONS].sort());
     expect(JSON.stringify(runtime.Resource)).toContain(`:bedrock-agentcore:${REGION}:${CELL}:runtime/*`);
     expect(JSON.stringify(runtime.Resource)).not.toMatch(/gateway|memory|"\*"/);
     expect(actions(statements).sort()).toEqual(
-      [...PORTAL_CONTAINMENT_TARGET_ACTIONS, "logs:StartQuery", "logs:GetQueryResults"].sort(),
+      [...PORTAL_CONTAINMENT_TARGET_ACTIONS, "logs:StartQuery", "logs:GetQueryResults", "logs:DescribeLogStreams"].sort(),
     );
     const query = statements.find((s) => s.Sid === "FindRuntimeSessions")!;
     expect(JSON.stringify(query.Resource)).toContain(`:logs:${REGION}:${CELL}:log-group:aws/spans:*`);
   });
 
-  it("cannot invoke, change or delete a Runtime, or touch anything else", () => {
+  it("lists session log stream names only in the log groups of this cell's Runtimes", () => {
+    const streams = statements.find((s) => s.Sid === "FindRuntimeSessionStreams")!;
+    expect(streams.Action).toBe("logs:DescribeLogStreams");
+    const resource = JSON.stringify(streams.Resource);
+    expect(resource).toContain(`:logs:${REGION}:${CELL}:log-group:/aws/bedrock-agentcore/runtimes/*`);
+    expect(resource).not.toContain("log-group:*");
+  });
+
+  it("cannot invoke, change or delete a Runtime, read a log event, or touch anything else", () => {
     for (const action of actions(statements)) {
       expect(action).not.toMatch(/:(Invoke|Update|Create|DeleteAgentRuntime|Tag|ListSessions)/);
+      expect(action).not.toMatch(/^logs:(GetLogEvents|FilterLogEvents|GetLogRecord|StartLiveTail|Put|Create|Delete)/);
       expect(action.startsWith("bedrock-agentcore:") || action.startsWith("logs:")).toBe(true);
     }
   });
@@ -209,9 +227,10 @@ describe("Phase 29 — containment function (Platform account)", () => {
   const template = Template.fromStack(stack);
   const statements = statementsOfRole(template, "AgenticAI-PortalContainment-nonprod");
 
-  it("can only assume the target role of cells that deployed one, and use the audit trail", () => {
+  it("can only assume the target role of cells that deployed one, read one Registry record, and use the audit trail", () => {
     const allowed = new Set([
       "sts:AssumeRole",
+      "agent-registry:GetRegistryRecord",
       "dynamodb:PutItem",
       "dynamodb:Query",
       "logs:CreateLogStream",
@@ -224,7 +243,14 @@ describe("Phase 29 — containment function (Platform account)", () => {
     expect(JSON.stringify(assume.Resource)).toContain(`:iam::${CELL}:role/AgenticAI-PortalContainmentTarget-nonprod`);
     // The cell that did not opt in is not reachable.
     expect(JSON.stringify(assume.Resource)).not.toContain("555555555555");
-    expect(actions(statements).some((a) => a.startsWith("bedrock-agentcore:") || a.startsWith("agent-registry:"))).toBe(false);
+    expect(actions(statements).some((a) => a.startsWith("bedrock-agentcore:"))).toBe(false);
+    // The Registry is read, never written, and only the agent Registry.
+    expect([...PORTAL_CONTAINMENT_REGISTRY_ACTIONS]).toEqual(["agent-registry:GetRegistryRecord"]);
+    const registry = statements.filter((s) => actions([s]).some((a) => a.startsWith("agent-registry:")));
+    expect(registry).toHaveLength(1);
+    expect(actions(registry)).toEqual(["agent-registry:GetRegistryRecord"]);
+    expect(JSON.stringify(registry[0].Resource)).toContain(AGENT_REGISTRY.arn);
+    expect(JSON.stringify(registry[0].Resource)).not.toContain(DISCOVERY_REGISTRY.arn);
   });
 
   it("serves the two containment routes behind the JWT authorizer", () => {
