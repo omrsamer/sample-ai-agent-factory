@@ -36,6 +36,11 @@ class Principal:
     groups: tuple[str, ...]
     role: str
 
+    @property
+    def label(self) -> str:
+        """Name shown for this caller, for example as the actor of an audit event."""
+        return self.display_name or self.email or self.subject
+
 
 def parse_multi_value(value: Any) -> tuple[str, ...]:
     """Normalise a multi-valued claim.
@@ -99,6 +104,11 @@ def _text(claims: Mapping[str, Any], *names: str) -> str | None:
     return None
 
 
+def _display_name(claims: Mapping[str, Any]) -> str | None:
+    """A human label for the caller. The subject is the last resort (see ``Principal.label``)."""
+    return _text(claims, "name", "email", "cognito:username", "preferred_username")
+
+
 class IdentityProvider(Protocol):
     name: str
 
@@ -137,7 +147,7 @@ class CognitoProvider:
         return _build(
             _text(claims, "sub"),
             _text(claims, "email"),
-            _text(claims, "name", "cognito:username", "username"),
+            _display_name(claims),
             groups,
             role_map,
         )
@@ -157,7 +167,7 @@ class EntraProvider:
         return _build(
             _text(claims, "oid"),
             _text(claims, "preferred_username", "email", "upn"),
-            _text(claims, "name"),
+            _display_name(claims),
             merged,
             role_map,
         )

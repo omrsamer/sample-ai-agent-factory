@@ -34,7 +34,7 @@ export default function CostTab({ agentId }: { agentId: string }) {
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="flex items-end gap-4">
           <div>
-            <label htmlFor="cost-from" className="block text-[11px] font-medium text-slate-500 uppercase tracking-wide mb-1">From</label>
+            <label htmlFor="cost-from" className="block text-[11px] font-medium text-slate-600 uppercase tracking-wide mb-1">From</label>
             <input
               id="cost-from"
               type="date"
@@ -45,7 +45,7 @@ export default function CostTab({ agentId }: { agentId: string }) {
             />
           </div>
           <div>
-            <label htmlFor="cost-to" className="block text-[11px] font-medium text-slate-500 uppercase tracking-wide mb-1">To</label>
+            <label htmlFor="cost-to" className="block text-[11px] font-medium text-slate-600 uppercase tracking-wide mb-1">To</label>
             <input
               id="cost-to"
               type="date"
@@ -57,7 +57,7 @@ export default function CostTab({ agentId }: { agentId: string }) {
           </div>
         </div>
         {loading && (
-          <div className="flex items-center gap-2 text-xs text-slate-400">
+          <div className="flex items-center gap-2 text-xs text-slate-600">
             <span className="w-3.5 h-3.5 border-2 border-slate-300 border-t-slate-500 rounded-full animate-spin" />
             Loading cost metrics…
           </div>
@@ -75,9 +75,9 @@ export default function CostTab({ agentId }: { agentId: string }) {
         <>
           <DataNotes notes={notes} />
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <Kpi label="Total Cost" value={costText(series.totals.cost, costAvailable)} sub="model spend (USD)" color="#f59e0b" />
-            <Kpi label="Total Tokens" value={fmtInt(series.totals.tokens)} sub="input + output" color="#6366f1" />
-            <Kpi label="Total Traces" value={fmtInt(series.totals.traces)} sub="invocations" color="#3b82f6" />
+            <Kpi label="Total Cost" value={costText(series.totals.cost, costAvailable)} sub="model spend (USD)" color="#b45309" />
+            <Kpi label="Total Tokens" value={fmtInt(series.totals.tokens)} sub="input + output" color="#4338ca" />
+            <Kpi label="Total Traces" value={fmtInt(series.totals.traces)} sub="invocations" color="#1d4ed8" />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4">
@@ -106,7 +106,7 @@ export default function CostTab({ agentId }: { agentId: string }) {
                   </ComposedChart>
                 </ResponsiveContainer>
               ) : (
-                <div className="h-[220px] flex items-center justify-center text-sm text-slate-400">No daily breakdown for this range.</div>
+                <div className="h-[220px] flex items-center justify-center text-sm text-slate-600">No daily breakdown for this range.</div>
               )}
             </div>
 
@@ -127,13 +127,13 @@ export default function CostTab({ agentId }: { agentId: string }) {
                       <div key={m.model} className="flex items-center gap-1.5">
                         <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: m.color }} />
                         <span className="text-slate-700 truncate">{m.model}</span>
-                        <span className="text-slate-400 ml-auto tabular-nums">{costAvailable ? fmtUsd(m.cost) : fmtInt(m.tokens)}</span>
+                        <span className="text-slate-600 ml-auto tabular-nums">{costAvailable ? fmtUsd(m.cost) : fmtInt(m.tokens)}</span>
                       </div>
                     ))}
                   </div>
                 </>
               ) : (
-                <div className="h-[180px] flex items-center justify-center text-sm text-slate-400">No model breakdown yet.</div>
+                <div className="h-[180px] flex items-center justify-center text-sm text-slate-600">No model breakdown yet.</div>
               )}
             </div>
           </div>
@@ -143,7 +143,7 @@ export default function CostTab({ agentId }: { agentId: string }) {
             {(metrics?.by_user?.length ?? 0) > 0 ? (
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="text-[11px] uppercase tracking-wide text-slate-400 border-b border-slate-200/70">
+                  <tr className="text-[11px] uppercase tracking-wide text-slate-600 border-b border-slate-200/70">
                     <th scope="col" className="text-left py-2 font-medium">User</th>
                     <th scope="col" className="text-right py-2 font-medium">Invocations</th>
                     <th scope="col" className="text-right py-2 font-medium">Cost</th>
@@ -153,7 +153,7 @@ export default function CostTab({ agentId }: { agentId: string }) {
                   {metrics!.by_user.map((u) => (
                     <tr key={u.user_id || '__nouser__'} className="border-b border-slate-100 last:border-0">
                       <td className="py-2.5 text-slate-700">
-                        {u.user_id || <span className="text-slate-400">No caller identity recorded</span>}
+                        {u.user_id || <span className="text-slate-600">No caller identity recorded</span>}
                       </td>
                       <td className="py-2.5 text-right text-slate-600 tabular-nums">{fmtInt(u.traces)}</td>
                       <td className="py-2.5 text-right font-semibold text-slate-900 tabular-nums">{costText(u.cost_usd, costAvailable)}</td>
@@ -162,7 +162,7 @@ export default function CostTab({ agentId }: { agentId: string }) {
                 </tbody>
               </table>
             ) : (
-              <div className="py-8 text-center text-sm text-slate-400">
+              <div className="py-8 text-center text-sm text-slate-600">
                 No per-user spend yet. Invocations carrying a caller identity will appear here.
               </div>
             )}
@@ -176,9 +176,9 @@ export default function CostTab({ agentId }: { agentId: string }) {
 function Kpi({ label, value, sub, color }: { label: string; value: string; sub: string; color: string }) {
   return (
     <div className={CARD}>
-      <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">{label}</div>
+      <div className="text-[11px] font-medium text-slate-600 uppercase tracking-wide">{label}</div>
       <div className="text-2xl font-semibold mt-1 tabular-nums" style={{ color }}>{value}</div>
-      <div className="text-[11px] text-slate-400 mt-0.5">{sub}</div>
+      <div className="text-[11px] text-slate-600 mt-0.5">{sub}</div>
     </div>
   );
 }

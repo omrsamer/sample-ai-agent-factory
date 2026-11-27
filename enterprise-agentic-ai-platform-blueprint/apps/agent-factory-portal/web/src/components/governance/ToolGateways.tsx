@@ -109,7 +109,7 @@ export default function ToolGateways() {
             <tbody className="divide-y divide-slate-100">
               {loading && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-slate-400 text-sm" role="status">Loading tool gateways…</td>
+                  <td colSpan={7} className="px-4 py-8 text-center text-slate-600 text-sm" role="status">Loading tool gateways…</td>
                 </tr>
               )}
               {!loading && rows.map((m) => {
@@ -127,7 +127,7 @@ export default function ToolGateways() {
                           <Link to={`/tool-gateways/${encodeURIComponent(m.id)}`} className="block font-medium text-blue-700 hover:underline truncate">
                             {m.name}
                           </Link>
-                          <span className="block text-xs text-slate-500 truncate">{mcpEndpoint(m)?.url ?? 'No endpoint recorded'}</span>
+                          <span className="block text-xs text-slate-600 truncate">{mcpEndpoint(m)?.url ?? 'No endpoint recorded'}</span>
                         </div>
                       </div>
                     </td>
@@ -142,7 +142,7 @@ export default function ToolGateways() {
               })}
               {!loading && rows.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-slate-400 text-sm">
+                  <td colSpan={7} className="px-4 py-8 text-center text-slate-600 text-sm">
                     {filtered ? 'No tool gateways match the current filters.' : 'No tool gateways in the registry yet.'}
                   </td>
                 </tr>

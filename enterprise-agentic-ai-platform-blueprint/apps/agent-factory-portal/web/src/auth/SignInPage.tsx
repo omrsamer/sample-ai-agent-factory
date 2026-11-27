@@ -26,8 +26,8 @@ export default function SignInPage({ environment }: { environment: string }) {
       <main className="w-full max-w-md bg-white rounded-2xl border border-slate-200 p-10 shadow-lg">
         <div className="text-center mb-8">
           <h1 className="text-2xl font-bold text-slate-900 mb-2">Agent Factory Portal</h1>
-          <p className="text-sm text-slate-500">
-            Read-only view of the agent fleet, its tool gateways and the governance catalog.
+          <p className="text-sm text-slate-600">
+            The agent fleet, its tool gateways and the governance catalog.
           </p>
         </div>
 
@@ -46,7 +46,7 @@ export default function SignInPage({ environment }: { environment: string }) {
           {loading ? 'Redirecting…' : `Sign in with ${providerLabel}`}
         </button>
 
-        <p className="mt-6 text-xs text-center text-slate-400">Environment: {environment}</p>
+        <p className="mt-6 text-xs text-center text-slate-600">Environment: {environment}</p>
       </main>
     </div>
   );

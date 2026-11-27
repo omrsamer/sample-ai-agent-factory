@@ -43,7 +43,7 @@ export default function EvaluationsTab({ agentId }: { agentId: string }) {
 
   if (loading) {
     return (
-      <div className={`${CARD} p-5 flex items-center gap-2 text-xs text-slate-400`} role="status">
+      <div className={`${CARD} p-5 flex items-center gap-2 text-xs text-slate-600`} role="status">
         <span className="w-3.5 h-3.5 border-2 border-slate-300 border-t-slate-500 rounded-full animate-spin" aria-hidden="true" />
         Loading…
       </div>
@@ -69,13 +69,13 @@ export default function EvaluationsTab({ agentId }: { agentId: string }) {
     <div className="space-y-4">
       <DataNotes notes={runs.warnings ?? []} />
       <div className={`${CARD} p-5`}>
-        <div className="text-[11px] uppercase tracking-wide text-slate-400 font-medium">Release gate · current build</div>
+        <div className="text-[11px] uppercase tracking-wide text-slate-600 font-medium">Release gate · current build</div>
         <div className="mt-1 flex items-center gap-2">
           <span className={`inline-block h-2.5 w-2.5 rounded-full ${GATE_DOT[card.state]}`} aria-hidden="true" />
           <span className="text-sm font-semibold text-slate-900">{card.headline}</span>
         </div>
-        {card.facts.length > 0 && <div className="mt-1 text-xs text-slate-500 tabular-nums">{card.facts.join(' · ')}</div>}
-        {card.detail && <p className="mt-1 text-xs text-slate-500">{card.detail}</p>}
+        {card.facts.length > 0 && <div className="mt-1 text-xs text-slate-600 tabular-nums">{card.facts.join(' · ')}</div>}
+        {card.detail && <p className="mt-1 text-xs text-slate-600">{card.detail}</p>}
         {card.regressions.length > 0 && (
           <div className="mt-1 text-xs text-amber-700">Regression against the baseline: {card.regressions.join('; ')}</div>
         )}
@@ -89,12 +89,12 @@ export default function EvaluationsTab({ agentId }: { agentId: string }) {
       <div className={`${CARD} p-5`}>
         <h2 className="text-sm font-semibold text-slate-900 mb-3">Recent runs</h2>
         {recent.length === 0 ? (
-          <p className="text-sm text-slate-500">No evaluation has run for this agent yet.</p>
+          <p className="text-sm text-slate-600">No evaluation has run for this agent yet.</p>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="text-[11px] text-slate-400 uppercase tracking-wide border-b border-slate-100">
+                <tr className="text-[11px] text-slate-600 uppercase tracking-wide border-b border-slate-100">
                   <th scope="col" className={TH}>Started</th>
                   <th scope="col" className={`${TH} pl-4`}>Environment</th>
                   <th scope="col" className={`${TH} pl-4`}>Result</th>
@@ -129,7 +129,7 @@ export default function EvaluationsTab({ agentId }: { agentId: string }) {
                               </div>
                             ))}
                       </td>
-                      <td className="py-2.5 pl-4 text-slate-500 capitalize">{run.trigger}</td>
+                      <td className="py-2.5 pl-4 text-slate-600 capitalize">{run.trigger}</td>
                     </tr>
                   );
                 })}
@@ -142,13 +142,13 @@ export default function EvaluationsTab({ agentId }: { agentId: string }) {
       {overrides.length > 0 && (
         <div className={`${CARD} p-5`}>
           <h2 className="text-sm font-semibold text-slate-900">Gate overrides</h2>
-          <p className="text-xs text-slate-500 mt-0.5 mb-3">Promotions made without a passing evaluation, with the reason the approver gave.</p>
+          <p className="text-xs text-slate-600 mt-0.5 mb-3">Promotions made without a passing evaluation, with the reason the approver gave.</p>
           <ul className="divide-y divide-slate-100">
             {overrides.map((o) => (
               <li key={`${o.at}-${o.by}`} className="py-2 text-sm">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   <span className="font-medium text-slate-800" title={o.by}>{o.by_name || o.by}</span>
-                  <span className="text-xs text-slate-400 tabular-nums">{formatDate(o.at)}</span>
+                  <span className="text-xs text-slate-600 tabular-nums">{formatDate(o.at)}</span>
                 </div>
                 <p className="text-slate-600 mt-0.5 break-words">{o.reason}</p>
               </li>

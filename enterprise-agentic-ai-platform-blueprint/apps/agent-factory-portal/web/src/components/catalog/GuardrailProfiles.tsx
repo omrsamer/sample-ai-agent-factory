@@ -13,17 +13,16 @@ function ProfileDetail({ templateId }: { templateId: string }) {
   if (error || !data) return <ErrorCard title="Couldn’t load the profile" message={error ?? 'No data was returned.'} onRetry={reload} />;
   const features = guardrailFeatures(data);
   return (
-    <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4">
-      <div className="sm:col-span-2 flex flex-wrap gap-1.5">
+    <>
+      <div className="flex flex-wrap gap-1.5 mb-4">
         {features.length === 0 ? (
-          <span className="text-xs text-slate-400">No protections configured</span>
+          <span className="text-xs text-slate-600">No protections configured</span>
         ) : (
           features.map((f) => <Badge key={f} cls="bg-slate-100 text-slate-600" label={f} />)
         )}
       </div>
-      <div className="sm:col-span-2">
-        <Field label="Guardrail ARN"><CodeValue value={data.guardrail_arn} copyLabel="guardrail ARN" /></Field>
-      </div>
+    <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4">
+      <Field className="sm:col-span-2" label="Guardrail ARN"><CodeValue value={data.guardrail_arn} copyLabel="guardrail ARN" /></Field>
       <Field label="Guardrail version">{data.guardrail_version ?? '—'}</Field>
       <Field label="Updated">{formatDate(data.updated_at)}</Field>
       <Field label="Content filters">
@@ -55,6 +54,7 @@ function ProfileDetail({ templateId }: { templateId: string }) {
           : 'Off'}
       </Field>
     </dl>
+    </>
   );
 }
 
@@ -67,7 +67,7 @@ function ProfileCard({ profile }: { profile: GuardrailTemplate }) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <h3 className="text-sm font-semibold text-slate-900">{profile.name}</h3>
+            <h2 className="text-sm font-semibold text-slate-900">{profile.name}</h2>
             <Badge cls={status.cls} label={status.label} />
           </div>
           {profile.description && <p className="text-sm text-slate-600 mt-1">{profile.description}</p>}

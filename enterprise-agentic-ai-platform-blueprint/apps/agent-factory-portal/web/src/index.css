@@ -48,6 +48,35 @@ body {
   @apply bg-white rounded-xl border border-slate-200 p-6;
 }
 
+/* A link inside running text is underlined, so it does not rely on colour alone. */
+main p a,
+main li > a:not(:only-child) {
+  text-decoration: underline;
+}
+
+/* Keyboard focus is always visible, on every control. */
+:focus-visible {
+  outline: 2px solid #1d4ed8;
+  outline-offset: 2px;
+}
+
+.skip-link {
+  position: absolute;
+  left: 0.5rem;
+  top: -3rem;
+  z-index: 100;
+  padding: 0.5rem 0.75rem;
+  background: #ffffff;
+  color: #1d4ed8;
+  border: 2px solid #1d4ed8;
+  border-radius: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.skip-link:focus {
+  top: 0.5rem;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -1,4 +1,4 @@
-# Agent Factory Portal: API contract (milestone 1)
+# Agent Factory Portal: API contract
 
 This is the hand-off between the web front end in this directory and the portal API. It lists
 every request the front end makes. The source of truth for the types is
@@ -7,14 +7,17 @@ every request the front end makes. The source of truth for the types is
 
 ## Rules that apply to every endpoint
 
-- **Read-only.** Every request is a `GET`. The front end sends no `POST`, `PUT`, `PATCH` or
-  `DELETE`, and no request body.
+- **Read-only by default.** With `features.governedActions` off (the default) every request is
+  a `GET`: the front end sends no `POST`, `PUT`, `PATCH` or `DELETE` and no request body, and
+  the code that could is never downloaded. With it on, the front end additionally calls the
+  registration endpoints in the last section, and writes only to `/registrations...`.
 - **Base path.** Paths below are relative to `apiBaseUrl` from `/config.json`, which already ends
   in `/api/v1` (for example `GET {apiBaseUrl}/agents` is `GET /api/v1/agents`).
 - **Authentication.** Each request carries `Authorization: Bearer <token>` and
   `Accept: application/json`. No other custom header is sent (no `x-user-email`, no
-  `Content-Type` on a `GET`), so a CORS configuration only has to allow the `authorization`
-  request header.
+  `Content-Type` on a `GET`), so a CORS configuration for the read API only has to allow the
+  `authorization` request header. A write with a body also sends
+  `Content-Type: application/json`.
   - `authProvider: "cognito"`: the token is the Cognito **ID token** (`token_use: "id"`), whose
     `aud` is the app client id. The access token is never sent.
   - `authProvider: "entra"`: the token is the Entra **access token** for `entra.apiScope`.
@@ -124,8 +127,11 @@ interface CurrentUser {
   role_level: number;      // 0 viewer, 1 operator, 2 admin
   can_deploy: boolean;     // not used in milestone 1
   oid: string | null;      // not used in milestone 1
-  name: string | null;
+  name: string | null;     // display label: name, then email. A value shaped like a UUID is treated as a token subject and not shown
   tenants: UserTenant[];
+  can_register?: boolean;  // governed actions only: may create, edit, submit and delete registrations
+  can_approve?: boolean;   // governed actions only: may approve and reject, and sees the Approvals screen
+  registration_tenants?: string[] | null;  // tenants the caller acts for; ["*"] or null means the UI does not restrict by tenant
 }
 interface UserTenant {
   id: string;
@@ -139,6 +145,13 @@ Used for: the profile in the sidebar; resolving `tenant_id` values to tenant nam
 screen (an id that is not in `tenants` is shown as the raw id); and `role_level >= 2` offers the
 "Platform" scope on the Observability screen. If this request fails the portal still works and
 shows identity-provider claims in the profile.
+
+The profile label is `name`, then `email`, then the identity provider's name or email claim.
+The token subject is never displayed; if nothing else is known the label is "Signed in".
+
+`can_register`, `can_approve` and `registration_tenants` only decide which controls are
+offered. Only the boolean `true` grants an authority. The action endpoints enforce every rule
+themselves, and a refusal is displayed.
 
 ## 2. `GET /agents` returns `Agent[]`
 
@@ -645,6 +658,119 @@ interface CatalogTool {
 }
 ```
 
+## Governed registration and approval (only with `features.governedActions: true`)
+
+The endpoints, bodies, status codes and rules are defined by the back end in
+[`../api/ACTIONS_CONTRACT.md`](../api/ACTIONS_CONTRACT.md). This section lists exactly what the
+front end calls and reads. The client is `src/actions/registrationsClient.ts`, the only module
+that issues a write; it is loaded only when the flag is on.
+
+| # | Method | Path | Body | Response |
+|---|--------|------|------|----------|
+| 24 | GET | `/registrations` | query `status?` | `Registration[]` |
+| 25 | GET | `/registrations/{record_id}` | none | `RegistrationDetail` |
+| 26 | GET | `/registrations/{record_id}/history` | none | `RegistrationHistory` |
+| 27 | POST | `/registrations` | `RegistrationInput` | `ActionResult` |
+| 28 | PUT | `/registrations/{record_id}` | `RegistrationInput` | `ActionResult` |
+| 29 | POST | `/registrations/{record_id}/submit` | none | `ActionResult` |
+| 30 | DELETE | `/registrations/{record_id}` | none | `ActionResult` |
+| 31 | POST | `/registrations/{record_id}/approve` | `{ reason, document_sha256 }` | `ActionResult` |
+| 32 | POST | `/registrations/{record_id}/reject` | `{ reason, document_sha256 }` | `ActionResult` |
+
+Which screen calls what:
+
+| Screen | Endpoints |
+|--------|-----------|
+| Registrations (list) | 24 with `status` when a filter is chosen |
+| Register agent (new) | 23 (tools to choose from), 3 when opened from a discovered agent, then 27 |
+| Edit registration | 25, 23, then 28 |
+| Registration (record page) | 25, 26; then 29, 30, 31 or 32 on the matching action |
+| Approvals | 24 with `status=PENDING_APPROVAL`, then 25 once per pending record |
+
+What the front end reads and sends:
+
+```ts
+interface Registration {
+  record_id: string;
+  name: string;                    // shown when agent_id is absent
+  status: string;                  // registry status; an unknown value is shown as recorded
+  status_reason?: string | null;   // shown as the decision when decision_reason is absent
+  record_version?: string | null;
+  tenant_id?: string | null;
+  agent_id?: string | null;
+  environment?: string | null;
+  document: RegistrationDocument;  // snake_case keys; see ACTIONS_CONTRACT.md
+  document_sha256: string;         // sent back with a decision
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+interface RegistrationDetail extends Registration {
+  created_by_label?: string | null;
+  submitted_by_label?: string | null;
+  submitted_at?: string | null;
+  submitted_by_me?: boolean;       // true hides Approve and Reject and explains why
+  decision?: string | null;        // not displayed
+  decided_by_label?: string | null;
+  decided_at?: string | null;
+  decision_reason?: string | null;
+  previous_approved?: RegistrationDocument | null;   // the document at the latest approval made through the portal; null when there was none
+}
+
+interface RegistrationHistory {
+  record_id: string;
+  events: {
+    event_id: string; request_id: string; at: string;
+    phase: 'intent' | 'result'; action: string; outcome: 'allowed' | 'denied' | 'failed';
+    reason: string; actor_label: string; actor_role?: string | null;
+    status_before?: string | null; status_after?: string | null;
+  }[];
+}
+
+interface ActionResult {
+  action: string; outcome: string; reason: string;
+  request_id: string;              // shown as the reference when audit_complete is false
+  registration: Registration | null;
+  audit_complete: boolean;         // false is shown as a warning
+}
+```
+
+- **Form fields** (the document's properties): tenant, agent id, environment, owner group,
+  contact, business purpose, risk class, data classification, cost centre, application id,
+  framework, golden path name and version, runtime ARN, tool gateway ARN, subscribed tool ids,
+  record version. Other properties of an existing document (`memory_id`, `policy_engine_arn`,
+  `policy_engine_mode`, `source_revision`, `evaluation`) are sent back unchanged on an update.
+- **Request body** of 27 and 28: the flat `RegistrationInput`, snake_case, without
+  `schema_version`. An empty optional field is omitted, never sent as an empty string. On an
+  update `record_version` is omitted unless the user raised it.
+- **Client-side validation** copies the enums, patterns, lengths and required fields of
+  `packages/agent-registry/schemas/agent-governance-1.0.json`. A test reads that file and fails
+  if the copy drifts. The server's answer always wins.
+- **Locked inputs:** tenant, agent id and environment on any existing record; runtime ARN, tool
+  gateway ARN, subscribed tools, risk class and data classification on an `APPROVED` record,
+  with the explanation that changing them needs a new registration.
+- **Controls offered:** Edit on `DRAFT`, `PENDING_APPROVAL`, `REJECTED`, `APPROVED` (with a
+  warning that saving returns the record to Draft); Submit on `DRAFT`; Delete on anything except
+  `APPROVED`; Approve and Reject on `PENDING_APPROVAL` when `can_approve` is true and
+  `submitted_by_me` is not true. Nothing is offered on a record whose tenant is outside a
+  restricted `registration_tenants`.
+- **History:** one row per action, taken from the `result` events. An `intent` with no `result`
+  is kept and marked "No result recorded". A 404 is shown as "no history".
+- **Errors:** a 422 is a list of `{ loc, msg, type }` and is mapped to form fields by the name
+  after `"body"` in `loc` (`risk_class`, or `golden_path` then `name`); an item that names no
+  form field is shown above the form; 403 is shown as "You do not hold the
+  authority for this action" with `detail`; 409 as a state conflict with `detail` and a Refresh
+  button (this also covers the second or so a record spends in `CREATING` or `UPDATING`); 503
+  as "Nothing was changed", with an invitation to try again. `hint` and `request_id` are shown
+  when present.
+
+**Diff.** When `previous_approved` is present, the record page shows the fields that differ
+between it and `document`. `record_version` is left out, since the server raises it on every
+update. An optional field that was not sent again is shown as "Removed". When
+`previous_approved` is null (a record never approved through the portal) no diff is shown. On
+an unchanged `APPROVED` record the two are equal and the section is hidden; on a
+`PENDING_APPROVAL` record with no differences it says so.
+
 ## Runtime configuration and sign-in (what infrastructure must provide)
 
 The site must serve `/config.json` next to the bundle:
@@ -665,7 +791,7 @@ The site must serve `/config.json` next to the bundle:
     "apiScope": "api://<apiAppId>/access_as_user"
   },
   "environment": "nonprod",
-  "features": { "readOnly": true }
+  "features": { "readOnly": true, "governedActions": false }
 }
 ```
 
@@ -675,8 +801,13 @@ The site must serve `/config.json` next to the bundle:
   still contains `<` or `>`, or is an all-zero GUID is rejected and the portal shows a
   configuration error page instead of starting.
 - `cognito.scopes` defaults to `["openid", "email", "profile"]` and must include `openid`.
-- `environment` is `nonprod` (default) or `prod`. `features.readOnly` defaults to `true`;
-  milestone 1 is read-only whatever its value.
+- `environment` is `nonprod` (default) or `prod`. `features.readOnly` defaults to `true` and is
+  informational.
+- `features.governedActions` defaults to `false`. Only the boolean `true` turns it on. Off, the
+  registration screens, routes, navigation entries and their code are absent and the site issues
+  only `GET` requests. On, a Content Security Policy needs nothing new (`connect-src` already
+  covers the API), but CORS on the action endpoints must allow `POST`, `PUT`, `DELETE` and the
+  `content-type` request header.
 - Serve `/config.json` with `Cache-Control: no-cache`; the front end also requests it with
   `cache: 'no-store'`.
 - The host must answer unknown paths with `index.html` (single-page application routing).

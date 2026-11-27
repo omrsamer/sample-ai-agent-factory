@@ -52,7 +52,7 @@ export default function AgentToolSubscriptionsTab({ agent }: { agent: Agent }) {
       ) : error ? (
         <ErrorCard title="Couldn’t load tool subscriptions" message={error} onRetry={reload} />
       ) : rows.length === 0 ? (
-        <div className={`${CARD} p-5 text-sm text-slate-500`}>This agent is not subscribed to any tool gateway.</div>
+        <div className={`${CARD} p-5 text-sm text-slate-600`}>This agent is not subscribed to any tool gateway.</div>
       ) : (
         <div className={`${CARD} overflow-x-auto`}>
           <table className="w-full text-sm">

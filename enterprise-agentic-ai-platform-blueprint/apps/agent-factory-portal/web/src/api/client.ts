@@ -82,10 +82,16 @@ export function formatApiErrorDetail(
 /** Thrown for a non-2xx response, so callers can tell "not found" from other failures. */
 export class ApiRequestError extends Error {
   readonly status: number | undefined;
-  constructor(message: string, status: number | undefined) {
+  /** The `detail` of the error body as sent, for callers that map validation errors to fields. */
+  readonly detail: ApiError['detail'] | undefined;
+  /** The whole error body, for callers that read fields beyond `detail`. */
+  readonly body: unknown;
+  constructor(message: string, status: number | undefined, detail?: ApiError['detail'], body?: unknown) {
     super(message);
     this.name = 'ApiRequestError';
     this.status = status;
+    this.detail = detail;
+    this.body = body;
   }
 }
 
@@ -125,7 +131,9 @@ client.interceptors.response.use(
       return Promise.reject(new ApiRequestError(message, 401));
     }
     const message = formatApiErrorDetail(error.response?.data?.detail, error.message);
-    return Promise.reject(new ApiRequestError(message, error.response?.status));
+    return Promise.reject(
+      new ApiRequestError(message, error.response?.status, error.response?.data?.detail, error.response?.data),
+    );
   },
 );
 
@@ -150,6 +158,14 @@ export interface CurrentUser {
   can_deploy: boolean;
   oid: string | null;
   name: string | null;
+  /** Label to show for the caller (name, then email). Never the token subject. */
+  display_name?: string | null;
+  /** May create, edit, submit and delete registrations. The action endpoints enforce it. */
+  can_register?: boolean;
+  /** May approve and reject registrations. The action endpoints enforce it. */
+  can_approve?: boolean;
+  /** Tenants the caller acts for: `["*"]` for every tenant, null when not known. */
+  registration_tenants?: string[] | null;
   tenants: UserTenant[];
 }
 

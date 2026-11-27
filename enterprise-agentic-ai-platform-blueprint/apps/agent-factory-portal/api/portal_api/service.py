@@ -13,11 +13,15 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from botocore.exceptions import ClientError
+
+from portal_api import registrations as registration_helpers
 from portal_api.aws import agentcore, cloudwatch, guardrails, logs, pipelines, registry
+from portal_api.aws import audit as audit_reader
 from portal_api.aws.cache import TTLCache
 from portal_api.aws.parallel import pmap
 from portal_api.aws.session import AwsClients, error_code
-from portal_api.config import Cell, Settings
+from portal_api.config import Cell, ConfigError, Settings
 from portal_api.mappers import agents as agent_mapper
 from portal_api.mappers import graph as graph_mapper
 from portal_api.mappers import guardrails as guardrail_mapper
@@ -29,7 +33,14 @@ from portal_api.mappers import release as release_mapper
 from portal_api.mappers.agents import AgentEntry, Runtime
 from portal_api.mappers.common import arn_parts, arn_resource_id, now_iso
 from portal_api.mappers.mcp import GatewayEntry
-from portal_api.models.portal import CatalogModel, CatalogTool, FleetHealth
+from portal_api.models.portal import (
+    CatalogModel,
+    CatalogTool,
+    FleetHealth,
+    Registration,
+    RegistrationDetail,
+    RegistrationHistory,
+)
 from portal_api.models.wire import (
     AgentMcpGrant,
     AgentMetricRow,
@@ -517,6 +528,82 @@ class PortalService:
             else:
                 results.append(result)
         return health_mapper.fleet(now_iso(), results)
+
+    # --- registrations -------------------------------------------------------
+
+    def registrations(self, status: str | None = None, tenant_id: str | None = None) -> list[Registration]:
+        """Agent governance records, read fresh so the list reflects an action that just completed."""
+        client = self.clients.platform("agent-registry-control", self.settings.registry_region)
+        result = []
+        for record in registry.list_records(client, self.settings.registry_id):
+            document = registration_helpers.agent_document(record)
+            if document is None:
+                continue
+            item = registration_helpers.to_registration(record, document)
+            if status and item.status != status:
+                continue
+            if tenant_id and item.tenant_id != tenant_id:
+                continue
+            result.append(item)
+        return sorted(result, key=lambda r: (r.updated_at or "", r.name), reverse=True)
+
+    def registration(self, record_id: str, caller_subject: str) -> RegistrationDetail:
+        """One agent governance record, with who created, submitted and decided it."""
+        client = self.clients.platform("agent-registry-control", self.settings.registry_region)
+        try:
+            record = client.get_registry_record(registryId=self.settings.registry_id, recordId=record_id)
+        except ClientError as exc:
+            if error_code(exc) == "ResourceNotFoundException":
+                raise NotFound("Registration not found") from exc
+            raise
+        document = registration_helpers.agent_document(record)
+        if document is None:
+            raise NotFound("Registration not found")
+        detail = RegistrationDetail(**registration_helpers.to_registration(record, document).model_dump())
+        if not self.settings.audit_table:
+            return detail
+        dynamodb = self.clients.platform("dynamodb", self.settings.registry_region)
+        items = audit_reader.query_items(dynamodb, self.settings.audit_table, audit_reader.record_key(record_id))
+        events = [audit_reader.from_item(item) for item in items]
+        approved = audit_reader.last_approved_document(items)
+        if approved:
+            detail.previous_approved = registration_helpers.snake_document(approved)
+        done = [e for e in events if e.phase == "result" and e.outcome == "allowed"]  # newest first
+        created = next((e for e in reversed(done) if e.action == "create"), None)
+        if created:
+            detail.created_by, detail.created_by_label = created.actor_subject, created.actor_label
+        if detail.status in ("PENDING_APPROVAL", "APPROVED", "REJECTED"):
+            submitted = audit_reader.submitter(events)
+            if submitted:
+                detail.submitted_by, detail.submitted_by_label = submitted.actor_subject, submitted.actor_label
+                detail.submitted_at = submitted.at
+                detail.submitted_by_me = submitted.actor_subject == caller_subject
+        if detail.status in ("APPROVED", "REJECTED"):
+            decided = next((e for e in done if e.action in ("approve", "reject")), None)
+            if decided:
+                detail.decision, detail.decided_by_label = decided.action, decided.actor_label
+                detail.decided_at, detail.decision_reason = decided.at, decided.reason
+        return detail
+
+    def registration_history(self, record_id: str) -> RegistrationHistory:
+        """The audit trail of one record, newest first. Works for a deleted record too."""
+        table = self.settings.audit_table
+        if not table:
+            raise ConfigError("PORTAL_AUDIT_TABLE is not set")
+        dynamodb = self.clients.platform("dynamodb", self.settings.registry_region)
+        events = audit_reader.query_events(dynamodb, table, audit_reader.record_key(record_id))
+        # Decisions taken before the record had an id (its creation) are filed under its name.
+        names = {event.record_name for event in events if event.record_name}
+        for name in sorted(names):
+            events.extend(
+                event
+                for event in audit_reader.query_events(dynamodb, table, audit_reader.name_key(name))
+                if event.record_id in (None, record_id)
+            )
+        if not events:
+            raise NotFound("No history for this registration")
+        events.sort(key=lambda e: (e.at, e.event_id), reverse=True)
+        return RegistrationHistory(record_id=record_id, events=events)
 
     # --- catalogue -----------------------------------------------------------
 

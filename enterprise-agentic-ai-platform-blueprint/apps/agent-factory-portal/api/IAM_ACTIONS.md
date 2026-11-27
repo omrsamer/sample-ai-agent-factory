@@ -1,25 +1,37 @@
 # IAM actions used by the Agent Factory Portal API
 
-This file lists every IAM action the code calls, and nothing else. All of them
-are read actions. The API has no code path that creates, updates, deletes,
-tags or invokes anything. `tests/test_readonly.py` fails if the code calls an
-operation that is not listed here, or if this file lists an action the code
-does not call.
+This file lists every IAM action the code calls, per role, and nothing else.
+`tests/test_readonly.py` fails if a role's code calls an operation that is not
+in its table, or if a table lists an action that role's code does not call.
+
+There are three Lambda functions, each with its own role, plus the reader role
+in each cell account:
+
+| Function | Handler | Role | Can change |
+| --- | --- | --- | --- |
+| Read API | `handler.handler` | read role | Nothing |
+| Registrar | `registrar_handler.handler` | registrar role | Registry records (create, update, submit, delete); appends audit events |
+| Approver | `approver_handler.handler` | approver role | A registry record's status; appends audit events |
+
+The read API has no code path that creates, updates, deletes, tags or invokes
+anything, and it does not import the action code at all.
 
 Placeholders: `PLATFORM` is the platform account id, `CELL` is a cell account
-id, `REGION` is the Region of the resource.
+id, `REGION` is the Region of the resource, `AUDIT_TABLE` is the table named in
+`PORTAL_AUDIT_TABLE`.
 
-## 1. Portal Lambda role (platform account)
+## 1. Read role (platform account)
 
 Region for every platform-account call is `PORTAL_REGISTRY_REGION`.
 
 | Action | Resource it can be narrowed to | Needed by |
 | --- | --- | --- |
 | `sts:AssumeRole` | The `readerRoleArn` of each entry in `PORTAL_CELLS` (exact role ARNs, no wildcard) | Every endpoint that reads a cell: `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/fleet/health` |
-| `agent-registry:ListRegistryRecords` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>` | `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/catalog/tools` |
+| `agent-registry:ListRegistryRecords` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>` | `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/catalog/tools`, `/registrations`, `/registrations/{record_id}` |
 | `agent-registry:GetRegistryRecord` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>/record/*` | Same as `ListRegistryRecords` (the list operation does not return descriptors) |
 | `codepipeline:ListPipelineExecutions` | `arn:aws:codepipeline:REGION:PLATFORM:<pipelineName>` for each `pipelineName` in `PORTAL_CELLS` | `/agents/{id}/evals/runs` |
 | `codepipeline:ListActionExecutions` | Same pipeline ARNs | `/agents/{id}/evals/runs` (EvaluationGate action result) |
+| `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | `/registrations/{record_id}`, `/registrations/{record_id}/history` |
 | `bedrock:ListGuardrails` | `*` (list operation) | `/guardrails`, `/guardrails/{id}` |
 | `bedrock:ListTagsForResource` | `arn:aws:bedrock:REGION:PLATFORM:guardrail/*` | `/guardrails`, `/guardrails/{id}`. Called only when `PORTAL_GUARDRAIL_TAG_KEY` is set (tag filter); not needed when it is empty |
 | `bedrock:GetGuardrail` | `arn:aws:bedrock:REGION:PLATFORM:guardrail/*` | `/guardrails/{id}` |
@@ -69,7 +81,41 @@ Notes for the policy author:
   key, the reader role also needs decrypt permission on that key. The code does not
   call AWS KMS itself.
 
-## 3. Notes on the action set
+## 3. Registrar role (platform account)
+
+Function `registrar_handler.handler`, `PORTAL_ACTION_ROLE=registrar`.
+
+| Action | Resource it can be narrowed to | Needed by |
+| --- | --- | --- |
+| `agent-registry:ListRegistryRecords` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>` | `POST /registrations` (the registry does not enforce unique record names, so the function looks for an existing record of the same name) |
+| `agent-registry:GetRegistryRecord` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>/record/*` | Every registrar route (current record, and waiting for CREATING or UPDATING to settle) |
+| `agent-registry:CreateRegistryRecord` | The registry ARN | `POST /registrations` |
+| `agent-registry:UpdateRegistryRecord` | The registry's record ARNs | `PUT /registrations/{record_id}` |
+| `agent-registry:SubmitRegistryRecordForApproval` | The registry's record ARNs | `POST /registrations/{record_id}/submit` |
+| `agent-registry:DeleteRegistryRecord` | The registry's record ARNs | `DELETE /registrations/{record_id}` |
+| `dynamodb:PutItem` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Every registrar route (audit events) |
+
+The registrar code does not call `Query` on the audit table. Granting it is
+harmless but not needed.
+
+## 4. Approver role (platform account)
+
+Function `approver_handler.handler`, `PORTAL_ACTION_ROLE=approver`.
+
+| Action | Resource it can be narrowed to | Needed by |
+| --- | --- | --- |
+| `agent-registry:GetRegistryRecord` | The registry's record ARNs | `POST /registrations/{record_id}/approve`, `POST /registrations/{record_id}/reject` |
+| `agent-registry:UpdateRegistryRecordStatus` | The registry's record ARNs | Same two routes |
+| `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Same two routes (who submitted the record; strongly consistent read) |
+| `dynamodb:PutItem` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Same two routes (audit events) |
+
+Neither action role has `dynamodb:UpdateItem` or `dynamodb:DeleteItem`, and the
+code writes with the condition `attribute_not_exists(pk)`, so an audit event
+can be added but never changed or removed through the API. The approver role
+cannot create, update or delete a record; the registrar role cannot set a
+record's status.
+
+## 5. Notes on the action set
 
 **Tag reads in the cell reader role:** `bedrock-agentcore:ListTagsForResource`
 on `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` and

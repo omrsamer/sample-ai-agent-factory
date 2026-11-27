@@ -2,7 +2,7 @@
 // Derived from Agentic Governance Platform (Apache-2.0); modified for the Agent Factory Portal.
 import { describe, expect, it } from 'vitest';
 import appSrc from '../App.tsx?raw';
-import { PORTAL_NAV, isNavItemActive, navRoutes } from './nav';
+import { PORTAL_NAV, isNavItemActive, navRoutes, portalNav } from './nav';
 
 describe('PORTAL_NAV', () => {
   it('groups the screens by plane, in order', () => {
@@ -31,6 +31,22 @@ describe('PORTAL_NAV', () => {
     const routes = navRoutes().join(' ');
     expect(routes).not.toMatch(/ops|marketplace|admin|studio|new/);
     expect(appSrc).not.toMatch(/path="[^"]*\/(new|create|admin|ops)\b/);
+  });
+});
+
+describe('portalNav', () => {
+  it('is exactly the read-only navigation when governed actions are off', () => {
+    expect(portalNav({ governedActions: false, approver: true })).toBe(PORTAL_NAV);
+    expect(navRoutes(portalNav({ governedActions: false, approver: true }))).not.toEqual(
+      expect.arrayContaining(['/registrations', '/approvals']),
+    );
+  });
+
+  it('adds Registrations under Platform control when they are on, and Approvals for approvers only', () => {
+    const labels = (approver: boolean) =>
+      portalNav({ governedActions: true, approver }).find((s) => s.id === 'platform-control')!.items.map((i) => i.label);
+    expect(labels(false)).toEqual(['Governance catalog', 'Registrations']);
+    expect(labels(true)).toEqual(['Governance catalog', 'Registrations', 'Approvals']);
   });
 });
 

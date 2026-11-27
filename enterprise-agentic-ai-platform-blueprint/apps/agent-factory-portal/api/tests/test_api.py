@@ -409,7 +409,7 @@ def test_current_user_shape(call):
         "role_level": 2,
         "can_deploy": False,
         "oid": "user-1",
-        "name": None,
+        "name": "admin@example.com",
         "tenants": [
             {"id": "ws1", "name": "ws1", "line_of_business": "", "stages": {}},
             {"id": "ws2", "name": "ws2", "line_of_business": "", "stages": {}},
@@ -418,7 +418,36 @@ def test_current_user_shape(call):
         "groups": ["platform-admins", "devs"],
         "identity_provider": "cognito",
         "read_only": True,
+        "can_register": True,
+        "can_approve": True,
+        "authorities": ["registrar", "approver"],
+        "registration_tenants": ["*"],
     }
+
+
+def test_current_user_registration_authorities(call, monkeypatch):
+    def me(groups: str) -> dict:
+        return call("/users/me", claims={"sub": "u", "cognito:groups": groups})[1]
+
+    developer = me("[devs devs2]")
+    assert (developer["can_register"], developer["can_approve"], developer["registration_tenants"]) == (
+        True,
+        False,
+        ["ws1", "ws2"],
+    )
+    approver = me("[approvers]")
+    assert (approver["can_register"], approver["can_approve"], approver["registration_tenants"]) == (
+        False,
+        True,
+        ["ws1"],
+    )
+    assert (developer["authorities"], approver["authorities"]) == (["registrar"], ["approver"])
+    viewer = me("[viewers]")
+    assert viewer["authorities"] == []
+    assert (viewer["can_register"], viewer["can_approve"], viewer["registration_tenants"]) == (False, False, [])
+    monkeypatch.delenv("PORTAL_GROUP_TENANT_MAP")
+    assert me("[devs]")["registration_tenants"] is None
+    assert me("[platform-admins]")["registration_tenants"] == ["*"]
 
 
 def test_agents_merge_registry_records_and_discovered_runtimes(call):

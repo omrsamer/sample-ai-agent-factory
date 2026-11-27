@@ -58,3 +58,135 @@ class CatalogTool(BaseModel):
     status: str
     version: str | None = None
     target_arn: str | None = None
+
+
+# --- Registrations (agent governance records) and their audit trail -------------
+
+
+class GoldenPathInput(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    name: str
+    version: str
+
+
+class EvaluationInput(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    verdict: str
+    run_id: str | None = None
+    completed_at: str | None = None
+
+
+class RegistrationInput(BaseModel):
+    """Request body of create and update: the governance document's fields in snake_case.
+
+    Types only; lengths, patterns and enumerations are checked against the
+    canonical JSON schema after the body is turned into a document.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    tenant_id: str
+    agent_id: str
+    environment: str
+    owner_group: str
+    business_purpose: str
+    risk_class: str
+    data_classification: str
+    cost_centre: str
+    application_id: str | None = None
+    contact: str | None = None
+    framework: str | None = None
+    golden_path: GoldenPathInput | None = None
+    runtime_arn: str | None = None
+    gateway_arn: str | None = None
+    memory_id: str | None = None
+    subscribed_tool_ids: list[str] | None = None
+    policy_engine_arn: str | None = None
+    policy_engine_mode: str | None = None
+    source_revision: str | None = None
+    evaluation: EvaluationInput | None = None
+    record_version: str | None = None
+
+
+class DecisionInput(BaseModel):
+    """Request body of approve and reject."""
+
+    model_config = {"extra": "forbid"}
+
+    reason: str = Field(min_length=1, max_length=1000)
+    # Optional guard: the decision is refused (409) if the record's document changed since it was read.
+    document_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class Registration(BaseModel):
+    record_id: str
+    name: str
+    status: str  # native registry status
+    status_reason: str | None = None
+    record_version: str | None = None
+    tenant_id: str | None = None
+    agent_id: str | None = None
+    environment: str | None = None
+    document: dict[str, object]  # the governance document, snake_case keys
+    document_sha256: str
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class RegistrationDetail(Registration):
+    """One registration with who created, submitted and decided it, read from the audit trail.
+
+    The people fields are null when the audit trail has no such event (for
+    example a record published by a pipeline) or is not configured.
+    """
+
+    created_by: str | None = None
+    created_by_label: str | None = None
+    # Set while the record is PENDING_APPROVAL, APPROVED or REJECTED.
+    submitted_by: str | None = None
+    submitted_by_label: str | None = None
+    submitted_at: str | None = None
+    submitted_by_me: bool = False
+    # Set while the record is APPROVED or REJECTED.
+    decision: str | None = None  # "approve" | "reject"
+    decided_by_label: str | None = None
+    decided_at: str | None = None
+    decision_reason: str | None = None  # the approver's full reason
+    # The document as it was when last approved through the portal (snake_case), for a diff. Null when never.
+    previous_approved: dict[str, object] | None = None
+
+
+class AuditEvent(BaseModel):
+    event_id: str
+    request_id: str
+    at: str
+    phase: str  # "intent" | "result"
+    action: str  # create | update | submit | delete | approve | reject
+    outcome: str  # allowed | denied | failed
+    reason: str
+    actor_subject: str
+    actor_label: str
+    actor_role: str
+    tenant_id: str | None = None
+    record_id: str | None = None
+    record_name: str | None = None
+    document_sha256: str | None = None
+    status_before: str | None = None
+    status_after: str | None = None
+
+
+class RegistrationHistory(BaseModel):
+    record_id: str
+    events: list[AuditEvent] = Field(default_factory=list)
+
+
+class ActionResult(BaseModel):
+    action: str
+    outcome: str = "allowed"
+    reason: str
+    request_id: str
+    registration: Registration | None = None  # null after a delete
+    # False when the action was performed but its result event could not be written.
+    audit_complete: bool = True

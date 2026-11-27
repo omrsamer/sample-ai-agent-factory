@@ -4,8 +4,10 @@ import { Link, useLocation } from 'react-router-dom';
 import { useEffect, useRef, useState } from 'react';
 import { useAuth } from '../auth/AuthContext';
 import { useUser } from '../contexts/UserContext';
-import { PORTAL_NAV, isNavItemActive } from './nav';
-import { emailAlias, initialsFor } from './governance/agentUi';
+import { isNavItemActive, portalNav } from './nav';
+import { useFeatures } from '../config/features';
+import { initialsFor } from './governance/agentUi';
+import { userEmail, userLabel } from './userLabel';
 import { tenantNames } from './governance/tenantUi';
 
 const ENVIRONMENT_BADGE: Record<string, string> = {
@@ -22,8 +24,11 @@ export default function Sidebar({ environment }: { environment: string }) {
   const profileRef = useRef<HTMLDivElement>(null);
 
   // The back end's view of the caller wins; the identity provider's is the fallback.
-  const displayName =
-    currentUser?.name?.trim() || authUser?.name?.trim() || emailAlias(currentUser?.email ?? authUser?.username);
+  const { governedActions } = useFeatures();
+  const approver = currentUser?.can_approve === true;
+  const sections = portalNav({ governedActions, approver });
+  const displayName = userLabel(currentUser, authUser);
+  const displayEmail = userEmail(currentUser, authUser);
   const displayRole = currentUser?.role ?? '';
   const displayTenants = tenantNames(currentUser?.tenants ?? []);
   const groups = authUser?.groups ?? [];
@@ -52,7 +57,7 @@ export default function Sidebar({ environment }: { environment: string }) {
       aria-label="Primary"
     >
       <div className={`px-4 pt-5 pb-4 border-b border-slate-200 flex items-center gap-2.5 ${isCollapsed ? 'justify-center' : ''}`}>
-        <Link to="/" className="flex items-center gap-2.5 min-w-0" aria-label="Agent Factory Portal home">
+        <Link to="/" className="flex items-center gap-2.5 min-w-0">
           <span className="flex-shrink-0 h-8 w-8 rounded-lg bg-blue-600 text-white flex items-center justify-center text-[11px] font-bold tracking-tight" aria-hidden="true">
             AF
           </span>
@@ -62,7 +67,7 @@ export default function Sidebar({ environment }: { environment: string }) {
                 Agent Factory Portal
               </span>
               <span className={`inline-block mt-0.5 px-1.5 py-px rounded border text-[10px] font-medium uppercase tracking-wide ${ENVIRONMENT_BADGE[environment] ?? ENVIRONMENT_BADGE.nonprod}`}>
-                {environment} · read-only
+                {governedActions ? environment : `${environment} · read-only`}
               </span>
             </span>
           )}
@@ -70,10 +75,10 @@ export default function Sidebar({ environment }: { environment: string }) {
       </div>
 
       <nav className="flex-1 overflow-y-auto px-3 py-3 space-y-4" aria-label="Sections">
-        {PORTAL_NAV.map((section) => (
+        {sections.map((section) => (
           <div key={section.id}>
             {!isCollapsed && (
-              <h2 className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">{section.label}</h2>
+              <h2 className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-600">{section.label}</h2>
             )}
             <ul className="space-y-0.5">
               {section.items.map((item) => {
@@ -107,7 +112,7 @@ export default function Sidebar({ environment }: { environment: string }) {
           onClick={() => setIsCollapsed((v) => !v)}
           aria-expanded={!isCollapsed}
           aria-label={isCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded-lg text-xs text-slate-500 hover:bg-slate-50 ${isCollapsed ? 'justify-center' : ''}`}
+          className={`w-full flex items-center gap-2.5 px-3 py-1.5 rounded-lg text-xs text-slate-600 hover:bg-slate-50 ${isCollapsed ? 'justify-center' : ''}`}
         >
           <svg className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
@@ -131,24 +136,24 @@ export default function Sidebar({ environment }: { environment: string }) {
           {!isCollapsed && (
             <span className="min-w-0 flex-1 text-left">
               <span className="block text-sm font-medium text-slate-900 truncate">{displayName}</span>
-              {displayRole && <span className="block text-xs text-slate-500 capitalize truncate">{displayRole}</span>}
+              {displayRole && <span className="block text-xs text-slate-600 capitalize truncate">{displayRole}</span>}
             </span>
           )}
         </button>
         {profileOpen && (
           <div className="mt-1 bg-white rounded-xl border border-slate-200 py-1.5 shadow-lg">
             <div className="px-4 py-2 border-b border-slate-100 space-y-0.5">
-              <div className="text-xs font-semibold text-slate-900 break-all">{currentUser?.email ?? authUser?.username}</div>
-              {displayRole && <div className="text-xs text-slate-500 capitalize">Role: {displayRole}</div>}
-              {displayTenants && <div className="text-xs text-slate-500">Tenants: {displayTenants}</div>}
-              {groups.length > 0 && <div className="text-xs text-slate-500">Groups: {groups.join(', ')}</div>}
+              {displayEmail && <div className="text-xs font-semibold text-slate-900 break-all">{displayEmail}</div>}
+              {displayRole && <div className="text-xs text-slate-600 capitalize">Role: {displayRole}</div>}
+              {displayTenants && <div className="text-xs text-slate-600">Tenants: {displayTenants}</div>}
+              {groups.length > 0 && <div className="text-xs text-slate-600">Groups: {groups.join(', ')}</div>}
             </div>
             <button
               type="button"
               onClick={signOut}
-              className="w-full flex items-center px-4 py-2 text-sm text-red-600 hover:bg-red-50 gap-2.5"
+              className="w-full flex items-center px-4 py-2 text-sm text-red-700 hover:bg-red-50 gap-2.5"
             >
-              <svg className="w-4 h-4 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
+              <svg className="w-4 h-4 text-red-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" />
               </svg>
               Sign out

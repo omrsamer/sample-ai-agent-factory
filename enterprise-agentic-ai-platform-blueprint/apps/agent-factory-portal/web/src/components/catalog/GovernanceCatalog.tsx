@@ -29,7 +29,7 @@ export default function GovernanceCatalog() {
         label="Catalog sections"
         onSelect={(id) => navigate(`/catalog/${id}`)}
       />
-      <p className="text-sm text-slate-500 mb-4">{section.blurb}</p>
+      <p className="text-sm text-slate-600 mb-4">{section.blurb}</p>
       {section.id === 'agents' ? (
         <AgentsTable />
       ) : section.id === 'tools' ? (

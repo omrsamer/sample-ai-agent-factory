@@ -74,14 +74,14 @@ export default function Fleet() {
         <section className="lg:col-span-2" aria-labelledby="fleet-health-heading">
           <div className="flex items-baseline justify-between mb-3">
             <h2 id="fleet-health-heading" className="text-base font-semibold text-slate-900">Fleet health</h2>
-            {health.data && <span className="text-xs text-slate-400">Checked {formatDate(health.data.checked_at)}</span>}
+            {health.data && <span className="text-xs text-slate-600">Checked {formatDate(health.data.checked_at)}</span>}
           </div>
           {health.loading ? (
             <Loading label="Loading fleet health…" />
           ) : health.error ? (
             <ErrorCard title="Couldn’t load fleet health" message={health.error} onRetry={health.reload} />
           ) : cells.length === 0 ? (
-            <div className={`${CARD} p-6 text-sm text-slate-500`}>No Workstream cells are reporting yet.</div>
+            <div className={`${CARD} p-6 text-sm text-slate-600`}>No Workstream cells are reporting yet.</div>
           ) : (
             <div className={`${CARD} overflow-x-auto`}>
               <table className="w-full text-sm">
@@ -123,6 +123,11 @@ export default function Fleet() {
               </table>
             </div>
           )}
+          {cells.length > 0 && cells.every((c) => c.state === 'no_data') && (
+            <p className="text-xs text-slate-600 mt-2">
+              No CloudWatch alarms were found for these cells; health is derived from alarms.
+            </p>
+          )}
         </section>
 
         <section aria-labelledby="recent-agents-heading">
@@ -131,9 +136,9 @@ export default function Fleet() {
             {agents.loading ? (
               <Loading label="Loading agents…" />
             ) : agents.error ? (
-              <p className="text-sm text-slate-500">Agents couldn’t be loaded. {agents.error}</p>
+              <p className="text-sm text-slate-600">Agents couldn’t be loaded. {agents.error}</p>
             ) : recentAgents.length === 0 ? (
-              <p className="text-sm text-slate-500">
+              <p className="text-sm text-slate-600">
                 No agents yet. Agents appear here once a Workstream pipeline has deployed one from its descriptor.
               </p>
             ) : (

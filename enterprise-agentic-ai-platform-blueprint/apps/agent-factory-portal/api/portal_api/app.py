@@ -18,7 +18,17 @@ from portal_api.aws.logs import UnsafeQueryValue
 from portal_api.aws.session import error_code
 from portal_api.config import ConfigError
 from portal_api.identity.provider import NotAuthenticated, NotAuthorized
-from portal_api.routes import agents, catalog, fleet, governance, guardrails, mcp_servers, observability, users
+from portal_api.routes import (
+    agents,
+    catalog,
+    fleet,
+    governance,
+    guardrails,
+    mcp_servers,
+    observability,
+    registrations,
+    users,
+)
 from portal_api.service import BadRequest, Forbidden, NotFound
 
 logger = logging.getLogger("portal_api")
@@ -124,6 +134,6 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(health, prefix=API_PREFIX)
-    for module in (users, agents, mcp_servers, governance, observability, guardrails, fleet, catalog):
+    for module in (users, agents, mcp_servers, governance, observability, guardrails, fleet, catalog, registrations):
         app.include_router(module.router, prefix=API_PREFIX)
     return app

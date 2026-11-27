@@ -49,7 +49,7 @@ describe('parseRuntimeConfig', () => {
       authProvider: 'cognito',
       cognito: COGNITO,
       environment: 'nonprod',
-      features: { readOnly: true },
+      features: { readOnly: true, governedActions: false },
     });
   });
 
@@ -80,6 +80,14 @@ describe('parseRuntimeConfig', () => {
     expect(ok({ ...VALID, features: { readOnly: false } }).features.readOnly).toBe(false);
     expect(ok({ ...VALID, features: { readOnly: 'no' } }).features.readOnly).toBe(true);
     expect(ok({ ...VALID, features: undefined }).features.readOnly).toBe(true);
+  });
+
+  it('turns governed actions on only for the boolean true', () => {
+    expect(ok(VALID).features.governedActions).toBe(false);
+    for (const value of ['true', 1, 'yes', null, {}]) {
+      expect(ok({ ...VALID, features: { governedActions: value } }).features.governedActions).toBe(false);
+    }
+    expect(ok({ ...VALID, features: { governedActions: true } }).features.governedActions).toBe(true);
   });
 
   it('rejects a non-object', () => {

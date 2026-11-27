@@ -37,6 +37,8 @@ _ROLE_ARN = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512}$")
 _SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _ALARM_PREFIX = re.compile(r"^[A-Za-z0-9_.\-/ ]{1,255}$")
 _PIPELINE_NAME = re.compile(r"^[A-Za-z0-9.@_-]{1,100}$")
+_TABLE_NAME = re.compile(r"^[A-Za-z0-9_.-]{3,255}$")
+_TENANT = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _EXTERNAL_ID = re.compile(r"^[\w+=,.@:/-]{2,1224}$")
 
 
@@ -96,6 +98,10 @@ class Settings:
     model_allowlist: tuple[ModelEntry, ...]
     allowed_origins: tuple[str, ...] = ()
     cache_ttl_seconds: int = 30
+    # Optional in the read API: only the registration history route needs the audit table.
+    audit_table: str | None = None
+    # Optional in the read API: lets /users/me say which tenants the caller can register for.
+    group_tenant_map: Mapping[str, tuple[str, ...]] | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     def cell_for(self, tenant_id: str | None, agent_id: str | None, environment: str | None) -> Cell | None:
@@ -270,6 +276,12 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         model_allowlist=models,
         allowed_origins=tuple(origins),
         cache_ttl_seconds=ttl,
+        audit_table=_optional(_TABLE_NAME, env.get("PORTAL_AUDIT_TABLE", "").strip(), "PORTAL_AUDIT_TABLE"),
+        group_tenant_map=(
+            _parse_tenant_map(_json(env, "PORTAL_GROUP_TENANT_MAP"), role_map)
+            if (env.get("PORTAL_GROUP_TENANT_MAP") or "").strip()
+            else None
+        ),
     )
 
 
@@ -285,6 +297,9 @@ _CONFIG_KEYS = (
     "PORTAL_MODEL_ALLOWLIST",
     "PORTAL_ALLOWED_ORIGINS",
     "PORTAL_CACHE_TTL_SECONDS",
+    "PORTAL_AUDIT_TABLE",
+    "PORTAL_GROUP_TENANT_MAP",
+    "PORTAL_ACTION_ROLE",
 )
 _cached: tuple[tuple[str | None, ...], Settings] | None = None
 
@@ -301,6 +316,93 @@ def get_settings() -> Settings:
         logger.error("Portal configuration rejected: %s", exc)
         raise
     _cached = (snapshot, settings)
+    return settings
+
+
+ACTION_ROLES = ("registrar", "approver")
+ALL_TENANTS = "*"  # same marker as portal_api.authorities.ALL_TENANTS
+
+
+@dataclass(frozen=True)
+class ActionSettings:
+    """Configuration of one action function (registrar or approver).
+
+    Deliberately smaller than ``Settings``: an action function reads the
+    registry and the audit table and nothing else, so it does not need cells,
+    guardrail tags or the model allow-list.
+    """
+
+    env: str
+    action_role: str
+    registry_id: str
+    registry_region: str
+    identity_provider: str
+    group_role_map: Mapping[str, str]
+    group_tenant_map: Mapping[str, tuple[str, ...]]
+    audit_table: str
+    allowed_origins: tuple[str, ...] = ()
+
+
+def _parse_tenant_map(raw: Any, role_map: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
+    if not isinstance(raw, dict):
+        raise ConfigError("PORTAL_GROUP_TENANT_MAP must be a JSON object")
+    result: dict[str, tuple[str, ...]] = {}
+    for group, tenants in raw.items():
+        if not isinstance(group, str) or not group or not isinstance(tenants, list):
+            raise ConfigError("PORTAL_GROUP_TENANT_MAP maps a group to something that is not a list")
+        for tenant in tenants:
+            if tenant == ALL_TENANTS:
+                if role_map.get(group) != "platform":
+                    raise ConfigError("PORTAL_GROUP_TENANT_MAP allows '*' only for a group mapped to platform")
+            elif not isinstance(tenant, str) or not _TENANT.match(tenant):
+                raise ConfigError("PORTAL_GROUP_TENANT_MAP holds a malformed tenant id")
+        result[group] = tuple(dict.fromkeys(tenants))
+    return result
+
+
+def load_action_settings(env: Mapping[str, str] | None = None) -> ActionSettings:
+    """Parse and validate the environment of an action function. Fails closed."""
+    env = os.environ if env is None else env
+    portal_env = _required(env, "PORTAL_ENV")
+    if portal_env not in ("nonprod", "prod"):
+        raise ConfigError("PORTAL_ENV must be nonprod or prod")
+    action_role = _required(env, "PORTAL_ACTION_ROLE")
+    if action_role not in ACTION_ROLES:
+        raise ConfigError("PORTAL_ACTION_ROLE must be registrar or approver")
+    provider = _required(env, "PORTAL_IDENTITY_PROVIDER")
+    if provider not in ("cognito", "entra"):
+        raise ConfigError("PORTAL_IDENTITY_PROVIDER must be cognito or entra")
+    role_map = _parse_role_map(_json(env, "PORTAL_GROUP_ROLE_MAP"))
+    origins = _json(env, "PORTAL_ALLOWED_ORIGINS", required=False, default=[])
+    if not isinstance(origins, list) or not all(isinstance(o, str) for o in origins) or "*" in origins:
+        raise ConfigError("PORTAL_ALLOWED_ORIGINS must be a JSON list of explicit origins")
+    return ActionSettings(
+        env=portal_env,
+        action_role=action_role,
+        registry_id=_match(_SLUG, _required(env, "PORTAL_REGISTRY_ID"), "PORTAL_REGISTRY_ID"),
+        registry_region=_match(_REGION, _required(env, "PORTAL_REGISTRY_REGION"), "PORTAL_REGISTRY_REGION"),
+        identity_provider=provider,
+        group_role_map=role_map,
+        group_tenant_map=_parse_tenant_map(_json(env, "PORTAL_GROUP_TENANT_MAP"), role_map),
+        audit_table=_match(_TABLE_NAME, _required(env, "PORTAL_AUDIT_TABLE"), "PORTAL_AUDIT_TABLE"),
+        allowed_origins=tuple(origins),
+    )
+
+
+_cached_action: tuple[tuple[str | None, ...], ActionSettings] | None = None
+
+
+def get_action_settings() -> ActionSettings:
+    global _cached_action
+    snapshot = tuple(os.environ.get(key) for key in _CONFIG_KEYS)
+    if _cached_action is not None and _cached_action[0] == snapshot:
+        return _cached_action[1]
+    try:
+        settings = load_action_settings()
+    except ConfigError as exc:
+        logger.error("Action configuration rejected: %s", exc)
+        raise
+    _cached_action = (snapshot, settings)
     return settings
 
 

@@ -29,7 +29,8 @@ contributed back by default.
 - **Adapted in place:** the access graph, the observability dashboard, the cost, trace and
   evaluation views, the shared badges and avatar, the 401 retry helpers, the ARN masking helper.
 - **Added:** fleet health, the governance catalog (tools, guardrail profiles, models), the
-  release evidence screen, the deployment tab, the configuration error page.
+  release evidence screen, the deployment tab, the configuration error page, and the optional
+  governed registration and approval screens.
 
 ### How files are marked
 
@@ -80,6 +81,7 @@ Cognito, the MSAL packages for Microsoft Entra ID.
 | `@types/react` | 19.3.3 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | `@types/react-dom` | 19.3.0 | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
 | `@vitejs/plugin-react` | 6.3.0 | MIT | https://github.com/vitejs/vite-plugin-react |
+| `axe-core` | 4.14.1 | MPL-2.0 | https://github.com/dequelabs/axe-core |
 | `eslint` | 9.39.5 | MIT | https://github.com/eslint/eslint |
 | `eslint-plugin-react-hooks` | 7.1.1 | MIT | https://github.com/facebook/react |
 | `eslint-plugin-react-refresh` | 0.5.8 | MIT | https://github.com/ArnaudBarre/eslint-plugin-react-refresh |
@@ -91,6 +93,10 @@ Cognito, the MSAL packages for Microsoft Entra ID.
 | `vitest` | 4.1.12 | MIT | https://github.com/vitest-dev/vitest |
 
 Tailwind CSS generates the stylesheet that ships in the bundle. Vite produces the bundle.
+
+`axe-core` (Mozilla Public License 2.0) is used unmodified, only to check accessibility from a
+headless browser during development. It is not imported by the application and is not part of
+the bundle.
 
 Removed relative to upstream: `autoprefixer` (Tailwind CSS 4 applies vendor prefixes itself) and the
 direct `postcss` entry (it is still installed as a dependency of `@tailwindcss/postcss` and Vite).

@@ -32,7 +32,7 @@ export default function ReleaseEvidence() {
       ) : (
         <>
           <div className={`${CARD} p-4 mb-5`}>
-            <label htmlFor="evidence-agent" className="block text-[11px] font-medium text-slate-500 uppercase tracking-wide mb-1">
+            <label htmlFor="evidence-agent" className="block text-[11px] font-medium text-slate-600 uppercase tracking-wide mb-1">
               Agent
             </label>
             <select

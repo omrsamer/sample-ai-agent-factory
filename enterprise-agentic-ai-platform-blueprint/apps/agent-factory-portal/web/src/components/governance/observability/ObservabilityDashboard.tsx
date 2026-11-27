@@ -60,7 +60,7 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
         <div className="flex items-end gap-4">
           {isAdmin && (
             <div>
-              <span id="obs-scope-label" className="block text-[11px] font-medium text-slate-500 uppercase tracking-wide mb-1">Scope</span>
+              <span id="obs-scope-label" className="block text-[11px] font-medium text-slate-600 uppercase tracking-wide mb-1">Scope</span>
               <div className="inline-flex bg-slate-100/80 rounded-lg p-0.5" role="group" aria-labelledby="obs-scope-label">
                 {(['platform', 'tenant'] as Scope[]).map((s) => (
                   <button
@@ -69,7 +69,7 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
                     aria-pressed={scope === s}
                     onClick={() => setScope(s)}
                     className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
-                      scope === s ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                      scope === s ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-700'
                     }`}
                   >
                     {s === 'platform' ? 'Platform' : 'My tenants'}
@@ -79,7 +79,7 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
             </div>
           )}
           <div>
-            <label htmlFor="obs-from" className="block text-[11px] font-medium text-slate-500 uppercase tracking-wide mb-1">From</label>
+            <label htmlFor="obs-from" className="block text-[11px] font-medium text-slate-600 uppercase tracking-wide mb-1">From</label>
             <input
               id="obs-from"
               type="date"
@@ -90,7 +90,7 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
             />
           </div>
           <div>
-            <label htmlFor="obs-to" className="block text-[11px] font-medium text-slate-500 uppercase tracking-wide mb-1">To</label>
+            <label htmlFor="obs-to" className="block text-[11px] font-medium text-slate-600 uppercase tracking-wide mb-1">To</label>
             <input
               id="obs-to"
               type="date"
@@ -102,7 +102,7 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
           </div>
         </div>
         {loading && (
-          <div className="flex items-center gap-2 text-xs text-slate-400">
+          <div className="flex items-center gap-2 text-xs text-slate-600">
             <span className="w-3.5 h-3.5 border-2 border-slate-300 border-t-slate-500 rounded-full animate-spin" />
             Loading metrics…
           </div>
@@ -120,9 +120,9 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
         <>
           <DataNotes notes={notes} />
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <Kpi label="Total Traces" value={fmtInt(series.totals.traces)} sub="agent invocations" color="#3b82f6" />
-            <Kpi label="Total Cost" value={costText(series.totals.cost, costAvailable)} sub="model spend (USD)" color="#f59e0b" />
-            <Kpi label="Total Tokens" value={fmtInt(series.totals.tokens)} sub="input + output" color="#6366f1" />
+            <Kpi label="Total Traces" value={fmtInt(series.totals.traces)} sub="agent invocations" color="#1d4ed8" />
+            <Kpi label="Total Cost" value={costText(series.totals.cost, costAvailable)} sub="model spend (USD)" color="#b45309" />
+            <Kpi label="Total Tokens" value={fmtInt(series.totals.tokens)} sub="input + output" color="#4338ca" />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4">
@@ -151,7 +151,7 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
                   </ComposedChart>
                 </ResponsiveContainer>
               ) : (
-                <div className="h-[220px] flex items-center justify-center text-sm text-slate-400">No daily breakdown for this range.</div>
+                <div className="h-[220px] flex items-center justify-center text-sm text-slate-600">No daily breakdown for this range.</div>
               )}
             </div>
 
@@ -172,13 +172,13 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
                       <div key={m.model} className="flex items-center gap-1.5">
                         <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: m.color }} />
                         <span className="text-slate-700 truncate">{m.model}</span>
-                        <span className="text-slate-400 ml-auto tabular-nums">{costAvailable ? fmtUsd(m.cost) : fmtInt(m.tokens)}</span>
+                        <span className="text-slate-600 ml-auto tabular-nums">{costAvailable ? fmtUsd(m.cost) : fmtInt(m.tokens)}</span>
                       </div>
                     ))}
                   </div>
                 </>
               ) : (
-                <div className="h-[180px] flex items-center justify-center text-sm text-slate-400">No model breakdown yet.</div>
+                <div className="h-[180px] flex items-center justify-center text-sm text-slate-600">No model breakdown yet.</div>
               )}
             </div>
           </div>
@@ -188,7 +188,7 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
             {series.byAgent.length > 0 ? (
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="text-[11px] text-slate-400 uppercase tracking-wide border-b border-slate-100">
+                  <tr className="text-[11px] text-slate-600 uppercase tracking-wide border-b border-slate-100">
                     <th scope="col" className="text-left py-2 font-medium">Agent</th>
                     <th scope="col" className="text-left py-2 font-medium pl-4">Tenant</th>
                     <th scope="col" className="text-right py-2 font-medium">Traces</th>
@@ -206,17 +206,17 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
                             {a.agent_name}
                           </Link>
                         </td>
-                        <td className="py-2.5 pl-4 text-slate-500 text-[13px]">{tenantName ?? a.tenant_id ?? '—'}</td>
+                        <td className="py-2.5 pl-4 text-slate-600 text-[13px]">{tenantName ?? a.tenant_id ?? '—'}</td>
                         <td className="py-2.5 text-right text-slate-700 tabular-nums">{fmtInt(a.traces)}</td>
                         <td className="py-2.5 text-right font-semibold text-slate-900 tabular-nums">{costText(a.cost, costAvailable)}</td>
-                        <td className="py-2.5 text-right text-slate-500 tabular-nums">{fmtInt(a.tokens)}</td>
+                        <td className="py-2.5 text-right text-slate-600 tabular-nums">{fmtInt(a.tokens)}</td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
             ) : (
-              <div className="py-8 text-center text-sm text-slate-400">No agents with traces in this scope.</div>
+              <div className="py-8 text-center text-sm text-slate-600">No agents with traces in this scope.</div>
             )}
           </div>
         </>
@@ -228,9 +228,9 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
 function Kpi({ label, value, sub, color }: { label: string; value: string; sub: string; color: string }) {
   return (
     <div className={CARD}>
-      <div className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">{label}</div>
+      <div className="text-[11px] font-medium text-slate-600 uppercase tracking-wide">{label}</div>
       <div className="text-2xl font-semibold mt-1 tabular-nums" style={{ color }}>{value}</div>
-      <div className="text-[11px] text-slate-400 mt-0.5">{sub}</div>
+      <div className="text-[11px] text-slate-600 mt-0.5">{sub}</div>
     </div>
   );
 }

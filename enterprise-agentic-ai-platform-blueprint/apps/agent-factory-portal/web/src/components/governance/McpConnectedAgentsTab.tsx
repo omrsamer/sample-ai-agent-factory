@@ -26,7 +26,7 @@ export default function McpConnectedAgentsTab({ mcp }: { mcp: McpServer }) {
   if (grants.error) return <ErrorCard title="Couldn’t load connected agents" message={grants.error} onRetry={grants.reload} />;
   const rows = grants.data ?? [];
   if (rows.length === 0) {
-    return <div className={`${CARD} p-5 text-sm text-slate-500`}>No agent is subscribed to this gateway.</div>;
+    return <div className={`${CARD} p-5 text-sm text-slate-600`}>No agent is subscribed to this gateway.</div>;
   }
 
   return (
@@ -54,7 +54,7 @@ export default function McpConnectedAgentsTab({ mcp }: { mcp: McpServer }) {
                   )}
                 </td>
                 <td className={TD}><Badge cls="bg-slate-100 text-slate-600" label={g.role} /></td>
-                <td className={`${TD} font-mono text-xs text-slate-500 break-all`}>{g.assignment_id}</td>
+                <td className={`${TD} font-mono text-xs text-slate-600 break-all`}>{g.assignment_id}</td>
               </tr>
             );
           })}

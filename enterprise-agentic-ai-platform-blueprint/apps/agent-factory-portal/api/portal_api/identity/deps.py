@@ -28,7 +28,7 @@ def jwt_claims(request: Request) -> Mapping[str, Any] | None:
     return claims if isinstance(claims, dict) and claims else None
 
 
-def _dev_claims(request: Request, settings: Settings) -> Mapping[str, Any] | None:
+def _dev_claims(request: Request, settings: Any) -> Mapping[str, Any] | None:
     """Local development only: build claims from request headers.
 
     The role still comes from PORTAL_GROUP_ROLE_MAP, so a developer exercises the
@@ -45,6 +45,11 @@ def _dev_claims(request: Request, settings: Settings) -> Mapping[str, Any] | Non
 
 
 def current_principal(request: Request, settings: Settings = Depends(get_settings)) -> Principal:
+    return principal_from_request(request, settings)
+
+
+def principal_from_request(request: Request, settings: Any) -> Principal:
+    """Resolve the caller. ``settings`` needs ``identity_provider`` and ``group_role_map``."""
     claims = jwt_claims(request)
     if claims is None and dev_auth_enabled():
         claims = _dev_claims(request, settings)

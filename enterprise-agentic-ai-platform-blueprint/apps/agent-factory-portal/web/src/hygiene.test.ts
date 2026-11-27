@@ -12,6 +12,7 @@ const sources = import.meta.glob('./**/*.{ts,tsx,css}', { query: '?raw', import:
   string
 >;
 const SELF = './hygiene.test.ts';
+const ACTIONS_CLIENT = './actions/registrationsClient.ts';
 const production = Object.entries(sources).filter(([path]) => !path.endsWith('.test.ts'));
 const all = Object.entries(sources).filter(([path]) => path !== SELF);
 
@@ -24,9 +25,35 @@ describe('milestone 1 is read-only', () => {
     expect(production.length).toBeGreaterThan(40);
   });
 
-  it('issues no mutating HTTP request', () => {
-    expect(offenders(production, /\.(post|put|patch|delete)\s*[<(]/)).toEqual([]);
+  it('issues writes from the actions client only', () => {
+    expect(offenders(production, /\.(post|put|patch|delete)\s*[<(]/)).toEqual([ACTIONS_CLIENT]);
     expect(offenders(production, /method:\s*['"](post|put|patch|delete)['"]/i)).toEqual([]);
+    expect(offenders(production, /\.patch\s*[<(]/)).toEqual([]);
+  });
+
+  it('writes only to /registrations', () => {
+    const client = sources[ACTIONS_CLIENT];
+    const targets = [...client.matchAll(/client\.(post|put|delete)(?:<[^>]*>)?\(\s*([^,)]+)/g)].map((m) => m[2].trim());
+    expect(targets.length).toBeGreaterThan(0);
+    for (const target of targets) {
+      expect(target === "'/registrations'" || target.startsWith('path(')).toBe(true);
+    }
+    expect(client).toContain('const path = (recordId: string, suffix = \'\') => `/registrations/${encodeURIComponent(recordId)}${suffix}`;');
+  });
+
+  it('keeps the actions feature unreachable unless it is switched on', () => {
+    // Nothing outside the folder imports from it statically.
+    const outside = production.filter(([path]) => !path.startsWith('./actions/'));
+    expect(offenders(outside, /from\s+'[^']*\/actions\//)).toEqual([]);
+    // The only way in is the dynamic import in the application shell, behind the flag.
+    expect(offenders(outside, /import\('[^']*\/actions\//)).toEqual(['./App.tsx']);
+    const app = sources['./App.tsx'];
+    expect(app).toContain('{governedActions && <Route path="/registrations/*" element={<GovernedActions />} />}');
+    expect(app).toContain('{governedActions && <Route path="/approvals" element={<Approvals />} />}');
+    expect(app).toContain('const governedActions = config.features.governedActions;');
+    // Only the actions client is imported for requests inside the folder.
+    const inside = production.filter(([path]) => path.startsWith('./actions/') && path !== ACTIONS_CLIENT);
+    expect(offenders(inside, /\.(post|put|patch|delete)\s*[<(]/)).toEqual([]);
   });
 
   it('uses no blocking browser dialog', () => {
@@ -73,7 +100,8 @@ describe('public-repository hygiene', () => {
   });
 
   it('contains no account-shaped number and no absolute local path', () => {
-    expect(offenders(all, /(?<![\d.])\d{12}(?![\d.])/)).toEqual([]);
+    // A run of one repeated digit is the only 12-digit number allowed (a placeholder account id).
+    expect(offenders(all, /(?<![\d.])(?!(\d)\1{11}(?![\d.]))\d{12}(?![\d.])/)).toEqual([]);
     expect(offenders(all, /\/(Users|home)\/[a-z]/)).toEqual([]);
   });
 });

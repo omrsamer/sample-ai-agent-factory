@@ -57,8 +57,27 @@ BASE_ENV = {
     "PORTAL_CELLS": json.dumps(CELLS),
     "PORTAL_IDENTITY_PROVIDER": "cognito",
     "PORTAL_GROUP_ROLE_MAP": json.dumps(
-        {"platform-admins": "platform", "sec": "security", "devs": "developer", "viewers": "readonly"}
+        {
+            "platform-admins": "platform",
+            "sec": "security",
+            "devs": "developer",
+            "devs2": "developer",
+            "approvers": "approver",
+            "approvers2": "approver",
+            "viewers": "readonly",
+        }
     ),
+    "PORTAL_GROUP_TENANT_MAP": json.dumps(
+        {
+            "platform-admins": ["*"],
+            "sec": ["ws1", "ws2"],
+            "devs": ["ws1"],
+            "devs2": ["ws2"],
+            "approvers": ["ws1"],
+            "approvers2": ["ws2"],
+        }
+    ),
+    "PORTAL_AUDIT_TABLE": "agenticai-portal-audit-test",
     "PORTAL_GUARDRAIL_TAG_KEY": "agenticai:blueprint",
     "PORTAL_GUARDRAIL_TAG_VALUE": "true",
     "PORTAL_MODEL_ALLOWLIST": json.dumps(
@@ -226,6 +245,7 @@ def gateway_bundle(mode: str | None = "LOG_ONLY", tags: dict[str, str] | None = 
 @pytest.fixture(autouse=True)
 def portal_env(monkeypatch: pytest.MonkeyPatch):
     """A complete, valid configuration; individual tests remove or break entries."""
+    config_module._cached_action = None
     for key in list(config_module._CONFIG_KEYS) + ["PORTAL_DEV_AUTH", "AWS_LAMBDA_FUNCTION_NAME"]:
         monkeypatch.delenv(key, raising=False)
     for key, value in BASE_ENV.items():

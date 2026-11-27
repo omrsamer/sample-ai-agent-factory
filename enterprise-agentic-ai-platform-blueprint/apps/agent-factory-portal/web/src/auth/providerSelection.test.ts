@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { RuntimeConfig } from '../config/runtimeConfig';
 import { AUTH_PROVIDER_LABEL, loadAuthProvider, type AuthProviderComponent } from './providerSelection';
 
-const BASE = { apiBaseUrl: '/api/v1', environment: 'nonprod', features: { readOnly: true } } as const;
+const BASE = { apiBaseUrl: '/api/v1', environment: 'nonprod', features: { readOnly: true, governedActions: false } } as const;
 const COGNITO_CONFIG: RuntimeConfig = {
   ...BASE,
   authProvider: 'cognito',

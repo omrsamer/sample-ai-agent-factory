@@ -24,9 +24,9 @@ export type GraphSelection =
     };
 
 const SECTION_TITLE =
-  'text-[11px] uppercase tracking-wide text-slate-400 font-semibold mb-2';
+  'text-[11px] uppercase tracking-wide text-slate-600 font-semibold mb-2';
 const ROW = 'flex items-baseline justify-between gap-3 text-sm';
-const ROW_KEY = 'text-slate-500 shrink-0';
+const ROW_KEY = 'text-slate-600 shrink-0';
 const ROW_VAL = 'text-slate-800 font-medium text-right';
 const CHIP =
   'inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium bg-slate-100 text-slate-600';
@@ -118,7 +118,7 @@ export default function GraphDetailDrawer({
                 </div>
               )}
               {selected.kind === 'node' && (
-                <div className="mt-1 text-xs text-slate-500">
+                <div className="mt-1 text-xs text-slate-600">
                   {NODE_TYPE_LABEL[selected.node.data.nodeType]}
                 </div>
               )}
@@ -129,7 +129,7 @@ export default function GraphDetailDrawer({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="shrink-0 inline-flex items-center justify-center h-7 w-7 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+            className="shrink-0 inline-flex items-center justify-center h-7 w-7 rounded-md text-slate-600 hover:text-slate-700 hover:bg-slate-100 transition-colors"
           >
             <span aria-hidden="true" className="text-base leading-none">×</span>
           </button>
@@ -187,7 +187,7 @@ function AgentNodeBody({ node }: { node: FlowNode }) {
 
   return (
     <section>
-      <h3 className={SECTION_TITLE}>Agent</h3>
+      <h2 className={SECTION_TITLE}>Agent</h2>
       <div className="space-y-1.5">
         <Row label="Origin" value={meta(node, 'origin')} />
         {badge && (
@@ -212,7 +212,7 @@ function McpNodeBody({ node }: { node: FlowNode }) {
 
   return (
     <section>
-      <h3 className={SECTION_TITLE}>Tool gateway</h3>
+      <h2 className={SECTION_TITLE}>Tool gateway</h2>
       <div className="space-y-1.5">
         <Row label="Kind" value={meta(node, 'kind')} />
         <Row label="Cedar enforcement" value={enforcementRaw ? enforcementLabel(enforcementRaw) : ''} />
@@ -232,8 +232,8 @@ function PrincipalNodeBody({ node }: { node: FlowNode }) {
   );
   return (
     <section>
-      <h3 className={SECTION_TITLE}>{kind === 'group' ? 'Group' : 'User'} · directory detail</h3>
-      {loading && <p className="text-sm text-slate-400">Loading directory detail…</p>}
+      <h2 className={SECTION_TITLE}>{kind === 'group' ? 'Group' : 'User'} · directory detail</h2>
+      {loading && <p className="text-sm text-slate-600">Loading directory detail…</p>}
       {error && <p className="text-sm text-rose-600">{error}</p>}
       {detail && (
         <div className="space-y-1.5">
@@ -243,7 +243,7 @@ function PrincipalNodeBody({ node }: { node: FlowNode }) {
           <Row label="Job title" value={detail.job_title ?? ''} />
           {detail.group_names && detail.group_names.length > 0 && (
             <div className="pt-1.5">
-              <p className="text-xs text-slate-500 mb-1.5">Group memberships</p>
+              <p className="text-xs text-slate-600 mb-1.5">Group memberships</p>
               <div className="flex flex-wrap gap-1.5">
                 {detail.group_names.map((g) => (
                   <span key={g} className={CHIP}>{g}</span>
@@ -267,9 +267,9 @@ function EdgeBody({ selection }: { selection: Extract<GraphSelection, { kind: 'e
   return (
     <>
       <section>
-        <h3 className={SECTION_TITLE}>
+        <h2 className={SECTION_TITLE}>
           {edgeType === 'can_call' ? 'Can call' : 'Has access'}
-        </h3>
+        </h2>
         <div className="space-y-1.5">
           <Row label="From" value={sourceLabel ?? ''} />
           <Row label="To" value={targetLabel ?? ''} />
@@ -291,11 +291,11 @@ function CedarPanel({ mcpRefId }: { mcpRefId: string }) {
   );
   return (
     <section>
-      <h3 className={SECTION_TITLE}>Cedar policy</h3>
+      <h2 className={SECTION_TITLE}>Cedar policy</h2>
       <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 leading-relaxed mb-3">
         {CEDAR_CAVEAT}
       </p>
-      {loading && <p className="text-sm text-slate-400">Loading policies…</p>}
+      {loading && <p className="text-sm text-slate-600">Loading policies…</p>}
       {error && <p className="text-sm text-rose-600">{error}</p>}
       {set && (
         <div className="space-y-2.5">
@@ -304,11 +304,11 @@ function CedarPanel({ mcpRefId }: { mcpRefId: string }) {
             <span className={ROW_VAL}>{enforcementLabel(set.enforcement_mode)}</span>
           </div>
           {set.policies.length === 0 ? (
-            <p className="text-sm text-slate-400">No policy is attached.</p>
+            <p className="text-sm text-slate-600">No policy is attached.</p>
           ) : (
             <div className="overflow-hidden rounded-lg border border-slate-200">
               <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-500">
+                <thead className="bg-slate-50 text-slate-600">
                   <tr>
                     <th scope="col" className="px-2.5 py-1.5 font-medium">Principal</th>
                     <th scope="col" className="px-2.5 py-1.5 font-medium">Tool</th>

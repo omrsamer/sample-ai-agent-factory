@@ -63,7 +63,7 @@ def test_cognito_principal_from_bracketed_groups():
     principal = CognitoProvider().principal(claims, ROLE_MAP)
     assert principal.subject == "sub-1"
     assert principal.email == "a@example.com"
-    assert principal.display_name == "alice"
+    assert principal.display_name == "a@example.com"
     assert principal.groups == ("devs", "sec")
     assert principal.role == "security"
 
@@ -152,3 +152,20 @@ def test_console_role_levels():
     assert console_role("finops") == ("viewer", 0)
     assert console_role("developer") == ("viewer", 0)
     assert console_role("readonly") == ("viewer", 0)
+
+
+@pytest.mark.parametrize(
+    ("claims", "expected"),
+    [
+        ({"name": "Ana", "email": "a@example.com", "cognito:username": "ana1", "preferred_username": "ana"}, "Ana"),
+        ({"email": "a@example.com", "cognito:username": "ana1", "preferred_username": "ana"}, "a@example.com"),
+        ({"cognito:username": "ana1", "preferred_username": "ana"}, "ana1"),
+        ({"preferred_username": "ana"}, "ana"),
+        ({}, "sub-1"),
+    ],
+)
+def test_display_label_order(claims, expected):
+    principal = CognitoProvider().principal({"sub": "sub-1", "cognito:groups": "[devs]", **claims}, ROLE_MAP)
+    assert principal.label == expected
+    entra = EntraProvider().principal({"oid": "sub-1", "roles": ["Portal.Admin"], **claims}, ROLE_MAP)
+    assert entra.label == expected

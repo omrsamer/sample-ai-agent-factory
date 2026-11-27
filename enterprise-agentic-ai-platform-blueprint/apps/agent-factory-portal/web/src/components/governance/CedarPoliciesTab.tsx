@@ -78,7 +78,7 @@ export default function CedarPoliciesTab({ mcp }: { mcp: McpServer }) {
           </div>
           <p className="text-sm text-slate-600 mt-1">{banner.body}</p>
           {warning && <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-3">{warning}</p>}
-          <p className="text-xs text-slate-500 mt-3">
+          <p className="text-xs text-slate-600 mt-3">
             Policies and the enforcement mode are defined as code and applied by the platform pipeline. They cannot be changed from this portal.
           </p>
         </div>
@@ -91,7 +91,7 @@ export default function CedarPoliciesTab({ mcp }: { mcp: McpServer }) {
       ) : policies.error ? (
         <ErrorCard title="Couldn’t load policies" message={policies.error} onRetry={policies.reload} />
       ) : rows.length === 0 ? (
-        <div className={`${CARD} p-5 text-sm text-slate-500`}>No Cedar policy is attached to this gateway.</div>
+        <div className={`${CARD} p-5 text-sm text-slate-600`}>No Cedar policy is attached to this gateway.</div>
       ) : (
         <div className={`${CARD} overflow-x-auto`}>
           <table className="w-full text-sm">

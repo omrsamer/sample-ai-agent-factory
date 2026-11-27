@@ -16,7 +16,7 @@ const LIFECYCLE_BADGE_CLS: Record<LifecycleState, string> = {
   proposed: 'bg-slate-100 text-slate-600',
   pending_approval: 'bg-amber-50 text-amber-700',
   rejected: 'bg-red-50 text-red-700',
-  deprecated: 'bg-slate-100 text-slate-400',
+  deprecated: 'bg-slate-100 text-slate-600',
   discovered: 'bg-sky-50 text-sky-700',
 };
 
@@ -56,7 +56,7 @@ export function kindBadge(kind: McpServerKind): { cls: string; label: string } {
 
 export function tenantBadge(name?: string | null): { cls: string; label: string } {
   const trimmed = (name ?? '').trim();
-  if (!trimmed) return { cls: 'bg-slate-100 text-slate-400', label: '—' };
+  if (!trimmed) return { cls: 'bg-slate-100 text-slate-600', label: '—' };
   return { cls: 'bg-teal-50 text-teal-700', label: trimmed };
 }
 
@@ -106,7 +106,7 @@ export function AgentAvatar({
   const base = `${AVATAR_SIZE[size]} rounded-lg font-semibold flex items-center justify-center shrink-0`;
   const trimmed = (name ?? '').trim();
   if (!trimmed) {
-    return <div aria-hidden="true" className={`${base} bg-slate-100 text-slate-400`}>?</div>;
+    return <div aria-hidden="true" className={`${base} bg-slate-100 text-slate-600`}>?</div>;
   }
   const color = AVATAR_PALETTE[hashIndex(trimmed, AVATAR_PALETTE.length)];
   return (

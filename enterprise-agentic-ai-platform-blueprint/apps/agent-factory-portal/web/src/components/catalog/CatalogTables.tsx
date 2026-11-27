@@ -9,7 +9,7 @@ const STATUS_CLS: Record<string, string> = {
   active: 'bg-emerald-50 text-emerald-700',
   restricted: 'bg-amber-50 text-amber-700',
   pending: 'bg-amber-50 text-amber-700',
-  deprecated: 'bg-slate-100 text-slate-500',
+  deprecated: 'bg-slate-100 text-slate-600',
   blocked: 'bg-red-50 text-red-700',
 };
 
@@ -77,8 +77,8 @@ export function CatalogTools() {
             <tr key={t.tool_id} className="align-top">
               <td className={TD}>
                 <div className="font-medium text-slate-800">{t.name}</div>
-                {t.description && <div className="text-xs text-slate-500 mt-0.5 max-w-md">{t.description}</div>}
-                <div className="text-[11px] font-mono text-slate-400 mt-0.5 break-all">{t.tool_id}</div>
+                {t.description && <div className="text-xs text-slate-600 mt-0.5 max-w-md">{t.description}</div>}
+                <div className="text-[11px] font-mono text-slate-600 mt-0.5 break-all">{t.tool_id}</div>
               </td>
               <td className={`${TD} text-slate-600`}>{t.owner || '—'}</td>
               <td className={`${TD} text-slate-600`}>{t.cost_centre || '—'}</td>

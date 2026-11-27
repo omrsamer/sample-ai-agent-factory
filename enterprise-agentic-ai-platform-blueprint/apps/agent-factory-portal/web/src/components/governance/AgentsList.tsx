@@ -103,7 +103,7 @@ export function AgentsTable({ linkBase = '/agents' }: { linkBase?: string }) {
             <tbody className="divide-y divide-slate-100">
               {loading && (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-slate-400 text-sm" role="status">Loading agents…</td>
+                  <td colSpan={6} className="px-4 py-8 text-center text-slate-600 text-sm" role="status">Loading agents…</td>
                 </tr>
               )}
               {!loading && rows.map((a) => {
@@ -119,7 +119,7 @@ export function AgentsTable({ linkBase = '/agents' }: { linkBase?: string }) {
                           <Link to={`${linkBase}/${encodeURIComponent(a.id)}`} className="block font-medium text-blue-700 hover:underline truncate">
                             {a.name}
                           </Link>
-                          <span className="block text-xs text-slate-500 truncate">{platformLabelOr(a.platform, 'Platform not recorded')}</span>
+                          <span className="block text-xs text-slate-600 truncate">{platformLabelOr(a.platform, 'Platform not recorded')}</span>
                         </div>
                       </div>
                     </td>
@@ -133,7 +133,7 @@ export function AgentsTable({ linkBase = '/agents' }: { linkBase?: string }) {
               })}
               {!loading && rows.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-slate-400 text-sm">
+                  <td colSpan={6} className="px-4 py-8 text-center text-slate-600 text-sm">
                     {filtered ? 'No agents match the current filters.' : 'No agents in the registry yet.'}
                   </td>
                 </tr>

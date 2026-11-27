@@ -12,7 +12,7 @@ const CARD =
   'rounded-2xl border bg-white shadow-sm transition-shadow hover:shadow-md ' +
   'cursor-grab active:cursor-grabbing overflow-hidden';
 const LABEL = 'text-sm font-semibold text-slate-900 leading-tight truncate';
-const SUBLABEL = 'text-[11px] text-slate-500 leading-tight truncate';
+const SUBLABEL = 'text-[11px] text-slate-600 leading-tight truncate';
 
 const RAIL = 'absolute inset-y-0 left-0 w-1';
 
@@ -20,7 +20,7 @@ const PILL = 'inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] fo
 
 const HOST_TAG =
   'inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-medium ' +
-  'bg-slate-100 text-slate-500';
+  'bg-slate-100 text-slate-600';
 
 const HANDLE = '!w-1 !h-1 !min-w-0 !border-0 !bg-transparent';
 
@@ -145,7 +145,7 @@ const MCP_KINDS: ReadonlySet<string> = new Set<McpServerKind>(['gateway', 'runti
 function mcpChipTint(kind: string): string {
   if (kind === 'gateway') return 'bg-violet-50 text-violet-600';
   if (kind === 'runtime') return 'bg-indigo-50 text-indigo-600';
-  return 'bg-slate-100 text-slate-500';
+  return 'bg-slate-100 text-slate-600';
 }
 function mcpRailTint(kind: string): string {
   if (kind === 'gateway') return 'bg-violet-500';

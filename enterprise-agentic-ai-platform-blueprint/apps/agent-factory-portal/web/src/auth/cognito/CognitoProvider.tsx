@@ -22,10 +22,9 @@ function toAuthUser(user: User | null): AuthUser | null {
   if (!user || user.expired) return null;
   const profile = user.profile as Record<string, unknown>;
   const email = typeof profile.email === 'string' ? profile.email : undefined;
-  const username =
-    email ?? (typeof profile['cognito:username'] === 'string' ? (profile['cognito:username'] as string) : user.profile.sub);
   return {
-    username,
+    // The token subject and the pool username are opaque identifiers and are never displayed.
+    username: email ?? '',
     name: typeof profile.name === 'string' ? profile.name : undefined,
     groups: cognitoGroups(profile),
   };

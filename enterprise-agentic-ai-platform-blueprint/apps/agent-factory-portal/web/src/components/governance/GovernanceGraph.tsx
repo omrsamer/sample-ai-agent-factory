@@ -24,6 +24,7 @@ import type { FlowNode, FlowEdge } from './graph/layout';
 import { nodeTypes } from './graph/graphNodes';
 import { edgeTypes } from './graph/PolicyEdge';
 import GraphDetailDrawer from './graph/GraphDetailDrawer';
+import AccessTable from './graph/AccessTable';
 import { useAsync } from '../shared/useAsync';
 import type { GraphSelection } from './graph/GraphDetailDrawer';
 
@@ -216,25 +217,49 @@ export default function GovernanceGraph() {
   const toggleType = (t: NodeType) =>
     setTypeVisible((prev) => ({ ...prev, [t]: !prev[t] }));
 
+  const [view, setView] = useState<'graph' | 'table'>('graph');
   const totalNodes = graph?.nodes.length ?? 0;
+  const noEdges = !loading && !error && totalNodes > 0 && (graph?.edges.length ?? 0) === 0;
   const isEmpty = !loading && !error && totalNodes === 0;
 
   return (
     <div className="h-full flex flex-col">
       <div className="shrink-0 px-6 pt-6 pb-3">
         <h1 className="text-xl font-semibold text-slate-900">Access graph</h1>
-        <p className="text-xs text-slate-500 mt-0.5">
+        <p className="text-xs text-slate-600 mt-0.5">
           Who can reach what: principals, the agents they may invoke, and the tool gateways those
           agents may call. Edges to a gateway with Cedar enforcement on carry a policy badge. In the
           default profile tool gateways authorise workloads with AWS IAM, so no per-user edges reach
           a gateway.
         </p>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <div className="inline-flex bg-slate-100/80 rounded-lg p-0.5" role="group" aria-label="View">
+            {(['graph', 'table'] as const).map((v) => (
+              <button
+                key={v}
+                type="button"
+                aria-pressed={view === v}
+                onClick={() => setView(v)}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
+                  view === v ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-800'
+                }`}
+              >
+                {v === 'graph' ? 'Graph' : 'Table'}
+              </button>
+            ))}
+          </div>
+          {noEdges && (
+            <p className="text-xs text-slate-600" role="status">
+              No access edges yet. Edges appear once agents are registered with their tool gateway and tool subscriptions.
+            </p>
+          )}
+        </div>
       </div>
 
       <div className="flex-1 min-h-0 px-6 pb-6">
         {error ? (
           <div className="bg-white/70 backdrop-blur rounded-2xl border border-red-200/70 shadow-sm p-6 max-w-xl">
-            <h3 className="text-sm font-semibold text-red-700">Couldn’t load the access graph</h3>
+            <h2 className="text-sm font-semibold text-red-700">Couldn’t load the access graph</h2>
             <p className="text-sm text-slate-600 mt-1">{error}</p>
             <button
               type="button"
@@ -246,7 +271,7 @@ export default function GovernanceGraph() {
           </div>
         ) : loading ? (
           <div className="h-full flex items-center justify-center bg-white/60 backdrop-blur rounded-2xl border border-slate-200/60 shadow-sm">
-            <div className="text-slate-400 text-sm">Loading the access graph…</div>
+            <div className="text-slate-600 text-sm">Loading the access graph…</div>
           </div>
         ) : isEmpty ? (
           <div className="h-full flex items-center justify-center bg-white/60 backdrop-blur rounded-2xl border border-slate-200/60 shadow-sm">
@@ -262,15 +287,27 @@ export default function GovernanceGraph() {
                   <path strokeLinecap="round" d="M7.7 7.6 10.6 16M16.3 7.6 13.4 16" />
                 </svg>
               </div>
-              <h3 className="text-sm font-semibold text-slate-900">No access relationships yet</h3>
-              <p className="text-xs text-slate-500 mt-1.5 leading-relaxed">
+              <h2 className="text-sm font-semibold text-slate-900">No access relationships yet</h2>
+              <p className="text-xs text-slate-600 mt-1.5 leading-relaxed">
                 Relationships are drawn here once agents and tool gateways are deployed and
                 access to them has been granted.
               </p>
             </div>
           </div>
+        ) : view === 'table' ? (
+          <AccessTable
+            nodes={laidOutNodes}
+            edges={laidOutEdges}
+            onSelectNode={(id) => {
+              setSelectedEdgeId(null);
+              setSelectedNodeId(id);
+            }}
+            onSelectEdge={(id) => {
+              setSelectedNodeId(null);
+              setSelectedEdgeId(id);
+            }}
+          />
         ) : (
-
           <div className="h-full rounded-2xl border border-slate-200/60 bg-white/40 backdrop-blur shadow-sm overflow-hidden">
             <ReactFlowProvider>
               <ReactFlow
@@ -368,7 +405,7 @@ function LegendFilters({
 }) {
   return (
     <div className="w-56 rounded-2xl border border-slate-200/80 bg-white/90 backdrop-blur-md shadow-sm p-3 text-left">
-      <p className="text-[11px] uppercase tracking-wide text-slate-400 font-semibold mb-2">
+      <p className="text-[11px] uppercase tracking-wide text-slate-600 font-semibold mb-2">
         Legend &amp; filters
       </p>
 
@@ -385,7 +422,7 @@ function LegendFilters({
               className={`group/row w-full flex items-center gap-2 px-2 py-1 rounded-lg border text-xs font-medium transition-colors ${
                 on
                   ? meta.chipOn
-                  : 'bg-transparent text-slate-400 border-transparent hover:bg-slate-50'
+                  : 'bg-transparent text-slate-600 border-transparent hover:bg-slate-50'
               }`}
             >
               <span
@@ -393,7 +430,7 @@ function LegendFilters({
                 className={`h-2.5 w-2.5 rounded-full shrink-0 ${on ? meta.dot : 'bg-slate-300'}`}
               />
               <span className="flex-1 text-left">{meta.label}</span>
-              <span className="text-[10px] tabular-nums opacity-60">{on ? 'shown' : 'hidden'}</span>
+              <span className="text-[10px] tabular-nums">{on ? 'shown' : 'hidden'}</span>
             </button>
           );
         })}
@@ -407,7 +444,7 @@ function LegendFilters({
           className={`w-full flex items-center gap-2 px-2 py-1 rounded-lg border text-xs font-medium transition-colors ${
             hideUnconnected
               ? 'bg-slate-100 text-slate-700 border-slate-300'
-              : 'bg-transparent text-slate-500 border-transparent hover:bg-slate-50'
+              : 'bg-transparent text-slate-600 border-transparent hover:bg-slate-50'
           }`}
         >
           <span
@@ -417,9 +454,9 @@ function LegendFilters({
             }`}
           />
           <span className="flex-1 text-left">Hide unconnected</span>
-          <span className="text-[10px] opacity-60">{hideUnconnected ? 'on' : 'off'}</span>
+          <span className="text-[10px]">{hideUnconnected ? 'on' : 'off'}</span>
         </button>
-        <p className="mt-1.5 text-[10px] leading-snug text-slate-400">
+        <p className="mt-1.5 text-[10px] leading-snug text-slate-600">
           Hides agents and tool gateways that have no access edge.
         </p>
       </div>
@@ -432,14 +469,14 @@ function LegendFilters({
           className={`w-full flex items-center gap-2 px-2 py-1 rounded-lg border text-xs font-medium transition-colors ${
             policyOnly
               ? 'bg-amber-50 text-amber-800 border-amber-200'
-              : 'bg-transparent text-slate-500 border-transparent hover:bg-slate-50'
+              : 'bg-transparent text-slate-600 border-transparent hover:bg-slate-50'
           }`}
         >
           <span aria-hidden="true" className="h-2.5 w-2.5 rounded-full bg-amber-500 shrink-0" />
           <span className="flex-1 text-left">Policy-governed only</span>
-          <span className="text-[10px] opacity-60">{policyOnly ? 'on' : 'off'}</span>
+          <span className="text-[10px]">{policyOnly ? 'on' : 'off'}</span>
         </button>
-        <p className="mt-1.5 text-[10px] leading-snug text-slate-400">
+        <p className="mt-1.5 text-[10px] leading-snug text-slate-600">
           Amber edges reach a tool gateway that has Cedar enforcement on.
         </p>
       </div>

@@ -4,20 +4,22 @@
 export function DataNotes({ notes }: { notes: string[] }) {
   if (notes.length === 0) return null;
   return (
-    <ul className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 space-y-0.5" role="status">
-      {notes.map((n) => (
-        <li key={n}>{n}</li>
-      ))}
-    </ul>
+    <div className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" role="status">
+      <ul className="space-y-0.5">
+        {notes.map((n) => (
+          <li key={n}>{n}</li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
 export function ObsEmptyCard({ title, body, tone = 'slate' }: { title: string; body: string; tone?: 'slate' | 'amber' }) {
   const wrap = tone === 'amber' ? 'card border-amber-200 bg-amber-50/30' : 'card border-slate-200 bg-slate-50/50';
   const iconBg = tone === 'amber' ? 'bg-amber-100' : 'bg-slate-100';
-  const iconFg = tone === 'amber' ? 'text-amber-600' : 'text-slate-400';
+  const iconFg = tone === 'amber' ? 'text-amber-600' : 'text-slate-600';
   const titleFg = tone === 'amber' ? 'text-amber-900' : 'text-slate-900';
-  const bodyFg = tone === 'amber' ? 'text-amber-700/80' : 'text-slate-500';
+  const bodyFg = tone === 'amber' ? 'text-amber-700/80' : 'text-slate-600';
   return (
     <div className={wrap}>
       <div className="flex items-start gap-4">
@@ -27,7 +29,7 @@ export function ObsEmptyCard({ title, body, tone = 'slate' }: { title: string; b
           </svg>
         </div>
         <div>
-          <h3 className={`text-base font-semibold ${titleFg} mb-1`}>{title}</h3>
+          <h2 className={`text-base font-semibold ${titleFg} mb-1`}>{title}</h2>
           <p className={`text-sm ${bodyFg} max-w-2xl`}>{body}</p>
         </div>
       </div>

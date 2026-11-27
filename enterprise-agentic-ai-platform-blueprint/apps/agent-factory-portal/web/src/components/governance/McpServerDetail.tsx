@@ -14,7 +14,7 @@ import McpConnectedAgentsTab from './McpConnectedAgentsTab';
 import { Badge, CARD, CodeValue, ErrorCard, Field, Loading, Page, TabBar, formatDate } from '../shared/ui';
 import { useAsync } from '../shared/useAsync';
 
-const BACK_LINK = 'text-xs text-slate-500 hover:text-slate-700';
+const BACK_LINK = 'text-xs text-slate-600 hover:text-slate-700';
 
 /** Read-only detail of one tool gateway. The active tab is kept in the `tab` query parameter. */
 export default function McpServerDetail() {
@@ -33,7 +33,7 @@ export default function McpServerDetail() {
   if (isNotFound(cause)) {
     return (
       <Page>
-        <p className="text-slate-500 text-sm">
+        <p className="text-slate-600 text-sm">
           Tool gateway <span className="font-mono">{id}</span> was not found.{' '}
           <Link to="/tool-gateways" className="text-blue-700 hover:underline">Back to tool gateways</Link>.
         </p>
@@ -67,7 +67,7 @@ export default function McpServerDetail() {
             <Badge cls={lifecycle.cls} label={lifecycle.label} />
             <Badge cls={kind.cls} label={kind.label} />
             {mcp.shared && <Badge cls="bg-violet-50 text-violet-700" label="Shared with all tenants" />}
-            <span className="text-xs text-slate-500">v{mcp.version}</span>
+            <span className="text-xs text-slate-600">v{mcp.version}</span>
           </div>
         </div>
       </div>
@@ -102,27 +102,21 @@ function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string |
       <div className={`${CARD} p-5`}>
         <h2 className="text-sm font-semibold text-slate-800 mb-1">Description</h2>
         <p className="text-sm text-slate-700 whitespace-pre-wrap">
-          {mcp.description ? mcp.description : <span className="text-slate-400">No description.</span>}
+          {mcp.description ? mcp.description : <span className="text-slate-600">No description.</span>}
         </p>
       </div>
 
       <div className={`${CARD} p-5`}>
         <h2 className="text-sm font-semibold text-slate-800 mb-3">Connection</h2>
         <dl className="grid grid-cols-1 lg:grid-cols-2 gap-x-8 gap-y-4">
-          <div className="lg:col-span-2">
-            <Field label={endpoint?.fromGateway ? 'Gateway URL' : 'Endpoint URL'}>
+          <Field className="lg:col-span-2" label={endpoint?.fromGateway ? 'Gateway URL' : 'Endpoint URL'}>
               <CodeValue value={endpoint?.url} copyLabel="endpoint URL" />
             </Field>
-          </div>
           {isGateway && (
-            <div className="lg:col-span-2">
-              <Field label="Gateway ARN"><CodeValue value={mcp.gateway_arn} copyLabel="gateway ARN" /></Field>
-            </div>
+            <Field className="lg:col-span-2" label="Gateway ARN"><CodeValue value={mcp.gateway_arn} copyLabel="gateway ARN" /></Field>
           )}
           {mcp.runtime_arn && (
-            <div className="lg:col-span-2">
-              <Field label="Runtime ARN"><CodeValue value={mcp.runtime_arn} copyLabel="runtime ARN" /></Field>
-            </div>
+            <Field className="lg:col-span-2" label="Runtime ARN"><CodeValue value={mcp.runtime_arn} copyLabel="runtime ARN" /></Field>
           )}
           {isGateway && <Field label="Cedar enforcement">{enforcementLabel(mcp.cedar_enforcement_mode)}</Field>}
           {isGateway && (
@@ -130,7 +124,7 @@ function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string |
               {mcp.cedar_policy_engine_id ? (
                 <span className="font-mono text-xs break-all">{mcp.cedar_policy_engine_id}</span>
               ) : (
-                <span className="text-slate-400">None attached</span>
+                <span className="text-slate-600">None attached</span>
               )}
             </Field>
           )}
@@ -149,7 +143,7 @@ function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string |
           </Field>
           <Field label="Business unit">{mcp.business_unit ?? '—'}</Field>
           <Field label="Owner">
-            {mcp.owner_email ? <span title={mcp.owner_email}>{emailAlias(mcp.owner_email)}</span> : <span className="text-slate-400">Unassigned</span>}
+            {mcp.owner_email ? <span title={mcp.owner_email}>{emailAlias(mcp.owner_email)}</span> : <span className="text-slate-600">Unassigned</span>}
           </Field>
           <Field label="Region">{mcp.region ?? '—'}</Field>
           <Field label="Data classification">{mcp.data_classification ?? '—'}</Field>
@@ -173,11 +167,11 @@ function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string |
 function ToolsTab({ mcp }: { mcp: McpServer }) {
   const tools = mcp.available_tools ?? [];
   if (tools.length === 0) {
-    return <div className={`${CARD} p-8 text-center text-slate-500 text-sm`}>No tools are recorded for this gateway.</div>;
+    return <div className={`${CARD} p-8 text-center text-slate-600 text-sm`}>No tools are recorded for this gateway.</div>;
   }
   return (
     <div className="space-y-3">
-      <p className="text-[11px] uppercase tracking-wide text-slate-400 font-medium">
+      <p className="text-[11px] uppercase tracking-wide text-slate-600 font-medium">
         {tools.length} {tools.length === 1 ? 'tool' : 'tools'}
       </p>
       {tools.map((tool, i) => (
@@ -185,7 +179,7 @@ function ToolsTab({ mcp }: { mcp: McpServer }) {
           <code className="text-sm font-mono font-semibold text-slate-800 break-all">{tool.name}</code>
           {tool.description && <p className="text-sm text-slate-600 mt-1 whitespace-pre-wrap">{tool.description}</p>}
           <details className="mt-3">
-            <summary className="text-[11px] uppercase tracking-wide text-slate-500 font-medium cursor-pointer">Input schema</summary>
+            <summary className="text-[11px] uppercase tracking-wide text-slate-600 font-medium cursor-pointer">Input schema</summary>
             <pre className="mt-2 text-xs font-mono bg-slate-50 border border-slate-200 rounded-lg p-3 overflow-x-auto text-slate-700">
               {JSON.stringify(tool.input_schema ?? {}, null, 2)}
             </pre>

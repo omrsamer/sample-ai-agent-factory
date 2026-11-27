@@ -30,6 +30,12 @@ class UserInfo(BaseModel):
     groups: list[str] = Field(default_factory=list)
     identity_provider: str
     read_only: bool = True
+    # Which registration actions to offer. The action functions enforce this themselves.
+    can_register: bool = False
+    can_approve: bool = False
+    authorities: list[str] = Field(default_factory=list)  # "registrar", "approver"
+    # Tenants the caller acts for: ["*"] for every tenant, null when the read API is not told.
+    registration_tenants: list[str] | None = None
 
 
 # --- Agents ------------------------------------------------------------------

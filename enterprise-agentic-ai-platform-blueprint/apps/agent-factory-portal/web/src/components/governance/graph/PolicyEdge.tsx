@@ -47,7 +47,6 @@ export function PolicyEdge({
               pointerEvents: 'all',
             }}
             title={CEDAR_ENFORCEMENT_COPY}
-            aria-label={CEDAR_ENFORCEMENT_COPY}
             className="nodrag nopan inline-flex items-center gap-1 rounded-full bg-amber-100 text-amber-800 text-xs font-medium px-2 py-0.5 shadow hover:bg-amber-200 transition-colors"
           >
             <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-amber-500" />

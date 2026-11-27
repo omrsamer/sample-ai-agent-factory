@@ -12,12 +12,14 @@ export default function ConfigErrorPage({ errors }: { errors: string[] }) {
           the deployment writes next to the site. That file is missing or invalid, so the portal
           cannot sign you in or reach the API.
         </p>
-        <ul className="mt-4 space-y-1.5 text-sm text-red-700 list-disc list-inside" role="alert">
-          {errors.map((e) => (
-            <li key={e} className="break-words">{e}</li>
-          ))}
-        </ul>
-        <p className="text-xs text-slate-500 mt-5">
+        <div role="alert">
+          <ul className="mt-4 space-y-1.5 text-sm text-red-700 list-disc list-inside">
+            {errors.map((e) => (
+              <li key={e} className="break-words">{e}</li>
+            ))}
+          </ul>
+        </div>
+        <p className="text-xs text-slate-600 mt-5">
           Running locally? Copy <code className="font-mono">public/config.example.json</code> to{' '}
           <code className="font-mono">public/config.local.json</code>, fill in the values, and reload.
         </p>

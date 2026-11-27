@@ -37,7 +37,11 @@ export interface RuntimeConfig {
   cognito?: CognitoConfig;
   entra?: EntraConfig;
   environment: PortalEnvironment;
-  features: { readOnly: boolean };
+  features: {
+    readOnly: boolean;
+    /** Governed registration and approval screens. Off unless explicitly `true`. */
+    governedActions: boolean;
+  };
 }
 
 export type ConfigResult =
@@ -168,6 +172,8 @@ export function parseRuntimeConfig(raw: unknown): { config: RuntimeConfig } | { 
   // can gate on it. Only an explicit `false` turns it off.
   const features = isRecord(raw.features) ? raw.features : {};
   const readOnly = features.readOnly !== false;
+  // The only feature that issues writes. Anything other than the boolean `true` leaves it off.
+  const governedActions = features.governedActions === true;
 
   if (errors.length > 0) return { errors };
   return {
@@ -177,7 +183,7 @@ export function parseRuntimeConfig(raw: unknown): { config: RuntimeConfig } | { 
       ...(cognito ? { cognito } : {}),
       ...(entra ? { entra } : {}),
       environment,
-      features: { readOnly },
+      features: { readOnly, governedActions },
     },
   };
 }

@@ -1,17 +1,26 @@
 # Agent Factory Portal API
 
-Read-only back end of the Agent Factory Portal, the product surface for the
+Back end of the Agent Factory Portal, the product surface for the
 blueprint's planes (developer experience, platform control, assurance and
 operations). It serves blueprint data in the response shapes the portal front
 end (`../web`) already uses.
 
-Milestone 1 is read-only by construction:
+The bundle holds three Lambda functions, each with its own IAM role:
+
+| Handler | Purpose |
+| --- | --- |
+| `handler.handler` | The read API. Every route is a `GET` |
+| `registrar_handler.handler` | Create, update, submit and delete agent records |
+| `approver_handler.handler` | Approve or reject a submitted agent record |
+
+The read API is read-only by construction:
 
 - Every route is a `GET`. Any other method is answered with `405` before a
   route or dependency runs.
-- The code calls only list, get and describe operations, plus
-  `logs:StartQuery` to run read-only CloudWatch Logs Insights queries.
-  `tests/test_readonly.py` enforces this and keeps [IAM_ACTIONS.md](IAM_ACTIONS.md) exact.
+- Its code calls only list, get, describe and query operations, plus
+  `logs:StartQuery` to run read-only CloudWatch Logs Insights queries, and it
+  does not import the action code. `tests/test_readonly.py` enforces this and
+  keeps [IAM_ACTIONS.md](IAM_ACTIONS.md) exact for all three roles.
 - Workstream cells are changed only by their pipelines. The portal reads each
   cell through a reader role, so central visibility does not become central
   write access.
@@ -43,6 +52,9 @@ caller with a mapped role.
 | `/fleet/health` | Per cell: CloudWatch alarms by name prefix, reduced to `healthy`, `needs_attention`, `critical` or `no_data`. An unreachable cell is reported, not fatal |
 | `/catalog/models` | `PORTAL_MODEL_ALLOWLIST` |
 | `/catalog/tools` | Registry tool records |
+| `/registrations` | Agent governance records in the registry, with `status` and `tenant_id` filters |
+| `/registrations/{record_id}` | One record, with who created, submitted and decided it (from the audit trail) |
+| `/registrations/{record_id}/history` | The record's audit trail, newest first |
 
 Things to know about the data:
 
@@ -68,6 +80,37 @@ Things to know about the data:
 
 The agent governance document is defined in
 [schemas/agent-governance-1.0.json](schemas/agent-governance-1.0.json).
+
+## Registration and approval
+
+The two action functions and their endpoints are specified in
+[ACTIONS_CONTRACT.md](ACTIONS_CONTRACT.md). In short:
+
+- **Who decides.** `portal_api/registration_core.py` is a rule-for-rule port
+  of the TypeScript authorization core in
+  `packages/agent-registry/src/agent-registration-api.ts`. Both run the shared
+  vectors in `packages/agent-registry/vectors/registration-decisions.json`.
+  `portal_api/actions/authority.py` only translates the portal's facts into
+  the core's terms: `platform` is registrar and approver for every tenant,
+  `developer` is registrar for its own tenants, `approver` and `security` are
+  approvers for their tenants.
+- **Record shape.** The same document, record name and calls as
+  `pipelines/publish_agent_record.py`. `schemas/agent-governance-1.0.json` is a
+  copy of the canonical schema in `packages/agent-registry/schemas`.
+- **Audit trail.** Every decision is appended to the Amazon DynamoDB table in
+  `PORTAL_AUDIT_TABLE` (`pk = RECORD#<record_id>`,
+  `sk = EVENT#<UTC timestamp>#<uuid>`). For an allowed action an `intent` event
+  is written first; if that write fails the action is not performed. A
+  `result` event follows the registry call. Events are written with
+  `attribute_not_exists(pk)` and never updated or deleted. The `result` event
+  of an approval also stores the approved document (attribute `document`), so
+  a later change can be shown against it.
+- **Separation of duties.** The submitter of a record is the actor of its
+  latest allowed `submit` event, read from the audit table with a strongly
+  consistent query. The submitter cannot approve or reject the record.
+- **Fail closed.** A function whose `PORTAL_ACTION_ROLE` does not match its
+  handler answers 404 for everything. Each function answers 404 for the other
+  functions' routes.
 
 ## Identity
 
@@ -100,7 +143,20 @@ mapped role wins. No claims is `401`; no mapped group is `403`.
 | `PORTAL_ALLOWED_ORIGINS` | no | JSON list of origins for CORS. Default: none. `*` is rejected |
 | `PORTAL_CACHE_TTL_SECONDS` | no | In-process cache lifetime for list reads. Default `30`, `0` disables |
 | `PORTAL_LOG_LEVEL` | no | Default `INFO` |
+| `PORTAL_AUDIT_TABLE` | for history | Audit table name. Without it `/registrations/{record_id}/history` answers 500 and `/registrations/{record_id}` omits the people fields |
+| `PORTAL_GROUP_TENANT_MAP` | no | Lets `/users/me` report `registration_tenants` |
 | `PORTAL_DEV_AUTH` | no | Local development only, see below |
+
+The action functions read a smaller set, all required unless noted:
+
+| Variable | Meaning |
+| --- | --- |
+| `PORTAL_ACTION_ROLE` | `registrar` or `approver`; must match the handler |
+| `PORTAL_ENV`, `PORTAL_REGISTRY_ID`, `PORTAL_REGISTRY_REGION` | As above. The audit table is read in the registry's Region |
+| `PORTAL_IDENTITY_PROVIDER`, `PORTAL_GROUP_ROLE_MAP` | As above |
+| `PORTAL_GROUP_TENANT_MAP` | JSON object, group or app role name to a list of tenant ids. `"*"` is allowed only for a group mapped to `platform` |
+| `PORTAL_AUDIT_TABLE` | Audit table name |
+| `PORTAL_ALLOWED_ORIGINS`, `PORTAL_LOG_LEVEL` | Optional, as above |
 
 If a required value is missing or malformed, every data endpoint answers `500`
 with a reason that names the variable, and the reason is logged. There is no
@@ -129,8 +185,8 @@ assume each cell's reader role.
 ./build.sh
 ```
 
-Produces `dist/` for an arm64, Python 3.13 Lambda function with handler
-`handler.handler`. Zip the contents of `dist/`. boto3 and botocore are bundled
+Produces `dist/` for arm64, Python 3.13 Lambda functions, with `handler.py`,
+`registrar_handler.py` and `approver_handler.py` at its root. Zip the contents of `dist/`. boto3 and botocore are bundled
 at pinned versions on purpose: the Agent Registry control-plane client is newer
 than the SDK included in the Lambda runtime.
 

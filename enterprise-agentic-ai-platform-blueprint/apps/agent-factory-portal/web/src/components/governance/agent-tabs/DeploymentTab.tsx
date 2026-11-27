@@ -33,7 +33,7 @@ export default function DeploymentTab({ agent }: { agent: Agent }) {
         <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
           <div>
             <h2 className="text-sm font-semibold text-slate-800">Runtime</h2>
-            <p className="text-xs text-slate-500 mt-0.5">Deployed by the Workstream pipeline. This portal does not start, stop or change a runtime.</p>
+            <p className="text-xs text-slate-600 mt-0.5">Deployed by the Workstream pipeline. This portal does not start, stop or change a runtime.</p>
           </div>
           {environments.length > 1 && (
             <div>
@@ -55,29 +55,27 @@ export default function DeploymentTab({ agent }: { agent: Agent }) {
         {runtime.loading ? (
           <Loading label="Reading runtime status…" />
         ) : runtime.error ? (
-          <p className="text-sm text-slate-500">Runtime status is unavailable. {isNotFound(runtime.cause) ? 'No runtime is recorded for this agent.' : runtime.error}</p>
+          <p className="text-sm text-slate-600">Runtime status is unavailable. {isNotFound(runtime.cause) ? 'No runtime is recorded for this agent.' : runtime.error}</p>
         ) : (
+          <>
+          {otherEnvironment && (
+            <p className="mb-4 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" role="status">
+              A reading for {stage} is not available. This is the status of {otherEnvironment}.
+            </p>
+          )}
           <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">
-            {otherEnvironment && (
-              <p className="sm:col-span-2 lg:col-span-3 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" role="status">
-                A reading for {stage} is not available. This is the status of {otherEnvironment}.
-              </p>
-            )}
             <Field label="Status"><Badge cls={status.cls} label={status.label} title={runtime.data?.detail ?? undefined} /></Field>
             <Field label="Environment">{runtime.data?.stage || '—'}</Field>
             <Field label="Image tag"><span className="font-mono text-xs break-all">{runtime.data?.image_tag || '—'}</span></Field>
             <Field label="Platform">{platformLabel(agent.platform)}</Field>
             <Field label="Region">{agent.region ?? '—'}</Field>
             <Field label="Checked">{formatDate(runtime.data?.checked_at)}</Field>
-            <div className="sm:col-span-2 lg:col-span-3">
-              <Field label="Runtime ARN"><CodeValue value={runtime.data?.runtime_arn} copyLabel="runtime ARN" /></Field>
-            </div>
+            <Field className="sm:col-span-2 lg:col-span-3" label="Runtime ARN"><CodeValue value={runtime.data?.runtime_arn} copyLabel="runtime ARN" /></Field>
             {runtime.data?.detail && (
-              <div className="sm:col-span-2 lg:col-span-3">
-                <Field label="Detail">{runtime.data.detail}</Field>
-              </div>
+              <Field className="sm:col-span-2 lg:col-span-3" label="Detail">{runtime.data.detail}</Field>
             )}
           </dl>
+          </>
         )}
       </div>
 
@@ -88,7 +86,7 @@ export default function DeploymentTab({ agent }: { agent: Agent }) {
         ) : history.error ? (
           <ErrorCard title="Couldn’t load deployment history" message={history.error} onRetry={history.reload} />
         ) : rows.length === 0 ? (
-          <div className={`${CARD} p-5 text-sm text-slate-500`}>{stage ? `No deployment has been recorded for ${stage}.` : 'No deployment has been recorded for this agent.'}</div>
+          <div className={`${CARD} p-5 text-sm text-slate-600`}>{stage ? `No deployment has been recorded for ${stage}.` : 'No deployment has been recorded for this agent.'}</div>
         ) : (
           <div className={`${CARD} overflow-x-auto`}>
             <table className="w-full text-sm">
