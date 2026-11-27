@@ -26,6 +26,7 @@ import {
   BucketEncryption,
   ObjectOwnership,
 } from "aws-cdk-lib/aws-s3";
+import { LogGroup, RetentionDays } from "aws-cdk-lib/aws-logs";
 import { BucketDeployment, ISource, Source } from "aws-cdk-lib/aws-s3-deployment";
 import { NagSuppressions } from "cdk-nag";
 import { Construct } from "constructs";
@@ -214,7 +215,29 @@ export class PortalWebHosting extends Construct {
       Source.asset(webDistPath),
       Source.jsonData("config.json", config),
     ];
+    // An explicit log group, so the publisher's logs are removed with the
+    // stack instead of being left behind as an auto-created group.
+    const publishLogs = new LogGroup(this, "PublishLogs", {
+      retention: RetentionDays.THREE_MONTHS,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    NagSuppressions.addResourceSuppressions(
+      publishLogs,
+      [
+        {
+          id: "NIST.800.53.R5-CloudWatchLogGroupEncrypted",
+          reason:
+            "SEC-046: CloudWatch Logs encrypts log data at rest by default; these are deployment logs of a public static bundle.",
+        },
+        {
+          id: "NIST.800.53.R5-CloudWatchLogGroupRetentionPeriod",
+          reason: "SEC-046: deployment logs are kept three months.",
+        },
+      ],
+      true,
+    );
     const deployment = new BucketDeployment(this, "Publish", {
+      logGroup: publishLogs,
       sources,
       destinationBucket: this.bucket,
       distribution: this.distribution,

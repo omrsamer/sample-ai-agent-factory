@@ -1,0 +1,1072 @@
+[
+  {
+    "name": "principal missing denies",
+    "principal": null,
+    "action": "create",
+    "request": {
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "missing or incomplete principal"
+    }
+  },
+  {
+    "name": "principal without id denies",
+    "principal": {
+      "principalId": "",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "create",
+    "request": {
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "missing or incomplete principal"
+    }
+  },
+  {
+    "name": "principal without role denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "",
+      "tenantId": "ws1"
+    },
+    "action": "create",
+    "request": {
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "missing or incomplete principal"
+    }
+  },
+  {
+    "name": "principal without tenant denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": ""
+    },
+    "action": "create",
+    "request": {
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "missing or incomplete principal"
+    }
+  },
+  {
+    "name": "request without tenant denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "create",
+    "request": {},
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "missing tenantId"
+    }
+  },
+  {
+    "name": "request with empty tenant denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": ""
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "missing tenantId"
+    }
+  },
+  {
+    "name": "unknown action denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "publish",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "unknown action 'publish'"
+    }
+  },
+  {
+    "name": "reject is not an action of the core",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "reject",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      },
+      "submittedBy": "user-registrar"
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "unknown action 'reject'"
+    }
+  },
+  {
+    "name": "submit is not an action of the core",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "submit",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "unknown action 'submit'"
+    }
+  },
+  {
+    "name": "REG-07-P registrar creates in own tenant",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "create",
+    "request": {
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": true,
+      "reasonContains": "REG-07-P"
+    }
+  },
+  {
+    "name": "REG-07-N approver cannot create",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "create",
+    "request": {
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-07-N"
+    }
+  },
+  {
+    "name": "REG-07-N other role cannot create",
+    "principal": {
+      "principalId": "user-other",
+      "role": "other",
+      "tenantId": "ws1"
+    },
+    "action": "create",
+    "request": {
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "principal holds 'other' (REG-07-N)"
+    }
+  },
+  {
+    "name": "create in another tenant denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "create",
+    "request": {
+      "tenantId": "ws2"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "may only create records in its own tenant"
+    }
+  },
+  {
+    "name": "registrar updates a draft record",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "registrar update of a record"
+    }
+  },
+  {
+    "name": "REG-08-N approver cannot update",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-08-N"
+    }
+  },
+  {
+    "name": "REG-08-N other role cannot update",
+    "principal": {
+      "principalId": "user-other",
+      "role": "other",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-08-N"
+    }
+  },
+  {
+    "name": "update of a missing record denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "update target record does not exist"
+    }
+  },
+  {
+    "name": "update of another tenant's record denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws2",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "cross-tenant update is denied"
+    }
+  },
+  {
+    "name": "update naming another tenant denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws2"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "cross-tenant update is denied"
+    }
+  },
+  {
+    "name": "REG-12-N approved record: changed inference target denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/other"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "APPROVED",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-12-N"
+    }
+  },
+  {
+    "name": "REG-12-N approved record: changed model denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "modelId": "model-b"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "APPROVED",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-12-N"
+    }
+  },
+  {
+    "name": "REG-12-N approved record: changed rate profile denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "rateProfile": "burst"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "APPROVED",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-12-N"
+    }
+  },
+  {
+    "name": "approved record: identical references allowed",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "APPROVED",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "registrar update of a record"
+    }
+  },
+  {
+    "name": "approved record: no proposed references allowed",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "APPROVED",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "registrar update of a record"
+    }
+  },
+  {
+    "name": "approved record: partial identical reference allowed",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "modelId": "model-a"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "APPROVED",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "registrar update of a record"
+    }
+  },
+  {
+    "name": "draft record: changed reference allowed",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "modelId": "model-b"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "registrar update of a record"
+    }
+  },
+  {
+    "name": "deprecated record: changed reference allowed by the core",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "modelId": "model-b"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DEPRECATED",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "registrar update of a record"
+    }
+  },
+  {
+    "name": "approved record without stored references: change allowed by the core",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "modelId": "model-b"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "APPROVED"
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "registrar update of a record"
+    }
+  },
+  {
+    "name": "role is checked before the approved-reference rule",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "update",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "proposedReferences": {
+        "modelId": "model-b"
+      }
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "APPROVED",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-08-N"
+    }
+  },
+  {
+    "name": "registrar deletes own tenant's record",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "delete",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "registrar delete of a record"
+    }
+  },
+  {
+    "name": "REG-10-N approver cannot delete",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "delete",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-10-N"
+    }
+  },
+  {
+    "name": "REG-10-N other role cannot delete",
+    "principal": {
+      "principalId": "user-other",
+      "role": "other",
+      "tenantId": "ws1"
+    },
+    "action": "delete",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-10-N"
+    }
+  },
+  {
+    "name": "delete of a missing record denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "delete",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "delete target record does not exist"
+    }
+  },
+  {
+    "name": "delete of another tenant's record denies",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "delete",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws2",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "cross-tenant delete is denied"
+    }
+  },
+  {
+    "name": "REG-11-P separate approver approves",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      },
+      "submittedBy": "user-registrar"
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "REG-11-P"
+    }
+  },
+  {
+    "name": "approve with no recorded submitter allowed",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      }
+    },
+    "expected": {
+      "allowed": true,
+      "reasonContains": "REG-11-P"
+    }
+  },
+  {
+    "name": "REG-09-N registrar cannot approve",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      },
+      "submittedBy": "user-other"
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-09-N"
+    }
+  },
+  {
+    "name": "REG-09-N other role cannot approve",
+    "principal": {
+      "principalId": "user-other",
+      "role": "other",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      },
+      "submittedBy": "user-registrar"
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-09-N"
+    }
+  },
+  {
+    "name": "approve of a missing record denies",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": null,
+    "expected": {
+      "allowed": false,
+      "reasonContains": "approve target record does not exist"
+    }
+  },
+  {
+    "name": "REG-11-N submitter cannot approve its own record",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      },
+      "submittedBy": "user-approver"
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-11-N"
+    }
+  },
+  {
+    "name": "self-approval is reported before the tenant rule",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws2",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      },
+      "submittedBy": "user-approver"
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-11-N"
+    }
+  },
+  {
+    "name": "approve of another tenant's record denies",
+    "principal": {
+      "principalId": "user-approver",
+      "role": "registry_approver",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws2",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      },
+      "submittedBy": "user-registrar"
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "cross-tenant approve is denied"
+    }
+  },
+  {
+    "name": "role is checked before self-approval",
+    "principal": {
+      "principalId": "user-registrar",
+      "role": "registry_admin",
+      "tenantId": "ws1"
+    },
+    "action": "approve",
+    "request": {
+      "recordId": "rec-1",
+      "tenantId": "ws1"
+    },
+    "currentState": {
+      "recordId": "rec-1",
+      "tenantId": "ws1",
+      "status": "DRAFT",
+      "references": {
+        "inferenceTargetArn": "arn:aws:bedrock:eu-west-1:111111111111:inference-profile/example",
+        "modelId": "model-a",
+        "rateProfile": "standard"
+      },
+      "submittedBy": "user-registrar"
+    },
+    "expected": {
+      "allowed": false,
+      "reasonContains": "REG-09-N"
+    }
+  }
+]

@@ -92,7 +92,7 @@ describe("Phase 28 — separation of duties in IAM", () => {
 
   it("registrar can create, change, submit and delete records, and cannot decide an approval", () => {
     expect([...registrar].sort()).toEqual(
-      [...PORTAL_REGISTRAR_REGISTRY_ACTIONS, "dynamodb:PutItem", "dynamodb:Query", ...OWN_TELEMETRY].sort(),
+      [...PORTAL_REGISTRAR_REGISTRY_ACTIONS, "dynamodb:PutItem", ...OWN_TELEMETRY].sort(),
     );
     expect(registrar).not.toContain("agent-registry:UpdateRegistryRecordStatus");
   });

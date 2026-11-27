@@ -115,6 +115,12 @@ export interface PortalApiProps {
    * actions in browser preflight.
    */
   readonly auditTable?: ITable;
+  /**
+   * Group or app-role name to tenant ids, so `/users/me` can tell the web
+   * application which tenants the user may register for. The action functions
+   * enforce it themselves.
+   */
+  readonly groupTenantMap?: Readonly<Record<string, readonly string[]>>;
 }
 
 /**
@@ -304,6 +310,9 @@ export class PortalApi extends Construct {
         PORTAL_ALLOWED_ORIGINS: stack.toJsonString(props.allowedOrigins),
         PORTAL_CACHE_TTL_SECONDS: "30",
         ...(props.auditTable ? { PORTAL_AUDIT_TABLE: props.auditTable.tableName } : {}),
+        ...(props.groupTenantMap
+          ? { PORTAL_GROUP_TENANT_MAP: JSON.stringify(props.groupTenantMap) }
+          : {}),
       },
     });
 

@@ -218,6 +218,7 @@ export class AgentFactoryPortalStack extends Stack {
       guardrailTag,
       logsKey,
       auditTable: audit?.table,
+      groupTenantMap: governedActions?.groupTenantMap,
     });
 
     if (governedActions && audit) {

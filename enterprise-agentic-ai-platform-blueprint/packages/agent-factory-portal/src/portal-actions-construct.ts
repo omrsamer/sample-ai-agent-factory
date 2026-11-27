@@ -36,8 +36,13 @@ export const PORTAL_APPROVER_REGISTRY_ACTIONS: readonly string[] = [
   "agent-registry:GetRegistryRecord",
 ];
 
-/** The audit trail is append-only: the action functions can add and read, never rewrite. */
-export const PORTAL_AUDIT_WRITER_ACTIONS: readonly string[] = ["dynamodb:PutItem", "dynamodb:Query"];
+/**
+ * The audit trail is append-only. The registrar only appends; the approver
+ * appends and reads (it must find a record's submitter to refuse a
+ * self-approval); the read API only reads. Nothing can rewrite or delete.
+ */
+export const PORTAL_REGISTRAR_AUDIT_ACTIONS: readonly string[] = ["dynamodb:PutItem"];
+export const PORTAL_APPROVER_AUDIT_ACTIONS: readonly string[] = ["dynamodb:PutItem", "dynamodb:Query"];
 export const PORTAL_AUDIT_READER_ACTIONS: readonly string[] = ["dynamodb:Query"];
 
 export function portalRegistrarRoleName(environment: PortalEnvironment): string {
@@ -109,6 +114,7 @@ interface ActionFunctionSpec {
   readonly roleName: string;
   readonly handler: string;
   readonly registryActions: readonly string[];
+  readonly auditActions: readonly string[];
   readonly description: string;
 }
 
@@ -162,9 +168,9 @@ export class PortalActions extends Construct {
             resources: [props.registryArn, recordsArn],
           }),
           new PolicyStatement({
-            sid: "AppendAndReadAuditTrail",
+            sid: "AuditTrail",
             effect: Effect.ALLOW,
-            actions: [...PORTAL_AUDIT_WRITER_ACTIONS],
+            actions: [...spec.auditActions],
             resources: [props.auditTable.tableArn],
           }),
         ],
@@ -245,6 +251,7 @@ export class PortalActions extends Construct {
       roleName: portalRegistrarRoleName(props.environment),
       handler: "registrar_handler.handler",
       registryActions: PORTAL_REGISTRAR_REGISTRY_ACTIONS,
+      auditActions: PORTAL_REGISTRAR_AUDIT_ACTIONS,
       description:
         "Agent Factory Portal registrar: creates, updates, submits and deletes agent governance records. Cannot approve.",
     });
@@ -254,6 +261,7 @@ export class PortalActions extends Construct {
       roleName: portalApproverRoleName(props.environment),
       handler: "approver_handler.handler",
       registryActions: PORTAL_APPROVER_REGISTRY_ACTIONS,
+      auditActions: PORTAL_APPROVER_AUDIT_ACTIONS,
       description:
         "Agent Factory Portal approver: approves or rejects a submitted agent governance record. Cannot create or change one.",
     });
