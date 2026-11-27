@@ -44,12 +44,22 @@ In the agent's cell, with that cell's containment role:
    `sessions.sources` says how many each gave, for example "found 3 sessions
    (2 in traces, 3 in logs)". It is informational.
 
-**Enforcement is not instant.** After the statement is written, the service
-takes up to about 30 seconds to deny every invocation; a call on an existing
-session can still succeed for a few seconds. `state` is `contained` as soon as
-the statement is verified, and `enforcement_delay_seconds` (30) says how long
-to allow. Tell the user "Contained. Invocations are blocked within about 30
-seconds." rather than "blocked now". The same applies to release.
+**Enforcement is not instant, and the two directions differ.** The service
+applies a policy change host by host (measured on a live Runtime under steady
+calls):
+
+- After contain, an occasional invocation still succeeded for up to 52
+  seconds, and none after that. Allow 90 seconds.
+- After release, a large share of calls was still refused for the first
+  minutes; the last refusal came 263 and 269 seconds later in two runs, and
+  none in the seven minutes that followed. Allow five minutes.
+
+`state` changes as soon as the statement is verified. Each result carries
+`enforcement_delay_seconds` for the action it reports (90 for contain, 300 for
+release), and the view carries both (`enforcement_delay_seconds` for contain,
+`release_delay_seconds` for release). Tell the user "Contained. Invocations
+are blocked within about 90 seconds." and "Released. Some calls can still be
+refused for about 5 minutes." rather than "now".
 
 Release removes exactly that statement and verifies. If the policy held
 nothing else, the policy is deleted. Release does not restart anything.
@@ -83,7 +93,7 @@ interface ContainmentResult {
   steps: ContainmentStep[];           // what was done, in order
   partial: boolean;                   // true: contained, but the session step did not fully complete
   denied_actions: string[];           // contain: the invoke actions the statement denies
-  enforcement_delay_seconds: number;  // 30: how long the change can take to apply everywhere
+  enforcement_delay_seconds: number;  // how long this change can take to apply everywhere: 90 for contain, 300 for release
   audit_complete: boolean;            // false: done, but its result event could not be written
 }
 
@@ -119,7 +129,8 @@ interface ContainmentView {
   contained_by_me: boolean;           // the caller contained it and so cannot release it
   detail: string | null;              // why the state is unknown, as a sentence to show
   partial: boolean;                   // the containment that holds did not stop every session it found
-  enforcement_delay_seconds: number;  // 30
+  enforcement_delay_seconds: number;  // 90: how long a contain can take to apply everywhere
+  release_delay_seconds: number;      // 300: how long a release can take to apply everywhere
   events: AuditEvent[];               // newest first; the AuditEvent of ACTIONS_CONTRACT.md
 }
 ```

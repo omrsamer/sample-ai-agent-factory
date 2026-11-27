@@ -323,13 +323,13 @@ def test_contain_a_runtime_that_has_no_policy(world):
         "stop_errors": [],
     }
     assert body["denied_actions"] == list(containment_policy.ALL_INVOKE_ACTIONS)
-    assert (body["partial"], body["enforcement_delay_seconds"]) == (False, 30)
+    assert (body["partial"], body["enforcement_delay_seconds"]) == (False, 90)
     assert [(step["id"], step["status"]) for step in body["steps"]] == [
         ("policy", "done"),
         ("verify", "done"),
         ("sessions", "done"),
     ]
-    assert "enforced within about 30 seconds" in body["reason"]
+    assert "enforced everywhere within about 90 seconds" in body["reason"]
     assert sorted(world.cell.stopped) == [(sid("aaa"), "DEFAULT"), (sid("bbb"), "LIVE")]
     assert body["reason"].startswith("Suspected prompt injection. [Invocation of the Runtime is denied")
     # read, write, read back to verify
@@ -855,6 +855,9 @@ def test_release_deletes_the_policy_only_when_nothing_else_remains(world):
         "contained",
         "not_contained",
     )
+    # A release takes longer to apply everywhere than a contain, and the response says so.
+    assert body["enforcement_delay_seconds"] == 300
+    assert "some calls can still be refused for about 5 minutes" in body["reason"]
 
 
 def test_release_keeps_the_other_statements(world):
@@ -1159,7 +1162,8 @@ def test_containment_view_says_when_the_containment_was_partial(world, read):
     world.cell.fail["start_query"] = "AccessDeniedException"
     assert world.post("contain", claims=SEC)[1]["partial"] is True
     view = read(world.record_id)[1]
-    assert (view["state"], view["partial"], view["enforcement_delay_seconds"]) == ("contained", True, 30)
+    assert (view["state"], view["partial"], view["enforcement_delay_seconds"]) == ("contained", True, 90)
+    assert view["release_delay_seconds"] == 300
     assert (
         view["events"][0]["detail"] == "ok; spans could not be queried (query could not start (AccessDeniedException))"
     )
@@ -1177,3 +1181,12 @@ def test_containment_view_unknown_and_missing(world, read, monkeypatch):
     monkeypatch.delenv("PORTAL_AUDIT_TABLE")
     code, view = read(world.record_id)
     assert code == 200 and view["events"] == []
+
+
+def test_the_delays_are_stated_in_words():
+    from portal_api.containment_timing import CONTAIN_DELAY_SECONDS, RELEASE_DELAY_SECONDS, delay_words
+
+    assert (CONTAIN_DELAY_SECONDS, RELEASE_DELAY_SECONDS) == (90, 300)
+    assert delay_words(45) == "about 45 seconds"
+    assert delay_words(90) == "about 90 seconds"
+    assert delay_words(300) == "about 5 minutes"

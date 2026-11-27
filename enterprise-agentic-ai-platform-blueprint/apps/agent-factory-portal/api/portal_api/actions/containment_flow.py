@@ -12,8 +12,9 @@ else remains) and verifies. Both are idempotent and never touch a statement the
 portal did not write.
 
 The function never invokes the Runtime to test the block: its role must not be
-able to. A change to the policy is enforced within about 30 seconds, not
-instantly, and every response says so.
+able to. A change to the policy is not enforced instantly: the service applies
+it host by host. Every response says how long to allow
+(``portal_api/containment_timing.py``, measured on a live Runtime).
 
 Audit follows the same discipline as registrations: an intent event before
 anything is changed, and a result event that says what was and was not done.
@@ -38,6 +39,7 @@ from portal_api.actions.engine import ActionError
 from portal_api.aws import audit as audit_reader
 from portal_api.aws.session import AwsClients, error_code
 from portal_api.config import ActionSettings, Cell
+from portal_api.containment_timing import CONTAIN_DELAY_SECONDS, RELEASE_DELAY_SECONDS, delay_words
 from portal_api.identity.provider import Principal
 from portal_api.mappers.common import arn_parts
 from portal_api.models.portal import (
@@ -51,8 +53,6 @@ from portal_api.models.portal import (
 logger = logging.getLogger(__name__)
 
 CONTAINED, NOT_CONTAINED = "contained", "not_contained"
-# A change to a Runtime's resource policy is enforced within about this long, not instantly.
-ENFORCEMENT_DELAY_SECONDS = 30
 NOT_ENABLED = "containment is not enabled for this cell"
 _RUNTIME_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{1,20}$")
 _LABELS = {
@@ -357,7 +357,7 @@ class ContainmentService:
         else:
             done = (
                 "Invocation of the Runtime is denied (statement written and verified; "
-                f"enforced within about {ENFORCEMENT_DELAY_SECONDS} seconds)."
+                f"enforced everywhere within {delay_words(CONTAIN_DELAY_SECONDS)})."
             )
             if tuple(denied) != containment_policy.ALL_INVOKE_ACTIONS:
                 done += " The service accepted only the core invoke actions in the statement."
@@ -376,7 +376,7 @@ class ContainmentService:
             steps=steps,
             partial=sessions_step.status != "done",
             denied_actions=denied,
-            enforcement_delay_seconds=ENFORCEMENT_DELAY_SECONDS,
+            enforcement_delay_seconds=CONTAIN_DELAY_SECONDS,
         )
 
     def _put_statement(
@@ -469,7 +469,7 @@ class ContainmentService:
             "state": NOT_CONTAINED,
             "other_statements_kept": kept,
             "steps": steps,
-            "enforcement_delay_seconds": ENFORCEMENT_DELAY_SECONDS,
+            "enforcement_delay_seconds": RELEASE_DELAY_SECONDS,
         }
         if not contained:
             policy_step.status, policy_step.detail = "unchanged", "The Runtime was not contained."
@@ -507,7 +507,10 @@ class ContainmentService:
             )
             raise _Failed(502, failure, steps, CONTAINED, CONTAINED)
         verify_step.status = "done"
-        after = f"Invocation is allowed again within about {ENFORCEMENT_DELAY_SECONDS} seconds."
+        after = (
+            "Invocation is allowed again; some calls can still be refused for "
+            f"{delay_words(RELEASE_DELAY_SECONDS)} while the change spreads."
+        )
         return ContainmentResult(
             outcome="allowed",
             reason=f"{reason} [The deny statement was removed and verified; {done}. {after}]",

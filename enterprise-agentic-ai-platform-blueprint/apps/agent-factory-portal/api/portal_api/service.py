@@ -15,8 +15,8 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+from portal_api import containment_timing, risk
 from portal_api import registrations as registration_helpers
-from portal_api import risk
 from portal_api.aws import agentcore, cloudwatch, guardrails, logs, omni, pipelines, registry
 from portal_api.aws import audit as audit_reader
 from portal_api.aws.cache import TTLCache
@@ -413,6 +413,8 @@ class PortalService:
             agent_id=entry.agent.id,
             state="unknown",
             runtime_arn=entry.runtime_arn,
+            enforcement_delay_seconds=containment_timing.CONTAIN_DELAY_SECONDS,
+            release_delay_seconds=containment_timing.RELEASE_DELAY_SECONDS,
             enabled=bool(
                 entry.runtime_arn
                 and any(

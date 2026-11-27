@@ -207,10 +207,14 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   with the two core actions (`InvokeAgentRuntime`,
   `InvokeAgentRuntimeCommand`) instead, and the response and audit event say
   so (`denied_actions`).
-- **Enforcement takes time.** A policy change is enforced within about 30
-  seconds, not instantly. Responses report the state as `contained` once the
-  statement is verified and carry `enforcement_delay_seconds`. The function
-  never invokes the Runtime to test the block; its role cannot.
+- **Enforcement takes time, and the two directions differ.** The service
+  applies a policy change host by host. Measured on a live Runtime under
+  steady calls: after contain an occasional invocation still succeeded for up
+  to 52 seconds; after release, calls were still refused for about four and
+  a half minutes. Responses report the new state once the statement is
+  verified and carry `enforcement_delay_seconds` (90 for contain, 300 for
+  release; `portal_api/containment_timing.py`). The function never invokes
+  the Runtime to test the block; its role cannot.
   Every other statement is kept as it was (`portal_api/containment_policy.py`,
   pure functions). Release removes exactly that statement and deletes the
   policy only if nothing else remains.

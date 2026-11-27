@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from portal_api.containment_timing import CONTAIN_DELAY_SECONDS, RELEASE_DELAY_SECONDS
+
 HealthState = Literal["healthy", "needs_attention", "critical", "no_data"]
 
 
@@ -323,8 +325,9 @@ class ContainmentResult(BaseModel):
     steps: list[ContainmentStep] = Field(default_factory=list)
     partial: bool = False
     denied_actions: list[str] = Field(default_factory=list)  # contain: the invoke actions the statement denies
-    # A change to the policy is enforced within about this many seconds, not instantly.
-    enforcement_delay_seconds: int = 30
+    # How long this change can take to apply everywhere: about a minute for contain, several
+    # minutes for release (the service applies a policy change host by host).
+    enforcement_delay_seconds: int = CONTAIN_DELAY_SECONDS
     audit_complete: bool = True
 
 
@@ -340,5 +343,7 @@ class ContainmentView(BaseModel):
     contained_by_me: bool = False  # the caller contained it and therefore cannot release it
     detail: str | None = None  # why the state is unknown, for example no reader in the agent's account
     partial: bool = False  # the containment that holds did not stop every session it found
-    enforcement_delay_seconds: int = 30
+    # How long a contain, and a release, can take to apply everywhere.
+    enforcement_delay_seconds: int = CONTAIN_DELAY_SECONDS
+    release_delay_seconds: int = RELEASE_DELAY_SECONDS
     events: list[AuditEvent] = Field(default_factory=list)
