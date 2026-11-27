@@ -22,32 +22,30 @@ import {
  * Read-only actions the portal may use inside a Workstream cell account.
  *
  * "Central visibility must not become central write access": every entry is a
- * Get, List, Describe, StartQuery, StopQuery or GetQueryResults operation. The
+ * Get, List, Describe or StartQuery operation, and matches
+ * apps/agent-factory-portal/api/IAM_ACTIONS.md exactly. The
  * conformance suite asserts the rendered policy holds nothing else.
  */
 export const PORTAL_FLEET_READER_AGENTCORE_ACTIONS: readonly string[] = [
-  "bedrock-agentcore:GetAgentRuntime",
   "bedrock-agentcore:ListAgentRuntimes",
+  "bedrock-agentcore:GetAgentRuntime",
   "bedrock-agentcore:ListAgentRuntimeVersions",
-  "bedrock-agentcore:ListAgentRuntimeEndpoints",
-  "bedrock-agentcore:GetGateway",
   "bedrock-agentcore:ListGateways",
-  "bedrock-agentcore:GetGatewayTarget",
+  "bedrock-agentcore:GetGateway",
   "bedrock-agentcore:ListGatewayTargets",
-  "bedrock-agentcore:GetPolicyEngine",
-  "bedrock-agentcore:ListPolicyEngines",
-  "bedrock-agentcore:GetPolicy",
+  "bedrock-agentcore:GetGatewayTarget",
+  "bedrock-agentcore:ListTagsForResource",
   "bedrock-agentcore:ListPolicies",
-  "bedrock-agentcore:GetMemory",
-  "bedrock-agentcore:ListMemories",
+  "bedrock-agentcore:GetPolicy",
 ];
 
-/** CloudWatch reads that IAM authorizes against `*` only. */
-export const PORTAL_FLEET_READER_CLOUDWATCH_ACTIONS: readonly string[] = [
+/** CloudWatch reads. Alarm reads take alarm ARNs; metric data has no resource type. */
+export const PORTAL_FLEET_READER_ALARM_ACTIONS: readonly string[] = [
   "cloudwatch:DescribeAlarms",
   "cloudwatch:DescribeAlarmHistory",
+];
+export const PORTAL_FLEET_READER_CLOUDWATCH_ACTIONS: readonly string[] = [
   "cloudwatch:GetMetricData",
-  "cloudwatch:ListMetrics",
 ];
 
 /** Logs Insights over the spans log group. */
@@ -58,11 +56,9 @@ export const PORTAL_FLEET_READER_LOGS_QUERY_ACTIONS: readonly string[] = [
 /** Query-result reads, which IAM authorizes against `*` only. */
 export const PORTAL_FLEET_READER_LOGS_RESULT_ACTIONS: readonly string[] = [
   "logs:GetQueryResults",
-  "logs:StopQuery",
-  "logs:DescribeLogGroups",
 ];
 
-const READ_ONLY_OPERATION = /^(Get|List|Describe|StartQuery|StopQuery)/;
+const READ_ONLY_OPERATION = /^(Get|List|Describe|StartQuery)/;
 
 export function assertPortalReadOnlyAction(action: string): void {
   const operation = action.slice(action.indexOf(":") + 1);
@@ -103,6 +99,7 @@ export class PortalFleetReaderRole extends Construct {
     }
     const all = [
       ...PORTAL_FLEET_READER_AGENTCORE_ACTIONS,
+      ...PORTAL_FLEET_READER_ALARM_ACTIONS,
       ...PORTAL_FLEET_READER_CLOUDWATCH_ACTIONS,
       ...PORTAL_FLEET_READER_LOGS_QUERY_ACTIONS,
       ...PORTAL_FLEET_READER_LOGS_RESULT_ACTIONS,
@@ -143,8 +140,15 @@ export class PortalFleetReaderRole extends Construct {
           agentcoreArn("runtime/*"),
           agentcoreArn("gateway/*"),
           agentcoreArn("policy-engine/*"),
-          agentcoreArn("memory/*"),
         ],
+      }),
+    );
+    policy.addStatements(
+      new PolicyStatement({
+        sid: "PortalReadAlarms",
+        effect: Effect.ALLOW,
+        actions: [...PORTAL_FLEET_READER_ALARM_ACTIONS],
+        resources: [`arn:${Aws.PARTITION}:cloudwatch:${stack.region}:${stack.account}:alarm:*`],
       }),
     );
     policy.addStatements(
@@ -184,7 +188,7 @@ export class PortalFleetReaderRole extends Construct {
         {
           id: "AwsSolutions-IAM5",
           reason:
-            "SEC-038: read-only fleet visibility. AgentCore list operations and resources created by Workstream pipelines cannot be enumerated at synthesis, so the statement is scoped to this account and Region by resource type; CloudWatch alarm, metric and Logs Insights result reads have no resource type in the Service Authorization Reference and are pinned to the Region by aws:RequestedRegion. The policy holds no mutating action.",
+            "SEC-038: read-only fleet visibility. AgentCore list operations and resources created by Workstream pipelines cannot be enumerated at synthesis, so the statement is scoped to this account and Region by resource type; CloudWatch metric data and Logs Insights result reads have no resource type in the Service Authorization Reference and are pinned to the Region by aws:RequestedRegion. The policy holds no mutating action.",
         },
       ],
       true,

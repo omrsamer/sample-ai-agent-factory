@@ -56,17 +56,14 @@ export interface PortalCell {
 
 /** Read-only Registry actions of the portal API in the Platform account. */
 export const PORTAL_API_REGISTRY_ACTIONS: readonly string[] = [
-  "agent-registry:GetRegistry",
   "agent-registry:ListRegistryRecords",
   "agent-registry:GetRegistryRecord",
 ];
 
 /** Read-only release-evidence actions on the named Workload pipelines. */
 export const PORTAL_API_PIPELINE_ACTIONS: readonly string[] = [
-  "codepipeline:GetPipelineState",
   "codepipeline:ListPipelineExecutions",
   "codepipeline:ListActionExecutions",
-  "codepipeline:GetPipelineExecution",
 ];
 
 /** Read-only Guardrail catalogue actions. */
@@ -198,9 +195,18 @@ export class PortalApi extends Construct {
     );
     policy.addStatements(
       new PolicyStatement({
+        sid: "PortalListGuardrails",
+        effect: Effect.ALLOW,
+        actions: ["bedrock:ListGuardrails"],
+        resources: ["*"],
+        conditions: { StringEquals: { "aws:RequestedRegion": stack.region } },
+      }),
+    );
+    policy.addStatements(
+      new PolicyStatement({
         sid: "PortalReadGuardrails",
         effect: Effect.ALLOW,
-        actions: [...PORTAL_API_GUARDRAIL_ACTIONS],
+        actions: ["bedrock:GetGuardrail", "bedrock:ListTagsForResource"],
         resources: [
           `arn:${Aws.PARTITION}:bedrock:${stack.region}:${stack.account}:guardrail/*`,
         ],
