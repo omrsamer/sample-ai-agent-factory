@@ -5,8 +5,9 @@
  * Containment is the one deliberate exception to "central visibility must not
  * become central write access". This suite pins how narrow it is:
  *   - a cell is containable only when it deploys the target role;
- *   - the target role holds five actions on that cell's Runtimes (resource
- *     policy read, put and delete; list and stop sessions) and trusts only
+ *   - the target role holds four actions on that cell's Runtimes (resource
+ *     policy read, put and delete; stop a session), may query the spans log
+ *     group to find the sessions, and trusts only
  *     the portal's containment function role, with the cell's external id;
  *   - the containment function's own role can only assume those target roles
  *     and append to and read the audit trail: no AgentCore, Registry or other
@@ -126,17 +127,22 @@ describe("Phase 29 — containment target role (Workstream cell)", () => {
   const template = Template.fromStack(stack);
   const statements = statementsOfRole(template, "AgenticAI-PortalContainmentTarget-nonprod");
 
-  it("holds exactly the five containment actions, on this cell's Runtimes only", () => {
-    expect(actions(statements).sort()).toEqual([...PORTAL_CONTAINMENT_TARGET_ACTIONS].sort());
-    expect(statements).toHaveLength(1);
-    expect(JSON.stringify(statements[0].Resource)).toContain(`:bedrock-agentcore:${REGION}:${CELL}:runtime/*`);
-    expect(JSON.stringify(statements[0].Resource)).not.toMatch(/gateway|memory|"\*"/);
+  it("holds exactly the four containment actions on this cell's Runtimes, and the span query that finds sessions", () => {
+    const runtime = statements.find((s) => s.Sid === "ContainRuntimes")!;
+    expect(actions([runtime]).sort()).toEqual([...PORTAL_CONTAINMENT_TARGET_ACTIONS].sort());
+    expect(JSON.stringify(runtime.Resource)).toContain(`:bedrock-agentcore:${REGION}:${CELL}:runtime/*`);
+    expect(JSON.stringify(runtime.Resource)).not.toMatch(/gateway|memory|"\*"/);
+    expect(actions(statements).sort()).toEqual(
+      [...PORTAL_CONTAINMENT_TARGET_ACTIONS, "logs:StartQuery", "logs:GetQueryResults"].sort(),
+    );
+    const query = statements.find((s) => s.Sid === "FindRuntimeSessions")!;
+    expect(JSON.stringify(query.Resource)).toContain(`:logs:${REGION}:${CELL}:log-group:aws/spans:*`);
   });
 
   it("cannot invoke, change or delete a Runtime, or touch anything else", () => {
     for (const action of actions(statements)) {
-      expect(action).not.toMatch(/:(Invoke|Update|Create|DeleteAgentRuntime|Tag)/);
-      expect(action.startsWith("bedrock-agentcore:")).toBe(true);
+      expect(action).not.toMatch(/:(Invoke|Update|Create|DeleteAgentRuntime|Tag|ListSessions)/);
+      expect(action.startsWith("bedrock-agentcore:") || action.startsWith("logs:")).toBe(true);
     }
   });
 
@@ -163,6 +169,38 @@ describe("Phase 29 — containment target role (Workstream cell)", () => {
 
   it("passes cdk-nag", () => {
     expect(nagErrors(stack)).toEqual([]);
+  });
+
+  it("is deployed by its own stage, which honours a custom spans log group", () => {
+    const app = new App({
+      context: {
+        "agenticai/portalEnvironment": "nonprod",
+        "agenticai/portalAccountId": PLATFORM,
+        "agenticai/portalCellAccountId": CELL,
+        "agenticai/portalExternalId": EXTERNAL_ID,
+        "agenticai/portalSpansLogGroupNames": "custom/agent-spans",
+      },
+    });
+    expect(addAgentFactoryPortalStage(app, "agent-factory-portal-containment", REGION)).toBe(true);
+    const staged = Template.fromStack(app.node.findChild("AgenticAI-AgentFactoryPortal-Containment-nonprod") as Stack);
+    const query = statementsOfRole(staged, "AgenticAI-PortalContainmentTarget-nonprod").find(
+      (s) => s.Sid === "FindRuntimeSessions",
+    )!;
+    expect(JSON.stringify(query.Resource)).toContain(`:logs:${REGION}:${CELL}:log-group:custom/agent-spans:*`);
+    expect(JSON.stringify(query.Resource)).not.toContain("aws/spans");
+  });
+
+  it("refuses to synthesize without the cell's external id", () => {
+    const app = new App({
+      context: {
+        "agenticai/portalEnvironment": "nonprod",
+        "agenticai/portalAccountId": PLATFORM,
+        "agenticai/portalCellAccountId": CELL,
+      },
+    });
+    expect(() => addAgentFactoryPortalStage(app, "agent-factory-portal-containment", REGION)).toThrow(
+      /requires context 'agenticai\/portalExternalId'/,
+    );
   });
 });
 

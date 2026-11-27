@@ -425,6 +425,7 @@ export function addAgentFactoryPortalStage(
       if (typeof externalId !== "string") {
         throw new Error("agent-factory-portal-containment stage requires context 'agenticai/portalExternalId'.");
       }
+      const containmentLogGroups = listContext(app, "agenticai/portalSpansLogGroupNames");
       const stack = new AgentFactoryPortalContainmentStack(
         app,
         `AgenticAI-AgentFactoryPortal-Containment-${environment}`,
@@ -433,6 +434,7 @@ export function addAgentFactoryPortalStage(
           environment,
           platformAccountId: platformAccount,
           externalId,
+          spansLogGroupNames: containmentLogGroups.length > 0 ? containmentLogGroups : undefined,
           description: `Agent Factory Portal (${environment}) containment authority for this cell.`,
         },
       );
