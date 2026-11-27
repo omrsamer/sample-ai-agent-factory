@@ -274,7 +274,13 @@ describe("Phase 27 — portal stack (Platform account)", () => {
 
   it("limits browser access to the portal origin and GET", () => {
     template.hasResourceProperties("AWS::ApiGatewayV2::Api", {
-      CorsConfiguration: Match.objectLike({ AllowMethods: ["GET", "OPTIONS"] }),
+      CorsConfiguration: Match.objectLike({
+        AllowMethods: ["GET", "OPTIONS"],
+        AllowHeaders: ["authorization", "content-type"],
+        // A download's file name is read by the web application: API Gateway drops a
+        // function's own CORS headers when CORS is configured on the API.
+        ExposeHeaders: ["content-disposition"],
+      }),
     });
   });
 

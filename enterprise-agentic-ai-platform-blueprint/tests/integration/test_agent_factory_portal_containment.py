@@ -105,8 +105,13 @@ GROUPS = {
     "developer": "product-teams",
     "readonly": "portal-readonly",
 }
-# A change to a Runtime's resource policy is enforced within about 30 seconds.
-ENFORCEMENT_TIMEOUT_SECONDS = 120
+# The service applies a change to a Runtime's resource policy host by host. Measured: after a
+# contain an occasional invocation still succeeds for up to about a minute; after a release
+# refusals continue, at a falling rate, for several minutes. So "closed" is asserted as a quiet
+# period with no successful call, and "open again" as the first successful call.
+CLOSED_QUIET_SECONDS = 45
+CLOSED_TIMEOUT_SECONDS = 240
+FIRST_ANSWER_TIMEOUT_SECONDS = 180
 
 
 def _password() -> str:
@@ -177,16 +182,34 @@ class Cell:
         except ClientError as error:
             return error.response["Error"]["Code"], session_id
 
-    def wait_for(self, expected: object, session_id: str | None = None) -> float:
-        """Seconds until invocation answers `expected` three times in a row."""
-        started, streak = time.monotonic(), 0
-        while time.monotonic() - started < ENFORCEMENT_TIMEOUT_SECONDS:
-            result, _ = self.invoke(session_id)
-            streak = streak + 1 if result == expected else 0
-            if streak == 3:
+    def first(self, expected: object, timeout: int = FIRST_ANSWER_TIMEOUT_SECONDS) -> float:
+        """Seconds until invocation first answers `expected`."""
+        started = time.monotonic()
+        while time.monotonic() - started < timeout:
+            if self.invoke()[0] == expected:
                 return time.monotonic() - started
-            time.sleep(4)
-        raise AssertionError(f"invocation did not settle on {expected!r} within {ENFORCEMENT_TIMEOUT_SECONDS} s")
+            time.sleep(2)
+        raise AssertionError(f"invocation never answered {expected!r} within {timeout} s")
+
+    def closed(self) -> float:
+        """Seconds until no invocation has succeeded for CLOSED_QUIET_SECONDS in a row."""
+        started = quiet_since = time.monotonic()
+        while time.monotonic() - started < CLOSED_TIMEOUT_SECONDS:
+            if self.invoke()[0] == "AccessDeniedException":
+                if time.monotonic() - quiet_since >= CLOSED_QUIET_SECONDS:
+                    return quiet_since - started
+            else:
+                quiet_since = time.monotonic()
+            time.sleep(2)
+        raise AssertionError(f"invocations were still succeeding {CLOSED_TIMEOUT_SECONDS} s after containment")
+
+    def refused_share(self, calls: int = 10) -> float:
+        """The share of `calls` invocations that are refused right now."""
+        refused = 0
+        for _ in range(calls):
+            refused += self.invoke()[0] == "AccessDeniedException"
+            time.sleep(1)
+        return refused / calls
 
     def policy(self) -> dict | None:
         try:
@@ -285,7 +308,8 @@ def _view(token) -> dict:
 
 def test_the_target_is_invocable_and_containment_is_enabled_for_its_cell(live):
     cell, tokens = live["cell"], live["tokens"]
-    assert cell.invoke()[0] == 200, "the validation Runtime must answer before the run"
+    # Tolerant of an earlier run: refusals can linger for minutes after a release.
+    cell.first(200)
     view = _view(tokens["security"])
     assert view["state"] == "not_contained", view
     assert view["enabled"] is True, "the Runtime's cell has not deployed the containment stage"
@@ -310,7 +334,7 @@ def test_contain_is_refused_without_the_role_the_tenant_or_a_reason(live):
     # Nothing was changed by any refusal.
     assert CONTAINMENT_SID not in cell.sids()
     assert _view(tokens["security"])["state"] == "not_contained"
-    assert cell.invoke()[0] == 200
+    cell.first(200)
 
 
 def test_contain_blocks_invocation_and_stops_the_running_session(live):
@@ -337,7 +361,8 @@ def test_contain_blocks_invocation_and_stops_the_running_session(live):
     statement = next(s for s in cell.statements() if s.get("Sid") == CONTAINMENT_SID)
     assert statement["Effect"] == "Deny" and statement["Principal"] == "*"
     assert statement["Resource"] == RUNTIME_ARN
-    live["seconds_to_deny"] = cell.wait_for("AccessDeniedException")
+    live["seconds_to_deny"] = cell.first("AccessDeniedException")
+    live["seconds_to_closed"] = cell.closed()
     assert cell.invoke(running)[0] == "AccessDeniedException"
 
     sessions = result["sessions"]
@@ -392,7 +417,8 @@ def test_a_different_person_releases_and_invocation_works_again(live):
     assert result["state"] == "not_contained" and result["changed"] is True
     assert result["policy_deleted"] is True, "the policy held only the containment statement"
     assert cell.policy() is None
-    live["seconds_to_allow"] = cell.wait_for(200)
+    live["seconds_to_allow"] = cell.first(200)
+    live["refused_after_release"] = cell.refused_share()
 
     status, again = _release(tokens["platform"])
     assert status == 200, again
@@ -423,8 +449,10 @@ def test_the_audit_trail_records_the_refusals_and_the_decisions(live):
     assert contained["status_before"] == "not_contained" and contained["status_after"] == "contained"
     # Shown with `pytest -rP`: the measured enforcement times, for the evidence record.
     print(
-        f"containment: invocation denied after {live['seconds_to_deny']:.0f} s, "
-        f"allowed again after {live['seconds_to_allow']:.0f} s; sessions {json.dumps(live['sessions'], sort_keys=True)}"
+        f"containment: first refusal after {live['seconds_to_deny']:.0f} s, no successful call after "
+        f"{live['seconds_to_closed']:.0f} s; release: first successful call after {live['seconds_to_allow']:.0f} s, "
+        f"{live['refused_after_release']:.0%} of calls still refused just after; "
+        f"sessions {json.dumps(live['sessions'], sort_keys=True)}"
     )
 
 
@@ -449,14 +477,14 @@ def test_containment_keeps_every_statement_it_did_not_write(live):
     during = cell.statements()
     assert [s for s in during if s.get("Sid") != CONTAINMENT_SID] == original, "an existing statement was altered"
     assert CONTAINMENT_SID in {s.get("Sid") for s in during}
-    cell.wait_for("AccessDeniedException")  # an explicit deny wins over the kept allow
+    cell.closed()  # an explicit deny wins over the kept allow
 
     status, result = _release(tokens["security"], "Live validation: release with an existing policy.")
     assert status == 200, result
     assert result["changed"] is True and result["policy_deleted"] is False
     assert result["other_statements_kept"] == 1
     assert cell.statements() == original, "release must leave the policy exactly as it found it"
-    cell.wait_for(200)
+    cell.first(200)
 
     cell.remove_statements({KEPT_SID})
     assert cell.policy() is None

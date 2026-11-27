@@ -406,6 +406,10 @@ export class PortalApi extends Construct {
             ]
           : [CorsHttpMethod.GET, CorsHttpMethod.OPTIONS],
         allowHeaders: ["authorization", "content-type"],
+        // With CORS configured on the API, API Gateway ignores CORS headers set by the
+        // function. The web application reads the file name of a download (the inventory
+        // export, an agent's evidence) from Content-Disposition, so it is exposed here.
+        exposeHeaders: ["content-disposition"],
         maxAge: Duration.minutes(10),
       },
     });
