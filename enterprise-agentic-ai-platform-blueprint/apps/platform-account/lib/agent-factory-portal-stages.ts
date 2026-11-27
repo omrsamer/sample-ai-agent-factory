@@ -87,6 +87,40 @@ function keyArnContext(app: App, key: string, region: string): string | undefine
   return value;
 }
 
+function governedActionsContext(
+  app: App,
+): { groupTenantMap: Record<string, string[]> } | undefined {
+  const enabled = context(app, "agenticai/portalGovernedActions");
+  if (enabled !== true && enabled !== "true") return undefined;
+  const map = jsonContext<Record<string, unknown>>(app, "agenticai/portalGroupTenantMap") ?? {};
+  const groupTenantMap: Record<string, string[]> = {};
+  for (const [group, tenants] of Object.entries(map)) {
+    if (!Array.isArray(tenants) || tenants.some((t) => typeof t !== "string" || t.length === 0)) {
+      throw new Error(
+        `Context agenticai/portalGroupTenantMap: '${group}' must map to a list of tenant ids.`,
+      );
+    }
+    groupTenantMap[group] = tenants as string[];
+  }
+  return { groupTenantMap };
+}
+
+function registryContext(app: App, region: string): { id: string; arn: string } | undefined {
+  const id = context(app, "agenticai/portalRegistryId");
+  const arn = context(app, "agenticai/portalRegistryArn");
+  if (id === undefined && arn === undefined) return undefined;
+  if (typeof id !== "string" || !/^[A-Za-z0-9]{16}$/.test(id)) {
+    throw new Error("Context agenticai/portalRegistryId must be a 16-character Registry id.");
+  }
+  const expected = new RegExp(`^arn:aws[\\w-]*:agent-registry:${region}:\\d{12}:registry/${id}$`);
+  if (typeof arn !== "string" || !expected.test(arn)) {
+    throw new Error(
+      "Context agenticai/portalRegistryArn must be the ARN of the Registry named by agenticai/portalRegistryId, in the portal Region.",
+    );
+  }
+  return { id, arn };
+}
+
 function portalTags(environment: PortalEnvironment): Record<string, string> {
   return {
     "application-id": "agent-factory-portal",
@@ -263,6 +297,8 @@ export function addAgentFactoryPortalStage(
         guardrailTag: jsonContext(app, "agenticai/portalGuardrailTag"),
         retainData: retain === undefined ? undefined : retain === true || retain === "true",
         logsKeyArn: keyArnContext(app, "agenticai/portalLogsKeyArn", deploymentRegion),
+        governedActions: governedActionsContext(app),
+        registry: registryContext(app, deploymentRegion),
         description: `Agent Factory Portal (${environment}): sign-in, read-only API and web hosting.`,
       });
       applyTags(stack, environment);

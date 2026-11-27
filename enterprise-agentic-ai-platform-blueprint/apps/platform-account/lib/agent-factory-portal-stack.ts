@@ -29,7 +29,9 @@ import { StringParameter } from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 
 import {
+  PortalActions,
   PortalApi,
+  PortalAuditTrail,
   PortalCell,
   PortalCognitoIdentity,
   PortalEdgeWebAcl,
@@ -96,10 +98,26 @@ export interface AgentFactoryPortalStackProps extends StackProps {
   readonly retainData?: boolean;
   /** Operator-provisioned key ARN for the portal's log groups. */
   readonly logsKeyArn?: string;
+  /**
+   * Governed registration and approval (opt-in). Off by default: the portal
+   * is then read-only and has no write route, role or table.
+   */
+  readonly governedActions?: {
+    /** Group or app-role name to the tenant ids its members may register for. */
+    readonly groupTenantMap: Readonly<Record<string, readonly string[]>>;
+  };
+  /**
+   * Registry the portal reads and, with governed actions, writes agent
+   * records to. Defaults to the Platform Registry of the environment
+   * (`/agenticai/registry/v1/<env>/{id,arn}`).
+   */
+  readonly registry?: { readonly id: string; readonly arn: string };
 }
 
 export class AgentFactoryPortalStack extends Stack {
   readonly portalUrl: string;
+  /** The runtime `config.json` published with the web application. */
+  readonly webConfig: Record<string, unknown>;
 
   constructor(scope: Construct, id: string, props: AgentFactoryPortalStackProps) {
     const {
@@ -117,6 +135,8 @@ export class AgentFactoryPortalStack extends Stack {
       guardrailTag,
       retainData,
       logsKeyArn,
+      governedActions,
+      registry,
       ...stackProps
     } = props;
     super(scope, id, stackProps);
@@ -172,14 +192,16 @@ export class AgentFactoryPortalStack extends Stack {
       };
     }
 
-    const registryId = StringParameter.valueForStringParameter(
-      this,
-      registrySsmParameter(environment, "id"),
-    );
-    const registryArn = StringParameter.valueForStringParameter(
-      this,
-      registrySsmParameter(environment, "arn"),
-    );
+    const registryId =
+      registry?.id ??
+      StringParameter.valueForStringParameter(this, registrySsmParameter(environment, "id"));
+    const registryArn =
+      registry?.arn ??
+      StringParameter.valueForStringParameter(this, registrySsmParameter(environment, "arn"));
+    const logsKey = logsKeyArn ? Key.fromKeyArn(this, "LogsKey", logsKeyArn) : undefined;
+    const audit = governedActions
+      ? new PortalAuditTrail(this, "Audit", { environment, retain: retainData })
+      : undefined;
 
     const api = new PortalApi(this, "Api", {
       environment,
@@ -194,15 +216,40 @@ export class AgentFactoryPortalStack extends Stack {
       allowedOrigins: [web.origin],
       modelAllowlist,
       guardrailTag,
-      logsKey: logsKeyArn ? Key.fromKeyArn(this, "LogsKey", logsKeyArn) : undefined,
+      logsKey,
+      auditTable: audit?.table,
     });
 
-    web.publish(webDistPath, {
+    if (governedActions && audit) {
+      const actions = new PortalActions(this, "Actions", {
+        environment,
+        codePath: apiCodePath,
+        httpApi: api.httpApi,
+        authorizer: api.authorizer,
+        registryId,
+        registryArn,
+        auditTable: audit.table,
+        identityProvider,
+        groupRoleMap,
+        groupTenantMap: governedActions.groupTenantMap,
+        allowedOrigins: [web.origin],
+        logsKey,
+      });
+      new CfnOutput(this, "PortalRegistrarRoleArn", { value: actions.registrarRole.roleArn });
+      new CfnOutput(this, "PortalApproverRoleArn", {
+        value: actions.approverRole.roleArn,
+        description:
+          "Add to the protected authority manifest (purpose: registry) where SCP-11 is attached, or approvals are denied.",
+      });
+    }
+
+    this.webConfig = {
       apiBaseUrl: api.apiBaseUrl,
       environment,
-      features: { readOnly: true },
+      features: { readOnly: !governedActions, governedActions: !!governedActions },
       ...webAuthConfig,
-    });
+    };
+    web.publish(webDistPath, this.webConfig);
 
     new CfnOutput(this, "PortalUrl", {
       value: web.origin,

@@ -74,6 +74,9 @@ def test_this_projects_stage_stacks_match(name):
         ("/aws/bedrock-agentcore/runtimes/AgenticAI_D03_prod_demo_primary_runtime-6H9L6D4QXc-DEFAULT", True),
         ("/aws/lambda/Nonprod-LogArchive-CustomS3AutoDeleteObjectsCustom-G6wbBAIOySHl", True),
         ("/agenticai/gateway/nonprod/access", True),
+        ("aws-waf-logs-agenticai-portal-nonprod", True),
+        ("aws-waf-logs-someone-elses-acl", False),
+        ("/aws/lambda/AgenticAI-AgentFactoryPor-CustomCDKBucketDeploymen-AbCdEf", True),
         ("/aws/lambda/IagRegistryStack-Handler", False),
         ("/aws/lambda/some-other-function", False),
         ("/aws/lambda/Prod-PaymentsService-Handler-abc", False),
@@ -154,3 +157,32 @@ def test_every_key_description_the_code_emits_is_recognised():
         "a construct emits a KMS key description the residue inventory does not recognise; "
         f"add it to PROJECT_KEY_DESCRIPTION: {unrecognised}"
     )
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("AgenticAI-AgentFactoryPortal-nonprod", True),
+        ("AgenticAI-PortalApi-nonprod", True),
+        ("AgenticAI-PortalFleetReader-nonprod", True),
+        ("AgenticAI-RegistryApprover-prod", True),
+        ("agenticai-portal-nonprod", True),
+        ("agenticai-portal-nonprod-ipv4", True),
+        ("portal-of-another-team", False),
+    ],
+)
+def test_agent_factory_portal_resources_are_recognised(name, expected):
+    assert inv.is_project_name(name) is expected
+
+
+@pytest.mark.parametrize(
+    "comment,expected",
+    [
+        ("Agent Factory Portal (nonprod)", True),
+        ("Agent Factory Portal (prod)", True),
+        ("Some other distribution", False),
+        ("", False),
+    ],
+)
+def test_portal_distribution_comment_matcher(comment, expected):
+    assert bool(inv.PROJECT_DISTRIBUTION_COMMENT.match(comment)) is expected

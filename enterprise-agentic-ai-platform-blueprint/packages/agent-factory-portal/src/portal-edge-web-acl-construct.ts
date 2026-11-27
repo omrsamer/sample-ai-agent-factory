@@ -60,6 +60,7 @@ export class PortalEdgeWebAcl extends Construct {
       const statements: CfnWebACL.StatementProperty[] = [];
       if (v4.length > 0) {
         const set = new CfnIPSet(this, "AllowedIpv4", {
+          name: `agenticai-portal-${props.environment}-ipv4`,
           scope: "CLOUDFRONT",
           ipAddressVersion: "IPV4",
           addresses: v4,
@@ -69,6 +70,7 @@ export class PortalEdgeWebAcl extends Construct {
       }
       if (v6.length > 0) {
         const set = new CfnIPSet(this, "AllowedIpv6", {
+          name: `agenticai-portal-${props.environment}-ipv6`,
           scope: "CLOUDFRONT",
           ipAddressVersion: "IPV6",
           addresses: v6,
@@ -110,6 +112,8 @@ export class PortalEdgeWebAcl extends Construct {
     }
 
     this.webAcl = new CfnWebACL(this, "WebAcl", {
+      // Named so that the residue inventory can recognise it.
+      name: `agenticai-portal-${props.environment}`,
       scope: "CLOUDFRONT",
       description: `Agent Factory Portal ${props.environment} edge protection`,
       defaultAction: { allow: {} },

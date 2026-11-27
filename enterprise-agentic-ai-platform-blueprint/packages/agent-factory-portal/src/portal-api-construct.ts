@@ -9,7 +9,9 @@ import {
   HttpApi,
   HttpMethod,
   HttpNoneAuthorizer,
+  IHttpRouteAuthorizer,
 } from "aws-cdk-lib/aws-apigatewayv2";
+import { ITable } from "aws-cdk-lib/aws-dynamodb";
 import { HttpJwtAuthorizer } from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import {
@@ -107,6 +109,12 @@ export interface PortalApiProps {
    * stack never creates or changes a key (same custody rule as the Omni hub).
    */
   readonly logsKey?: IKey;
+  /**
+   * Registration audit trail. When set, the read API may query it (never
+   * write it) and the HTTP API accepts the write methods of the governed
+   * actions in browser preflight.
+   */
+  readonly auditTable?: ITable;
 }
 
 /**
@@ -119,6 +127,8 @@ export class PortalApi extends Construct {
   readonly role: Role;
   readonly handler: LambdaFunction;
   readonly httpApi: HttpApi;
+  /** The JWT authorizer every data route uses. */
+  readonly authorizer: IHttpRouteAuthorizer;
   /** Base URL the web application calls, ending in `/api/v1`. */
   readonly apiBaseUrl: string;
 
@@ -201,6 +211,16 @@ export class PortalApi extends Construct {
         ],
       }),
     );
+    if (props.auditTable) {
+      policy.addStatements(
+        new PolicyStatement({
+          sid: "PortalReadAuditTrail",
+          effect: Effect.ALLOW,
+          actions: ["dynamodb:Query"],
+          resources: [props.auditTable.tableArn],
+        }),
+      );
+    }
     const pipelineNames = [
       ...new Set(props.cells.map((c) => c.pipelineName).filter((n): n is string => !!n)),
     ];
@@ -283,6 +303,7 @@ export class PortalApi extends Construct {
         ),
         PORTAL_ALLOWED_ORIGINS: stack.toJsonString(props.allowedOrigins),
         PORTAL_CACHE_TTL_SECONDS: "30",
+        ...(props.auditTable ? { PORTAL_AUDIT_TABLE: props.auditTable.tableName } : {}),
       },
     });
 
@@ -292,17 +313,26 @@ export class PortalApi extends Construct {
       createDefaultStage: true,
       corsPreflight: {
         allowOrigins: [...props.allowedOrigins],
-        allowMethods: [CorsHttpMethod.GET, CorsHttpMethod.OPTIONS],
+        allowMethods: props.auditTable
+          ? [
+              CorsHttpMethod.GET,
+              CorsHttpMethod.POST,
+              CorsHttpMethod.PUT,
+              CorsHttpMethod.DELETE,
+              CorsHttpMethod.OPTIONS,
+            ]
+          : [CorsHttpMethod.GET, CorsHttpMethod.OPTIONS],
         allowHeaders: ["authorization", "content-type"],
         maxAge: Duration.minutes(10),
       },
     });
     const integration = new HttpLambdaIntegration("PortalIntegration", this.handler);
-    const authorizer = new HttpJwtAuthorizer("PortalJwt", props.jwtIssuer, {
+    const authorizer = (this.authorizer = new HttpJwtAuthorizer("PortalJwt", props.jwtIssuer, {
       jwtAudience: [...props.jwtAudience],
       identitySource: ["$request.header.Authorization"],
-    });
-    // M1 is read-only: only GET routes exist, so any other method has no route.
+    }));
+    // The read API serves GET only; any other method has no route unless the
+    // governed actions add their own routes to their own functions.
     this.httpApi.addRoutes({
       path: "/api/v1/{proxy+}",
       methods: [HttpMethod.GET],

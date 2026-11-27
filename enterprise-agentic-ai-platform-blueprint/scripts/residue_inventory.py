@@ -45,6 +45,10 @@ PROJECT_BUCKET = re.compile(r"^(agenticai|(nonprod|prod)-(registry|inferencegate
 PROJECT_LOG_GROUP = re.compile(
     rf"^(/aws/(lambda|codebuild|bedrock-agentcore/runtimes|vendedlogs/[^/]+)/(AgenticAI|agenticai|{STAGE_STACKS}-|WorkloadPipeline|PlatformPipeline)|/agenticai/)"
 )
+#: AWS WAF requires its log groups to start with `aws-waf-logs-`.
+PROJECT_WAF_LOG_GROUP = re.compile(r"^aws-waf-logs-(agenticai|AgenticAI)")
+#: The portal's CloudFront distributions carry this comment (they have no name).
+PROJECT_DISTRIBUTION_COMMENT = re.compile(r"^Agent Factory Portal \(")
 #: AgentCore Identity keeps OAuth2 provider secrets under this service prefix.
 PROJECT_SECRET = re.compile(r"(^(AgenticAI|agenticai)|^bedrock-agentcore-identity!default/oauth2/(AgenticAI|agenticai))")
 #: The exact customer-managed-key descriptions the blueprint's constructs emit
@@ -102,7 +106,7 @@ def is_project_bucket(name: str) -> bool:
 
 
 def is_project_log_group(name: str) -> bool:
-    return bool(PROJECT_LOG_GROUP.match(name))
+    return bool(PROJECT_LOG_GROUP.match(name) or PROJECT_WAF_LOG_GROUP.match(name))
 
 
 def is_project_secret(name: str) -> bool:
@@ -231,6 +235,41 @@ class Inventory:
         names = [a["AlarmName"] for a in paged(cw, "describe_alarms", "MetricAlarms")]
         return [n for n in names if is_project_name(n)]
 
+    def http_apis(self) -> list[str]:
+        return [a["Name"] for a in paged(self.client("apigatewayv2"), "get_apis", "Items") if is_project_name(a["Name"])]
+
+    # CloudFront and CloudFront-scope AWS WAF are global services whose API
+    # lives in us-east-1; they are inventoried with --global.
+
+    def distributions(self) -> list[str]:
+        cloudfront = self.session.client("cloudfront", config=CFG)
+        found: list[str] = []
+        marker = None
+        while True:
+            kwargs = {"Marker": marker} if marker else {}
+            page = cloudfront.list_distributions(**kwargs).get("DistributionList", {})
+            found += [
+                d["Comment"] for d in page.get("Items", []) if PROJECT_DISTRIBUTION_COMMENT.match(d.get("Comment", ""))
+            ]
+            marker = page.get("NextMarker")
+            if not page.get("IsTruncated"):
+                return found
+
+    def cloudfront_scope(self, operation: str, key: str) -> Callable[[], list[str]]:
+        def run() -> list[str]:
+            waf = self.session.client("wafv2", region_name="us-east-1", config=CFG)
+            found: list[str] = []
+            marker = None
+            while True:
+                kwargs = {"Scope": "CLOUDFRONT", **({"NextMarker": marker} if marker else {})}
+                page = getattr(waf, operation)(**kwargs)
+                found += [item["Name"] for item in page.get(key, []) if is_project_name(item["Name"])]
+                marker = page.get("NextMarker")
+                if not marker or not page.get(key):
+                    return found
+
+        return run
+
     def delivery_sources(self) -> list[str]:
         return [d["name"] for d in paged(self.client("logs"), "describe_delivery_sources", "deliverySources") if "agenticai" in d["name"].lower()]
 
@@ -272,7 +311,11 @@ class Inventory:
         s("bedrock guardrails", self.guardrails)
         s("cloudwatch alarms", self.alarms)
         s("ecr repositories", self.ecr_repositories)
+        s("api gateway http apis", self.http_apis)
         if include_global:
+            s("cloudfront distributions (global)", self.distributions)
+            s("wafv2 web acls (cloudfront scope)", self.cloudfront_scope("list_web_acls", "WebACLs"))
+            s("wafv2 ip sets (cloudfront scope)", self.cloudfront_scope("list_ip_sets", "IPSets"))
             s("iam roles (global)", self.roles)
             s("s3 buckets (global)", self.buckets)
         return self.rows

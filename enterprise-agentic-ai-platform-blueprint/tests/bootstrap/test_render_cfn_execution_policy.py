@@ -1022,7 +1022,17 @@ def test_portal_policy_is_scoped_to_portal_stacks_roles_and_regions() -> None:
     assert statements["ManagePortalRoles"]["Resource"] == [
         f"arn:aws:iam::{PLATFORM}:role/AgenticAI-AgentFactoryPor*",
         f"arn:aws:iam::{PLATFORM}:role/AgenticAI-PortalApi-*",
+        f"arn:aws:iam::{PLATFORM}:role/AgenticAI-RegistryRegistrar-*",
+        f"arn:aws:iam::{PLATFORM}:role/AgenticAI-RegistryApprover-*",
     ]
+    table = statements["PortalAuditTable"]
+    assert table["Resource"] == (
+        f"arn:aws:dynamodb:{REGION}:{PLATFORM}:table/AgenticAI-AgentFactoryPor*"
+    )
+    assert not any(
+        action.split(":")[1] in {"PutItem", "UpdateItem", "DeleteItem", "Query", "Scan", "GetItem"}
+        for action in table["Action"]
+    ), "the execution role manages the table, never its data"
     assert statements["ManagePortalPolicies"]["Resource"] == (
         f"arn:aws:iam::{PLATFORM}:policy/AgenticAI-AgentFactoryPor*"
     )

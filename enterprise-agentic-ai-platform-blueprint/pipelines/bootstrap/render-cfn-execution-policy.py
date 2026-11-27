@@ -1301,6 +1301,9 @@ def portal_role_arns(account: str) -> list[str]:
     return [
         iam_arn(account, f"role/{PORTAL_STACK_PREFIX}*"),
         iam_arn(account, "role/AgenticAI-PortalApi-*"),
+        # Governed actions (opt-in): the registrar and approver functions.
+        iam_arn(account, "role/AgenticAI-RegistryRegistrar-*"),
+        iam_arn(account, "role/AgenticAI-RegistryApprover-*"),
     ]
 
 
@@ -1423,6 +1426,24 @@ def portal_policy(account: str, region: str) -> dict[str, Any]:
                 "Effect": "Allow",
                 "Action": "kms:DescribeKey",
                 "Resource": [arn("kms", r, account, "key/*") for r in regions],
+            },
+            {
+                # Registration audit trail (opt-in governed actions).
+                "Sid": "PortalAuditTable",
+                "Effect": "Allow",
+                "Action": [
+                    "dynamodb:CreateTable",
+                    "dynamodb:DeleteTable",
+                    "dynamodb:DescribeTable",
+                    "dynamodb:UpdateTable",
+                    "dynamodb:DescribeContinuousBackups",
+                    "dynamodb:UpdateContinuousBackups",
+                    "dynamodb:DescribeTimeToLive",
+                    "dynamodb:ListTagsOfResource",
+                    "dynamodb:TagResource",
+                    "dynamodb:UntagResource",
+                ],
+                "Resource": arn("dynamodb", region, account, f"table/{PORTAL_STACK_PREFIX}*"),
             },
             {
                 "Sid": "PortalDistribution",
