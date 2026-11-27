@@ -97,7 +97,7 @@ def traces_by_user_query(runtime_arn: str) -> str:
 
 
 SESSION_LOOKBACK_HOURS = 8  # the maximum lifetime of a Runtime session
-MAX_SESSIONS = 200
+MAX_SESSIONS = 1000
 
 
 def sessions_query(runtime_arn: str, limit: int = MAX_SESSIONS) -> str:

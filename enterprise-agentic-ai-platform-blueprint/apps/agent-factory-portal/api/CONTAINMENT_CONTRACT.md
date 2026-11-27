@@ -38,7 +38,11 @@ In the agent's cell, with that cell's containment role:
    statement in the policy is kept exactly as it was.
 3. Reads the policy back to verify the statement is there.
 4. Finds the Runtime's sessions of the last eight hours and stops each one,
-   at most 200 and within a time limit. No API lists a Runtime's sessions, so
+   most recent first, at most 1000 per action and within a time limit. When a
+   limit cuts the list, `sessions.discovery` says that more sessions may be
+   running and the result is `partial`; containing again continues, because a
+   session that was already stopped needs no second stop. No API lists a
+   Runtime's sessions, so
    they are found in two places: the Runtime's traces (an instrumented agent)
    and the names of its session log streams (any agent that writes output).
    `sessions.sources` says how many each gave, for example "found 3 sessions

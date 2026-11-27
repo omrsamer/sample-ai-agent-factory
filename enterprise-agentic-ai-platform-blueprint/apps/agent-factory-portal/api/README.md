@@ -225,9 +225,10 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   them), and the names of its session log streams, `runtime-logs-<session id>`
   in `/aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>` for each of the
   Runtime's endpoints (any agent that writes output has them; no log event is
-  read). Each session is stopped, most recent first, at most 200 and within a
-  time budget. A session that is unknown or already ended counts as needing no
-  stop. If one source cannot be read the other is used and the response names
+  read). Each session is stopped, most recent first, at most 1000 per action
+  and within a time budget. A list that a limit cut never reads as complete:
+  the result is partial and says that more sessions may be running. A session
+  that is unknown or already ended counts as needing no stop. If one source cannot be read the other is used and the response names
   the one that failed; if neither can, containment still holds and the
   response and audit event say that the stop was not performed and why.
 - **Who.** `portal_api/actions/containment_rules.py` (pure): contain needs

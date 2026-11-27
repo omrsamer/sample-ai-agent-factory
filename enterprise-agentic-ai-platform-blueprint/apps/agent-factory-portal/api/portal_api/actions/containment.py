@@ -36,7 +36,7 @@ _ENDPOINT = re.compile(r"^[A-Za-z0-9_\-]{1,100}$")
 MAX_ENDPOINTS = 10
 STREAM_PREFIX = "runtime-logs-"
 STREAM_PAGE_LIMIT = 50
-MAX_STREAM_PAGES = 4
+MAX_STREAM_PAGES = 20
 _QUALIFIER = re.compile(r"/runtime-endpoint/([A-Za-z0-9_\-]{1,100})")
 
 
@@ -87,6 +87,17 @@ class SessionStop:
     failures: list[str] = field(default_factory=list)  # error codes only
 
 
+class Found(list):  # type: ignore[type-arg]
+    """Sessions from one source. ``truncated`` is true when the source held more than was read."""
+
+    truncated: bool = False
+
+
+def limit_note() -> str:
+    """Said whenever a limit cut the list: a result must never read as complete when it is not."""
+    return f"the limit of {logs.MAX_SESSIONS} sessions per action was reached, so more sessions may be running"
+
+
 @dataclass
 class Discovery:
     """The Runtime's recent sessions and how they were found."""
@@ -113,7 +124,9 @@ def sessions_from_spans(client: Any, runtime_arn: str, start: dt.datetime, end: 
     )
     if warnings and not results["sessions"]:
         raise SourceFailed(warnings[0].split(": ", 1)[-1])
-    sessions = []
+    sessions = Found()
+    # The query returns at most MAX_SESSIONS rows: a full result means there may be more.
+    sessions.truncated = len(results["sessions"]) >= logs.MAX_SESSIONS
     for row in results["sessions"]:
         session_id = row.get("session_id") or ""
         if not _SESSION_ID.fullmatch(session_id):
@@ -156,7 +169,7 @@ def sessions_from_log_streams(client: Any, runtime_id: str, endpoints: list[str]
     never a log event. A Runtime that writes nothing has no such stream.
     """
     since_ms = int(since.timestamp() * 1000)
-    sessions = []
+    sessions = Found()
     for endpoint in endpoints:
         group = f"/aws/bedrock-agentcore/runtimes/{runtime_id}-{endpoint}"
         token: str | None = None
@@ -193,6 +206,9 @@ def sessions_from_log_streams(client: Any, runtime_id: str, endpoints: list[str]
             token = page.get("nextToken")
             if not any_recent or not token:
                 break
+        else:
+            # Every allowed page was read and the last one still held recent streams and a next page.
+            sessions.truncated = True
     return sessions
 
 
@@ -235,6 +251,11 @@ def discover_sessions(control: Any, logs_client: Any, runtime_arn: str) -> Disco
         key = (session.session_id, session.qualifier)
         if key not in merged or session.last_seen > merged[key].last_seen:
             merged[key] = session
+    truncated = (
+        getattr(spans, "truncated", False) or getattr(streams, "truncated", False) or len(merged) > logs.MAX_SESSIONS
+    )
+    if truncated:
+        notes.append(limit_note())
     ordered = sorted(merged.values(), key=lambda s: s.last_seen, reverse=True)[: logs.MAX_SESSIONS]
     return Discovery(ordered, "; ".join(["ok", *failures, *notes]), sources)
 

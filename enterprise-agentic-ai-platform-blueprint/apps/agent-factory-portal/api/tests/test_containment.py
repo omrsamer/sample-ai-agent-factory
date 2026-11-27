@@ -526,7 +526,7 @@ def test_sessions_are_bounded_in_number_time_and_shape(world, monkeypatch):
     from portal_api.actions import containment
     from portal_api.aws import logs
 
-    assert (logs.MAX_SESSIONS, logs.SESSION_LOOKBACK_HOURS) == (200, 8)
+    assert (logs.MAX_SESSIONS, logs.SESSION_LOOKBACK_HOURS) == (1000, 8)
     world.cell.sessions = [session_row(sid(f"s{i:03d}")) for i in range(40)] + [
         {"session_id": "too-short", "resource_id": ""},  # not a Runtime session id: ignored
     ]
@@ -545,7 +545,7 @@ def test_sessions_are_bounded_in_number_time_and_shape(world, monkeypatch):
         body["steps"][2]["status"] == "partial"
         and "8 were not attempted before the time limit" in body["steps"][2]["detail"]
     )
-    assert "limit 200" in world.cell.query["queryString"]
+    assert "limit 1000" in world.cell.query["queryString"]
     assert world.cell.query["endTime"] - world.cell.query["startTime"] == 8 * 3600
     assert world.dynamo.events()[-1]["sessions_failed"] == "8"
 
@@ -649,10 +649,23 @@ def test_discovered_sessions_are_ordered_most_recent_first_and_capped(world):
     world.cell.stream_page_size = 50
     world.cell.streams[log_group()] = [session_stream(f"n{i:03d}", 1 + i / 100) for i in range(150)]
     world.cell.sessions = [session_row(sid(f"m{i:03d}"), last_seen=at(60)) for i in range(120)]
+    whole = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN)
+    assert len(whole.sessions) == 270 and whole.note == "ok"  # under the limit: nothing is cut, nothing is said
+
+    world.cell.streams[log_group()] = [session_stream(f"n{i:03d}", 1 + i / 100) for i in range(800)]
+    world.cell.sessions = [session_row(sid(f"m{i:03d}"), last_seen=at(60)) for i in range(400)]
     capped = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN)
-    assert len(capped.sessions) == logs.MAX_SESSIONS == 200
-    assert capped.sources == {"spans": 120, "log_streams": 150}
+    assert len(capped.sessions) == logs.MAX_SESSIONS == 1000
+    assert capped.sources == {"spans": 400, "log_streams": 800}
     assert capped.sessions[0].session_id == sid("n000")  # the newest are kept
+    # A cut list never reads as complete.
+    assert capped.note == "ok; the limit of 1000 sessions per action was reached, so more sessions may be running"
+
+    # A source that returns as many rows as it may return has probably more.
+    world.cell.streams[log_group()] = []
+    world.cell.sessions = [session_row(sid(f"q{i:04d}"), last_seen=at(60)) for i in range(1000)]
+    full = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN)
+    assert len(full.sessions) == 1000 and "more sessions may be running" in full.note
 
 
 def test_the_same_session_id_on_two_endpoints_is_two_sessions(world):
@@ -727,15 +740,19 @@ def test_streams_that_are_not_recent_sessions_are_ignored(world):
     assert body["sessions"]["sources"] == {"spans": 0, "log_streams": 2}
 
 
-def test_stream_paging_stops_at_the_page_cap_and_at_the_first_page_outside_the_window(world):
+def test_stream_paging_stops_at_the_page_cap_and_at_the_first_page_outside_the_window(world, monkeypatch):
     from portal_api.actions import containment
 
-    assert (containment.MAX_STREAM_PAGES, containment.STREAM_PAGE_LIMIT, containment.MAX_ENDPOINTS) == (4, 50, 10)
+    assert (containment.MAX_STREAM_PAGES, containment.STREAM_PAGE_LIMIT, containment.MAX_ENDPOINTS) == (20, 50, 10)
+    monkeypatch.setattr(containment, "MAX_STREAM_PAGES", 4)
     world.cell.stream_page_size = 2
     world.cell.streams[log_group()] = [session_stream(f"s{i:02d}", i + 1) for i in range(12)]  # six pages of two
     body = world.post("contain")[1]
     assert len(world.cell.stream_requests) == 4  # the page cap
     assert body["sessions"]["found"] == 8 and len(world.cell.stopped) == 8
+    # The cap cut the list, so the result is partial and says that more sessions may be running.
+    assert body["partial"] is True and "more sessions may be running" in body["sessions"]["discovery"]
+    assert "more sessions may be running" in body["steps"][2]["detail"]
 
     world.cell.policies.clear()
     world.cell.stream_requests.clear()
