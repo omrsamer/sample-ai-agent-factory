@@ -1,0 +1,193 @@
+{
+  "upstream": {
+    "repository": "open-telemetry/semantic-conventions",
+    "version": "v1.41.0",
+    "source": "https://opentelemetry.io/docs/specs/semconv/registry/attributes/gen-ai/",
+    "retrieved": "2026-11-27",
+    "note": "Curated subset. Bump the version only together with the normalization vectors and both generated modules (scripts/generate.py)."
+  },
+  "attributes": {
+    "gen_ai.operation.name": {
+      "type": "string",
+      "tier": "required"
+    },
+    "gen_ai.provider.name": {
+      "type": "string",
+      "tier": "required"
+    },
+    "gen_ai.request.model": {
+      "type": "string",
+      "tier": "required"
+    },
+    "gen_ai.request.max_tokens": {
+      "type": "int",
+      "tier": "optional"
+    },
+    "gen_ai.request.temperature": {
+      "type": "double",
+      "tier": "optional"
+    },
+    "gen_ai.request.top_p": {
+      "type": "double",
+      "tier": "optional"
+    },
+    "gen_ai.request.top_k": {
+      "type": "double",
+      "tier": "optional"
+    },
+    "gen_ai.request.seed": {
+      "type": "int",
+      "tier": "optional"
+    },
+    "gen_ai.request.stop_sequences": {
+      "type": "string[]",
+      "tier": "optional"
+    },
+    "gen_ai.request.stream": {
+      "type": "boolean",
+      "tier": "optional"
+    },
+    "gen_ai.response.model": {
+      "type": "string",
+      "tier": "recommended"
+    },
+    "gen_ai.response.id": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "gen_ai.response.finish_reasons": {
+      "type": "string[]",
+      "tier": "recommended"
+    },
+    "gen_ai.response.time_to_first_chunk": {
+      "type": "double",
+      "tier": "optional"
+    },
+    "gen_ai.usage.input_tokens": {
+      "type": "int",
+      "tier": "recommended"
+    },
+    "gen_ai.usage.output_tokens": {
+      "type": "int",
+      "tier": "recommended"
+    },
+    "gen_ai.usage.cache_read.input_tokens": {
+      "type": "int",
+      "tier": "optional"
+    },
+    "gen_ai.usage.cache_creation.input_tokens": {
+      "type": "int",
+      "tier": "optional"
+    },
+    "gen_ai.usage.reasoning.output_tokens": {
+      "type": "int",
+      "tier": "optional"
+    },
+    "gen_ai.agent.id": {
+      "type": "string",
+      "tier": "recommended"
+    },
+    "gen_ai.agent.name": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "gen_ai.agent.version": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "gen_ai.conversation.id": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "gen_ai.tool.name": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "gen_ai.tool.type": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "gen_ai.tool.call.id": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "gen_ai.output.type": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "gen_ai.token.type": {
+      "type": "string",
+      "tier": "optional"
+    }
+  },
+  "operations": [
+    "chat",
+    "create_agent",
+    "embeddings",
+    "execute_tool",
+    "generate_content",
+    "invoke_agent",
+    "invoke_workflow",
+    "retrieval",
+    "text_completion"
+  ],
+  "providers": [
+    "anthropic",
+    "aws.bedrock",
+    "azure.ai.inference",
+    "azure.ai.openai",
+    "cohere",
+    "deepseek",
+    "gcp.gemini",
+    "gcp.gen_ai",
+    "gcp.vertex_ai",
+    "groq",
+    "ibm.watsonx.ai",
+    "mistral_ai",
+    "openai",
+    "perplexity",
+    "x_ai"
+  ],
+  "legacyAttributes": {
+    "gen_ai.system": "gen_ai.provider.name",
+    "gen_ai.usage.prompt_tokens": "gen_ai.usage.input_tokens",
+    "gen_ai.usage.completion_tokens": "gen_ai.usage.output_tokens",
+    "gen_ai.openai.request.seed": "gen_ai.request.seed",
+    "gen_ai.openai.request.response_format": "gen_ai.output.type",
+    "gen_ai.prompt": null,
+    "gen_ai.completion": null
+  },
+  "legacyValues": {
+    "gen_ai.operation.name": {
+      "tool_call": "execute_tool"
+    },
+    "gen_ai.provider.name": {
+      "xai": "x_ai"
+    }
+  },
+  "extensions": {
+    "agenticai.tenant.id": {
+      "type": "string",
+      "tier": "required"
+    },
+    "agenticai.application.id": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "agenticai.environment": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "agenticai.golden_path.version": {
+      "type": "string",
+      "tier": "optional"
+    },
+    "agenticai.invocation.latency_ms": {
+      "type": "double",
+      "tier": "optional"
+    }
+  },
+  "legacyExtensions": {
+    "agenticai.agent.id": "gen_ai.agent.id"
+  }
+}

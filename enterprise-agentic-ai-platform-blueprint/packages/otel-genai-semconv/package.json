@@ -4,6 +4,6 @@
   "private": true,
   "main": "src/index.ts",
   "types": "src/index.ts",
-  "description": "OpenTelemetry GenAI semantic-convention helpers. Pure-fn span attribute builders aligned to OTel GenAI sem-conv (gen_ai.* attributes).",
+  "description": "OpenTelemetry GenAI semantic-convention helpers: a registry pinned to one upstream version, generated TypeScript and Python constants, span attribute builders, and normalization of legacy names held to shared vectors.",
   "license": "MIT-0"
 }
