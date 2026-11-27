@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agenticai.agent-governance/1.0",
+  "title": "Agent governance document",
+  "description": "Governance document stored as the custom descriptor of an AWS Agent Registry record for one deployed agent. Written by the Workload pipeline of the owning Workstream cell; read by the Agent Factory Portal.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "tenantId",
+    "agentId",
+    "environment",
+    "ownerGroup",
+    "businessPurpose",
+    "riskClass",
+    "dataClassification",
+    "costCentre",
+    "recordVersion"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "agenticai.agent-governance/1.0" },
+    "tenantId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+    "agentId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+    "applicationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "environment": { "type": "string", "enum": ["nonprod", "prod"] },
+    "ownerGroup": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "contact": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "businessPurpose": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "riskClass": { "type": "string", "enum": ["minimal", "limited", "high", "unacceptable"] },
+    "dataClassification": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] },
+    "costCentre": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "framework": { "type": "string", "maxLength": 64 },
+    "goldenPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 64 }
+      }
+    },
+    "runtimeArn": {
+      "type": "string",
+      "pattern": "^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:runtime/[A-Za-z0-9_-]+$"
+    },
+    "gatewayArn": {
+      "type": "string",
+      "pattern": "^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:gateway/[A-Za-z0-9_-]+$"
+    },
+    "memoryId": { "type": "string", "maxLength": 128 },
+    "subscribedToolIds": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" }
+    },
+    "policyEngineArn": {
+      "type": "string",
+      "pattern": "^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:policy-engine/[A-Za-z0-9_-]+$"
+    },
+    "policyEngineMode": { "type": "string", "enum": ["NONE", "LOG_ONLY", "ENFORCE"] },
+    "sourceRevision": { "type": "string", "maxLength": 128 },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["passed", "failed", "not_run"] },
+        "runId": { "type": "string", "maxLength": 128 },
+        "completedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "recordVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" }
+  }
+}
