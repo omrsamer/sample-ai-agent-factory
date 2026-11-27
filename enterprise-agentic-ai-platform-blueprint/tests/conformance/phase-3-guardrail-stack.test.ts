@@ -164,4 +164,20 @@ describe('Phase 3 — PlatformBaselineGuardrail (R-BED-013..R-BED-028)', () => {
     expect(byType['PHONE']).toBe('ANONYMIZE');
     expect(byType['IP_ADDRESS']).toBe('ANONYMIZE');
   });
+
+  it('enforces every sensitive-information action on INPUT and OUTPUT', () => {
+    const t = synth();
+    const guardrails = t.findResources('AWS::Bedrock::Guardrail');
+    const policy = (Object.values(guardrails)[0].Properties as any).SensitiveInformationPolicyConfig;
+    expect(policy.PiiEntitiesConfig).toHaveLength(8);
+    expect(policy.RegexesConfig).toHaveLength(3);
+    for (const entry of [...policy.PiiEntitiesConfig, ...policy.RegexesConfig]) {
+      expect(entry.InputEnabled).toBe(true);
+      expect(entry.OutputEnabled).toBe(true);
+      expect(entry.InputAction).toBe(entry.Action);
+      expect(entry.OutputAction).toBe(entry.Action);
+    }
+    const email = policy.PiiEntitiesConfig.find((entry: any) => entry.Type === 'EMAIL');
+    expect(email.InputAction).toBe('ANONYMIZE');
+  });
 });

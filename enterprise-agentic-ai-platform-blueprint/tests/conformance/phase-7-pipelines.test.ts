@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { App } from "aws-cdk-lib";
+import { App, PermissionsBoundary, Stack } from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 
 import { GuardrailStack } from "../../apps/platform-account/lib/guardrail-stack";
@@ -20,6 +20,7 @@ import { RegistryStack } from "../../apps/platform-account/lib/registry-stack";
 import {
   PlatformDeploymentStage,
   PlatformPipelineStack,
+  type PlatformPipelineStackProps,
 } from "../../pipelines/platform-pipeline-stack";
 import { stageAwareSynthCommands } from "../../pipelines/synth-commands";
 import type { GaRegistryConsumerContext } from "@agenticai/agent-registry";
@@ -27,6 +28,7 @@ import {
   WorkloadDeploymentStage,
   WorkloadPipelineStack,
   WorkstreamRegistryRolesStage,
+  type WorkloadPipelineStackProps,
 } from "../../pipelines/workload-pipeline-stack";
 
 const GITHUB_CONNECTION =
@@ -92,6 +94,7 @@ function createPlatformPipeline(
     Partial<Record<"nonprod" | "prod", Readonly<Record<string, number>>>>
   >,
   auditOamSinkArn?: string,
+  overrides: Partial<PlatformPipelineStackProps> = {},
 ): PlatformPipelineStack {
   return new PlatformPipelineStack(app, "PP", {
     env: { account: "111111111111", region: "us-west-2" },
@@ -128,6 +131,7 @@ function createPlatformPipeline(
       },
     ],
     gaRegistryRecordGenerations,
+    ...overrides,
   });
 }
 
@@ -167,12 +171,27 @@ function synthWorkloadGa(
     readonly workloadNonprodAccountId?: string;
     readonly workloadProdAccountId?: string;
     readonly auditOamSinkArn?: string;
+    readonly s3Source?: { readonly bucketName: string; readonly objectKey: string };
   },
+  overrides: Partial<WorkloadPipelineStackProps> = {},
 ): {
   readonly stack: WorkloadPipelineStack;
   readonly template: Template;
 } {
-  const app = new App();
+  const generated = overrides.agentImageVariant === "generated-agent";
+  const app = new App({ context: generated ? {
+    "agenticai/bootstrapQualifier": "isolated1",
+    "agenticai/workloadRoleBoundaryName": "Isolated-RoleBoundary",
+    "agenticai/identityProvisionerBrokerByAllocation": Object.fromEntries(
+      [[options?.workloadNonprodAccountId ?? "444444444444", "nonprod"],
+       [options?.workloadProdAccountId ?? "555555555555", "prod"]].map(([account, stage]) => [
+        `${account}:us-west-2:${stage}:demo:primary`, {
+          versionArn: `arn:aws:lambda:us-west-2:${account}:function:AgenticAI-D03-${stage}-demo-primary-idbroker:17`,
+          configSha256: "a".repeat(64),
+        },
+      ]),
+    ),
+  } : {} });
   const stack = new WorkloadPipelineStack(app, "WPGA", {
     env: { account: "111111111111", region: "us-west-2" },
     githubRepo: "aws-samples/sample-ai-agent-factory",
@@ -197,14 +216,54 @@ function synthWorkloadGa(
     workloadProdAvailabilityZones: ["us-west-2a", "us-west-2b", "us-west-2c"],
     auditOamSinkArn: options?.auditOamSinkArn,
     gaRegistry: {
-      nonprod: gaConsumerContext("nonprod"),
-      prod: gaConsumerContext("prod"),
+      nonprod: archiveConsumerContext("nonprod", options?.s3Source),
+      prod: archiveConsumerContext("prod", options?.s3Source),
       gatewayRegion: "us-west-2",
     },
     policyEngine,
+    identityProvisionerPermissionsBoundaryName: generated ? "Isolated-IdentityProvisionerBoundary" : undefined,
+    s3Source: options?.s3Source,
+    ...overrides,
   });
   return { stack, template: Template.fromStack(stack) };
 }
+
+function archiveConsumerContext(
+  environment: "nonprod" | "prod",
+  source?: { readonly bucketName: string; readonly objectKey: string },
+): any {
+  const context = gaConsumerContext(environment);
+  if (!source) return context;
+  const sha256 = source.objectKey.split("/").pop()!.slice(0, -4);
+  return {
+    ...context, schemaVersion: "agenticai.ga-registry-consumer-context/2.0",
+    sourceRevision: `s3-sha256:${sha256}`,
+    sourceArchive: { ...source, sha256, versionId: "reviewed-immutable-version", ownerAccountId: "111111111111" },
+  };
+}
+
+test("isolated workload stages retain their application boundary beneath a pipeline boundary", () => {
+  const { stack, template } = synthWorkloadGa(undefined, undefined, {
+    permissionsBoundary: PermissionsBoundary.fromName("ReviewedPipelineBoundary"),
+    workloadPermissionsBoundaryName: "ReviewedWorkloadBoundary",
+  });
+  const rootRoles = Object.values(template.findResources("AWS::IAM::Role")) as any[];
+  expect(rootRoles.length).toBeGreaterThan(0);
+  for (const role of rootRoles) {
+    expect(JSON.stringify(role.Properties.PermissionsBoundary)).toContain("ReviewedPipelineBoundary");
+  }
+  const children = stack.node.findAll().filter(node => node instanceof Stack && node !== stack) as Stack[];
+  expect(children.length).toBeGreaterThan(0);
+  let applicationRoles = 0;
+  for (const child of children) {
+    for (const role of Object.values(Template.fromStack(child).findResources("AWS::IAM::Role")) as any[]) {
+      applicationRoles++;
+      expect(JSON.stringify(role.Properties.PermissionsBoundary)).toContain("ReviewedWorkloadBoundary");
+      expect(JSON.stringify(role.Properties.PermissionsBoundary)).not.toContain("ReviewedPipelineBoundary");
+    }
+  }
+  expect(applicationRoles).toBeGreaterThan(0);
+});
 
 function expectCleanupSafeArtifactStore(
   template: Template,
@@ -262,6 +321,89 @@ function expectCleanupSafeArtifactStore(
 }
 
 describe("Phase 7 — Platform pipeline", () => {
+  it("uses the frozen S3 archive and preserves its source through self-mutation", () => {
+    const app = new App();
+    const root = createPlatformPipeline(app, "222222222222", undefined, undefined, {
+      githubRepo: undefined,
+      githubConnectionArn: undefined,
+      s3Source: { bucketName: "reviewed-blueprint-source", objectKey: "sources/sha256.zip" },
+    });
+    const t = Template.fromStack(root);
+    const pipeline = Object.values(t.findResources("AWS::CodePipeline::Pipeline"))[0] as any;
+    const source = pipeline.Properties.Stages[0].Actions[0];
+    expect(source.ActionTypeId.Provider).toBe("S3");
+    expect(source.Configuration).toMatchObject({
+      S3Bucket: "reviewed-blueprint-source",
+      S3ObjectKey: "sources/sha256.zip",
+      PollForSourceChanges: false,
+    });
+    const rendered = JSON.stringify(t.toJSON());
+    expect(rendered).toContain("agenticai/sourceBucketName");
+    expect(rendered).toContain("agenticai/sourceObjectKey");
+    expect(rendered).not.toContain("UseConnection");
+  });
+
+  it("preserves mainline GitHub source when no archive is selected", () => {
+    const pipeline = Object.values(
+      synthPlatform().findResources("AWS::CodePipeline::Pipeline"),
+    )[0] as any;
+    const source = pipeline.Properties.Stages[0].Actions[0];
+    expect(source.ActionTypeId.Provider).toBe("CodeStarSourceConnection");
+    expect(source.Configuration.BranchName).toBe("main");
+  });
+
+  it("forwards IAM authorization and trusted prompt hashes into both stage templates", () => {
+    const app = new App();
+    const digest = "a".repeat(64);
+    const root = createPlatformPipeline(app, "222222222222", undefined, undefined, {
+      inferenceGatewayAuthorizerType: "AWS_IAM",
+      trustedSystemPromptHashes: [digest],
+    });
+    const rendered = JSON.stringify(Template.fromStack(root).toJSON());
+    expect(rendered).toContain("agenticai/inferenceGatewayAuthorizerType");
+    expect(rendered).toContain("agenticai/trustedSystemPromptHashes");
+    for (const stageName of ["Nonprod", "Prod"]) {
+      const stage = root.node.findChild(stageName) as PlatformDeploymentStage;
+      const t = Template.fromStack(stage.node.findChild("InferenceGateway") as any);
+      t.hasResourceProperties("AWS::BedrockAgentCore::Gateway", {
+        AuthorizerType: "AWS_IAM",
+        AuthorizerConfiguration: Match.absent(),
+      });
+      t.hasResourceProperties("AWS::Lambda::Function", {
+        Environment: { Variables: Match.objectLike({
+          TRUSTED_SYSTEM_PROMPT_SHA256: JSON.stringify([digest]),
+        }) },
+      });
+    }
+  });
+
+  it("rejects an incomplete source configuration", () => {
+    expect(() => createPlatformPipeline(new App(), "222222222222", undefined, undefined, {
+      githubConnectionArn: undefined,
+    })).toThrow("Pipeline source requires");
+  });
+
+  it("rejects a GA workload archive without a checksum-specific key", () => {
+    expect(() => synthWorkloadGa(undefined, {
+      s3Source: {
+        bucketName: "reviewed-blueprint-source",
+        objectKey: "sources/sha256.zip",
+      },
+    })).toThrow("checksum-specific archive key");
+  });
+
+  it("verifies immutable S3 provenance with an owner-scoped object-version permission", () => {
+    const digest = "a".repeat(64);
+    const template = synthWorkloadGa(undefined, {
+      s3Source: { bucketName: "reviewed-blueprint-source", objectKey: `sources/${digest}.zip` },
+    });
+    const rendered = JSON.stringify(template.template.toJSON());
+    expect(rendered).toContain("--source-sha256");
+    expect(rendered).toContain("--source-checkout");
+    expect(rendered).toContain("s3:GetObjectVersion");
+    expect(rendered).toContain("s3:ResourceAccount");
+  });
+
   it("emits a single CodePipeline", () => {
     const t = synthPlatform();
     t.resourceCountIs("AWS::CodePipeline::Pipeline", 1);
@@ -799,6 +941,66 @@ describe("Phase 7 — R2 GA Registry Workload pipeline", () => {
     expect(allActions).not.toContain("CanaryDeploy");
     expect(allActions).not.toContain("CanarySoak");
     expect(actions.some((name: string) => name.includes("Deploy"))).toBe(true);
+  });
+
+  it("generated Registry pipeline orders evaluation, approval and real routing before production", () => {
+    const inference = (envName: "nonprod" | "prod") => ({
+      inferenceGatewayUrl: `https://inference-${envName}.gateway.bedrock-agentcore.us-west-2.amazonaws.com/mcp`,
+      inferenceScope: `agenticai-inference-${envName}-api/invoke`,
+      modelId: `agenticai-inference-${envName}-bedrock/openai.gpt-oss-120b`,
+      guardrailId: "reviewed-guardrail",
+      m2mSecretArn: `arn:aws:secretsmanager:us-west-2:111111111111:secret:agenticai/inference-m2m/${envName}-abcdef`,
+    });
+    const { template } = synthWorkloadGa(undefined, undefined, {
+      enablePipelineRuntimeMemory: true, agentImageVariant: "generated-agent",
+      generatedAgentInference: { nonprod: inference("nonprod"), prod: inference("prod") },
+      canaryPercent: 5, canarySoakMinutes: 1,
+      runtimeCanary: {
+        aliasArn: "arn:aws:lambda:us-west-2:444444444444:function:reviewed-router:live",
+        baselineVersion: "1", candidateVersion: "2",
+        routingRoleArn: "arn:aws:iam::444444444444:role/ReviewedRouting",
+        alarmName: "agenticai-runtime-canary-nonprod-shared-shared",
+      },
+    });
+    const pipeline = Object.values(template.findResources("AWS::CodePipeline::Pipeline"))[0] as any;
+    const actions = pipeline.Properties.Stages.flatMap((s: any) => s.Actions);
+    const prod = pipeline.Properties.Stages.find((s: any) => s.Name === "Prod").Actions;
+    const order = (name: string) => prod.find((a: any) => a.Name === name).RunOrder;
+    expect(order("EvaluationGate")).toBeLessThan(order("ProdGatewayApproval"));
+    expect(order("ProdGatewayApproval")).toBeLessThan(order("CanaryDeploy"));
+    expect(order("CanaryDeploy")).toBeLessThan(order("CanarySoak"));
+    for (const action of prod.filter((a: any) => /Prepare|Deploy/.test(a.Name) && !/Canary/.test(a.Name))) {
+      expect(action.RunOrder).toBeGreaterThan(order("CanarySoak"));
+    }
+    const sourceArtifacts = actions.find((a: any) => a.ActionTypeId.Category === "Source").OutputArtifacts;
+    for (const name of ["EvaluationGate", "CanaryDeploy", "CanarySoak"]) {
+      expect(actions.find((a: any) => a.Name === name).InputArtifacts).toEqual(sourceArtifacts);
+    }
+    const builds = codeBuildBlob(template);
+    expect(builds).toContain("pipelines/runtime_canary.py --action start");
+    expect(builds).toContain("pipelines/runtime_canary.py --action soak");
+    expect(builds).toContain("--alarm 'agenticai-runtime-canary-nonprod-shared-shared'");
+    expect(builds).toContain('export CANARY_OWNED_REVISION=');
+    const deployAction = actions.find((a: any) => a.Name === "CanaryDeploy");
+    const soakAction = actions.find((a: any) => a.Name === "CanarySoak");
+    expect(deployAction.Namespace).toBeTruthy();
+    const soakEnvironment = JSON.parse(soakAction.Configuration.EnvironmentVariables);
+    expect(soakEnvironment).toContainEqual({
+      name: "CANARY_OWNED_REVISION", type: "PLAINTEXT",
+      value: `#{${deployAction.Namespace}.CANARY_OWNED_REVISION}`,
+    });
+    const projects = Object.values(template.findResources("AWS::CodeBuild::Project")) as any[];
+    const deployProject = projects.find((p: any) =>
+      String(p.Properties.Source.BuildSpec).includes("runtime_canary.py --action start"));
+    expect(JSON.parse(deployProject.Properties.Source.BuildSpec).env["exported-variables"])
+      .toContain("CANARY_OWNED_REVISION");
+    const soakProject = projects.find((p: any) =>
+      String(p.Properties.Source.BuildSpec).includes("runtime_canary.py --action soak"));
+    expect(JSON.parse(soakProject.Properties.Source.BuildSpec).phases.build.commands.join("\n"))
+      .toContain('--owned-revision "$CANARY_OWNED_REVISION"');
+    template.hasResourceProperties("AWS::IAM::Role", {
+      RoleName: "AgenticAI-WLP-demo-primary-Canary",
+    });
   });
 
   it("routes opt-in PolicyEngine mode and exact principals to both Gateway stages", () => {

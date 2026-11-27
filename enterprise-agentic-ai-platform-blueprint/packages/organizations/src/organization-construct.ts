@@ -27,18 +27,18 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: MIT-0
  */
-import { Annotations } from 'aws-cdk-lib';
+import { Annotations, Stack, Token } from "aws-cdk-lib";
 import {
   CfnOrganization,
   CfnOrganizationalUnit,
   CfnPolicy,
-} from 'aws-cdk-lib/aws-organizations';
-import { Construct } from 'constructs';
+} from "aws-cdk-lib/aws-organizations";
+import { Construct } from "constructs";
 
 import {
   PLATFORM_APPROVED_REGIONS,
   allowedModelArns,
-} from '@agenticai/platform-baselines';
+} from "@agenticai/platform-baselines";
 
 import {
   buildScpSet,
@@ -46,23 +46,27 @@ import {
   SCP_BODY_SOFT_LIMIT,
   SCP_BODY_HARD_LIMIT,
   SCP_MAX_ATTACHED_PER_TARGET,
-} from './scps';
+} from "./scps";
+import { validateProtectedAuthorityManifest } from "./protected-authority";
+import { buildProtectedAuthorityPolicies } from "./protected-authority-policies";
 
 /** The five OUs the construct creates directly under the root, by key. */
 export type OrganizationalUnitKey =
-  | 'security'
-  | 'sharedServices'
-  | 'agenticaiPlatform'
-  | 'agenticaiWorkloads'
-  | 'sandbox';
+  | "security"
+  | "sharedServices"
+  | "agenticaiPlatform"
+  | "agenticaiWorkloads"
+  | "sandbox";
 
 /** OU names from spec §2.1.2. Override per key with `organizationalUnitNames`. */
-export const DEFAULT_ORGANIZATIONAL_UNIT_NAMES: Readonly<Record<OrganizationalUnitKey, string>> = {
-  security: 'Security',
-  sharedServices: 'SharedServices',
-  agenticaiPlatform: 'AgenticAI-Platform',
-  agenticaiWorkloads: 'AgenticAI-Workloads',
-  sandbox: 'AgenticAI-Sandbox',
+export const DEFAULT_ORGANIZATIONAL_UNIT_NAMES: Readonly<
+  Record<OrganizationalUnitKey, string>
+> = {
+  security: "Security",
+  sharedServices: "SharedServices",
+  agenticaiPlatform: "AgenticAI-Platform",
+  agenticaiWorkloads: "AgenticAI-Workloads",
+  sandbox: "AgenticAI-Sandbox",
 };
 
 /** AWS Organizations caps an OU name at 128 characters. */
@@ -71,16 +75,27 @@ const OU_NAME_MAX_LENGTH = 128;
 function resolveOrganizationalUnitNames(
   overrides: Partial<Record<OrganizationalUnitKey, string>> | undefined,
 ): Record<OrganizationalUnitKey, string> {
-  const names: Record<OrganizationalUnitKey, string> = { ...DEFAULT_ORGANIZATIONAL_UNIT_NAMES };
+  const names: Record<OrganizationalUnitKey, string> = {
+    ...DEFAULT_ORGANIZATIONAL_UNIT_NAMES,
+  };
   for (const [key, value] of Object.entries(overrides ?? {})) {
     if (value === undefined) continue;
-    if (!Object.prototype.hasOwnProperty.call(DEFAULT_ORGANIZATIONAL_UNIT_NAMES, key)) {
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        DEFAULT_ORGANIZATIONAL_UNIT_NAMES,
+        key,
+      )
+    ) {
       throw new Error(
         `organizationalUnitNames: unknown OU key '${key}' (expected one of ` +
-          `${Object.keys(DEFAULT_ORGANIZATIONAL_UNIT_NAMES).join(', ')}).`,
+          `${Object.keys(DEFAULT_ORGANIZATIONAL_UNIT_NAMES).join(", ")}).`,
       );
     }
-    if (typeof value !== 'string' || value.trim().length === 0 || value.length > OU_NAME_MAX_LENGTH) {
+    if (
+      typeof value !== "string" ||
+      value.trim().length === 0 ||
+      value.length > OU_NAME_MAX_LENGTH
+    ) {
       throw new Error(
         `organizationalUnitNames.${key} must be a non-empty string of at most ${OU_NAME_MAX_LENGTH} characters.`,
       );
@@ -89,7 +104,7 @@ function resolveOrganizationalUnitNames(
   }
   if (new Set(Object.values(names)).size !== Object.keys(names).length) {
     throw new Error(
-      'organizationalUnitNames must give the five OUs distinct names; sibling OUs cannot share one.',
+      "organizationalUnitNames must give the five OUs distinct names; sibling OUs cannot share one.",
     );
   }
   return names;
@@ -114,6 +129,17 @@ export interface OrganizationConstructProps {
    * Sandbox OU. Default false (sandbox-first; promote only after soak).
    */
   readonly attachToWorkloadsOu?: boolean;
+  /**
+   * Exact 12-digit workload account IDs for SCP-09 Gateway mutation lockdown.
+   * Required when promoting SCPs to Workloads; omission is sandbox-only.
+   */
+  readonly gatewayAdminWorkloadAccountIds?: readonly string[];
+  /**
+   * Approved exact role entities, controllers, execution consumers and inputs.
+   * Required for member-account SCP exceptions. Protection policies attach to
+   * the exact governed accounts before the business exemptions are installed.
+   */
+  readonly protectedAuthorityManifest?: unknown;
 
   /**
    * If true, the construct skips creating `CfnOrganization`, assuming the
@@ -136,7 +162,9 @@ export interface OrganizationConstructProps {
    * the default name (AWS Control Tower's `Security` OU, for example) instead
    * of renaming or deleting the existing OU.
    */
-  readonly organizationalUnitNames?: Partial<Record<OrganizationalUnitKey, string>>;
+  readonly organizationalUnitNames?: Partial<
+    Record<OrganizationalUnitKey, string>
+  >;
 
   /**
    * Approved Bedrock Guardrail identifiers (ids or ARNs) passed into SCP-02's
@@ -160,9 +188,9 @@ export interface OrganizationConstructProps {
    * spends one of the nine SCP slots a target can hold. Default false.
    */
   readonly enableOmniTelemetryLockdown?: boolean;
-  /** Pipeline role-name patterns exempted by SCP-13 (default: the CDK cfn-exec role). */
+  /** Removed SCP-13 name option; supplying it is rejected. */
   readonly omniPipelineRoleNamePatterns?: readonly string[];
-  /** Exact break-glass role names exempted by SCP-13 (default none). */
+  /** Removed SCP-13 name option; enroll exact telemetry identities instead. */
   readonly omniBreakGlassRoleNames?: readonly string[];
 }
 
@@ -170,49 +198,102 @@ export class OrganizationConstruct extends Construct {
   readonly organization?: CfnOrganization;
   readonly ous: Record<string, CfnOrganizationalUnit>;
   readonly scps: ReadonlyMap<string, CfnPolicy>;
+  readonly authorityPolicies: ReadonlyMap<string, CfnPolicy>;
 
   constructor(scope: Construct, id: string, props: OrganizationConstructProps) {
     super(scope, id);
 
-    const primaryRegion = props.primaryRegion ?? 'us-west-2';
+    const primaryRegion = props.primaryRegion ?? "us-west-2";
+    const gatewayAdminWorkloadAccountIds =
+      props.gatewayAdminWorkloadAccountIds ?? [];
+    if (
+      !Array.isArray(gatewayAdminWorkloadAccountIds) ||
+      gatewayAdminWorkloadAccountIds.some(
+        (account) =>
+          typeof account !== "string" || !/^[0-9]{12}$/.test(account),
+      )
+    ) {
+      throw new Error(
+        "gatewayAdminWorkloadAccountIds must contain exact 12-digit AWS account IDs.",
+      );
+    }
+    if (
+      props.attachToWorkloadsOu !== undefined &&
+      typeof props.attachToWorkloadsOu !== "boolean"
+    ) {
+      throw new Error("attachToWorkloadsOu must be a boolean.");
+    }
+    if (
+      props.attachToWorkloadsOu &&
+      gatewayAdminWorkloadAccountIds.length === 0
+    ) {
+      throw new Error(
+        "Promoting SCPs to Workloads requires gatewayAdminWorkloadAccountIds so SCP-09 Gateway mutation lockdown is attached.",
+      );
+    }
+    const manifest =
+      props.protectedAuthorityManifest === undefined
+        ? undefined
+        : validateProtectedAuthorityManifest(props.protectedAuthorityManifest);
+    if (manifest) {
+      const managementAccount = Stack.of(this).account;
+      if (
+        Token.isUnresolved(managementAccount) ||
+        managementAccount !== manifest.managementAccountId
+      ) {
+        throw new Error(
+          "protectedAuthorityManifest.managementAccountId must equal the resolved management stack account.",
+        );
+      }
+    }
 
     // ------ Organization ------
     let rootId: string;
     if (props.importExistingOrganization) {
       if (!props.existingRootId) {
         throw new Error(
-          'existingRootId is required when importExistingOrganization is true.',
+          "existingRootId is required when importExistingOrganization is true.",
         );
       }
       rootId = props.existingRootId;
     } else {
-      this.organization = new CfnOrganization(this, 'Organization', {
-        featureSet: 'ALL',
+      this.organization = new CfnOrganization(this, "Organization", {
+        featureSet: "ALL",
       });
       // CfnOrganization.RootId attribute gives us the root id for downstream OUs.
       rootId = this.organization.attrRootId;
     }
 
     // ------ OU hierarchy (spec §2.1.2) ------
-    const ouNames = resolveOrganizationalUnitNames(props.organizationalUnitNames);
+    const ouNames = resolveOrganizationalUnitNames(
+      props.organizationalUnitNames,
+    );
     this.ous = {
-      security: new CfnOrganizationalUnit(this, 'SecurityOu', {
+      security: new CfnOrganizationalUnit(this, "SecurityOu", {
         name: ouNames.security,
         parentId: rootId,
       }),
-      sharedServices: new CfnOrganizationalUnit(this, 'SharedServicesOu', {
+      sharedServices: new CfnOrganizationalUnit(this, "SharedServicesOu", {
         name: ouNames.sharedServices,
         parentId: rootId,
       }),
-      agenticaiPlatform: new CfnOrganizationalUnit(this, 'AgenticAiPlatformOu', {
-        name: ouNames.agenticaiPlatform,
-        parentId: rootId,
-      }),
-      agenticaiWorkloads: new CfnOrganizationalUnit(this, 'AgenticAiWorkloadsOu', {
-        name: ouNames.agenticaiWorkloads,
-        parentId: rootId,
-      }),
-      sandbox: new CfnOrganizationalUnit(this, 'SandboxOu', {
+      agenticaiPlatform: new CfnOrganizationalUnit(
+        this,
+        "AgenticAiPlatformOu",
+        {
+          name: ouNames.agenticaiPlatform,
+          parentId: rootId,
+        },
+      ),
+      agenticaiWorkloads: new CfnOrganizationalUnit(
+        this,
+        "AgenticAiWorkloadsOu",
+        {
+          name: ouNames.agenticaiWorkloads,
+          parentId: rootId,
+        },
+      ),
+      sandbox: new CfnOrganizationalUnit(this, "SandboxOu", {
         name: ouNames.sandbox,
         parentId: rootId,
       }),
@@ -226,11 +307,30 @@ export class OrganizationConstruct extends Construct {
       approvedGuardrailIds: props.approvedGuardrailIds,
       approvedAgentCoreVpceIds: props.approvedAgentCoreVpceIds,
       approvedBedrockVpceIds: props.approvedBedrockVpceIds,
+      gatewayAdminWorkloadAccountIds,
+      protectedAuthorityManifest: manifest,
       enableOmniTelemetryLockdown: props.enableOmniTelemetryLockdown,
       omniPipelineRoleNamePatterns: props.omniPipelineRoleNamePatterns,
       omniBreakGlassRoleNames: props.omniBreakGlassRoleNames,
     });
 
+    const authorityPolicies = new Map<string, CfnPolicy>();
+    if (manifest) {
+      for (const protection of buildProtectedAuthorityPolicies(manifest)) {
+        this.validateScpBodySize(protection);
+        authorityPolicies.set(
+          protection.id,
+          new CfnPolicy(this, `ProtectedAuthority${protection.id}`, {
+            content: protection.body,
+            name: protection.name,
+            description: protection.description,
+            type: "SERVICE_CONTROL_POLICY",
+            targetIds: [protection.accountId],
+          }),
+        );
+      }
+    }
+    this.authorityPolicies = authorityPolicies;
     const scpMap = new Map<string, CfnPolicy>();
 
     // Target OUs. Sandbox is always attached. Workloads gate on flag.
@@ -242,13 +342,20 @@ export class OrganizationConstruct extends Construct {
     for (const scp of scpDefinitions) {
       this.validateScpBodySize(scp);
 
-      const cfnPolicy = new CfnPolicy(this, `Scp${scp.id.replace(/^scp-/, '')}`, {
-        content: scp.body,
-        description: scp.description,
-        name: scp.name,
-        type: 'SERVICE_CONTROL_POLICY',
-        targetIds: [...targetIds],
-      });
+      const cfnPolicy = new CfnPolicy(
+        this,
+        `Scp${scp.id.replace(/^scp-/, "")}`,
+        {
+          content: scp.body,
+          description: scp.description,
+          name: scp.name,
+          type: "SERVICE_CONTROL_POLICY",
+          targetIds: [...targetIds],
+        },
+      );
+      for (const protection of authorityPolicies.values()) {
+        cfnPolicy.addResourceDependency(protection);
+      }
 
       scpMap.set(scp.id, cfnPolicy);
     }
@@ -268,7 +375,7 @@ export class OrganizationConstruct extends Construct {
     // Safety reminder if Workloads attachment is still opt-out.
     if (!props.attachToWorkloadsOu) {
       Annotations.of(this).addInfo(
-        'SCPs attached to Sandbox OU only. Promote to AgenticAI-Workloads after the canonical soak tests pass (bash scripts/scp-sandbox-soak.sh).',
+        "SCPs attached to Sandbox OU only. Promote to AgenticAI-Workloads after the canonical soak tests pass (bash scripts/scp-sandbox-soak.sh).",
       );
     }
   }

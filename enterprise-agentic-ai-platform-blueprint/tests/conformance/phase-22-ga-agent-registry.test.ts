@@ -162,7 +162,7 @@ describe("Phase 22 — GA Registry producer remains additive", () => {
     }
   });
 
-  it("rotates only an explicitly generated terminal record and its SSM pointer", () => {
+  it("rotates only an explicitly generated terminal record and its approval binding", () => {
     const baselineTemplate = synth("nonprod", false);
     const baselineResources = baselineTemplate.toJSON().Resources as Record<
       string,
@@ -204,9 +204,28 @@ describe("Phase 22 — GA Registry producer remains additive", () => {
         parameter.Properties.Name ===
         "/agenticai/registry/v1/nonprod/records/tool-echo/id",
     )!;
+    const [approvalId, echoApproval] = Object.entries(
+      rotatedTemplate.findResources("Custom::AgenticAIGaRegistryApproval"),
+    ).find(
+      ([, resource]: [string, any]) =>
+        resource.Properties.RecordName === "tool-echo",
+    )!;
     expect((echoPointer as any).Properties.Value).toEqual({
+      "Fn::GetAtt": [approvalId, "RecordId"],
+    });
+    expect((echoApproval as any).Properties.RecordId).toEqual({
       "Fn::GetAtt": [rotatedEcho, "RecordId"],
     });
+    expect(
+      (echoApproval as any).Properties.Tags["aws:cloudformation:logical-id"],
+    ).toBe(rotatedEcho);
+    const approvalPolicyId = Object.entries(
+      rotatedTemplate.findResources("AWS::IAM::Policy"),
+    ).find(([, resource]: [string, any]) =>
+      JSON.stringify(resource.Properties.PolicyDocument.Statement).includes(
+        "agent-registry:SubmitRegistryRecordForApproval",
+      ),
+    )![0];
 
     expect(
       Object.keys(baselineResources)
@@ -227,7 +246,10 @@ describe("Phase 22 — GA Registry producer remains additive", () => {
               JSON.stringify(rotatedResources[logicalId]),
         )
         .sort(),
-    ).toEqual([echoPointerId]);
+    ).toEqual([approvalId, approvalPolicyId].sort());
+    expect(rotatedResources[echoPointerId]).toEqual(
+      baselineResources[echoPointerId],
+    );
   });
 
   it("rejects invalid or unknown record generations", () => {
@@ -241,7 +263,7 @@ describe("Phase 22 — GA Registry producer remains additive", () => {
 
   it("creates tools without invoke permissions before Workstream roles exist", () => {
     const template = synth("nonprod", false);
-    template.resourceCountIs("AWS::Lambda::Function", 2);
+    template.resourceCountIs("AWS::Lambda::Function", 4);
     template.resourceCountIs("AWS::Lambda::Alias", 2);
     template.resourceCountIs("AWS::Lambda::Permission", 0);
   });
@@ -295,7 +317,7 @@ describe("Phase 22 — GA Registry producer remains additive", () => {
       "agenticai-platform-nonprod-tool-ping",
     ]);
     template.resourceCountIs("AWS::Lambda::Alias", 2);
-    template.resourceCountIs("AWS::Logs::LogGroup", 2);
+    template.resourceCountIs("AWS::Logs::LogGroup", 4);
     template.resourceCountIs("AWS::KMS::Key", 2);
     const keys = Object.values(
       template.findResources("AWS::KMS::Key"),

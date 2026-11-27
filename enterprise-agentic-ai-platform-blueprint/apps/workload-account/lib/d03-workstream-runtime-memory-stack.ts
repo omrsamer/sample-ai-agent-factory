@@ -44,6 +44,7 @@ import {
   Effect,
   ManagedPolicy,
   PolicyDocument,
+  PermissionsBoundary as RolePermissionsBoundary,
   PolicyStatement,
   Role,
   ServicePrincipal,
@@ -55,6 +56,7 @@ import {
   Runtime as LambdaRuntime,
 } from "aws-cdk-lib/aws-lambda";
 import { Provider } from "aws-cdk-lib/custom-resources";
+import { bindReviewedIdentityProviderFramework } from "./identity-provider-framework";
 import { NagSuppressions } from "cdk-nag";
 import { Construct } from "constructs";
 import { createHash } from "node:crypto";
@@ -71,6 +73,8 @@ export interface AllocationTagInputs {
 export interface D03WorkstreamRuntimeMemoryStackProps
   extends StackProps, AllocationTagInputs {
   readonly envName: "nonprod" | "prod";
+  /** Optional owned isolated-bootstrap boundary for the generated-agent identity provisioner only. */
+  readonly identityProvisionerPermissionsBoundaryName?: string;
   /**
    * Days short-term Memory events are retained. AgentCore requires 3–365.
    * Default 30.
@@ -181,206 +185,59 @@ const NETWORK_MODE_PUBLIC = "PUBLIC";
  * read in-process only and never logged or returned.
  */
 const CREDENTIAL_PROVIDER_HANDLER = `
+"""Source-role custom-resource handler: exact-version Invoke only."""
+if not __debug__:
+    raise RuntimeError("Optimized Python is forbidden")
 import json
+import re
 import time
 import boto3
-from botocore.exceptions import ClientError
-
-_NOT_FOUND = ("ResourceNotFoundException", "ResourceNotFound")
-_TERMINAL = ("CREATE_FAILED", "UPDATE_FAILED", "DELETE_FAILED")
-_PENDING = ("CREATING", "UPDATING", "DELETING")
+from botocore.config import Config
 
 
-def _error_code(error):
-    return error.response["Error"]["Code"]
-
-
-def _is_not_found(error):
-    return _error_code(error) in _NOT_FOUND
-
-
-def _is_already_exists(error):
-    code = _error_code(error)
-    message = error.response["Error"].get("Message", "")
-    return (
-        "AlreadyExists" in code
-        or "Conflict" in code
-        or (code == "ValidationException" and "already exists" in message)
-    )
-
-
-def _assert_tags(client, resource_arn, expected_tags):
-    live = client.list_tags_for_resource(resourceArn=resource_arn).get("tags", {})
-    if live == expected_tags:
-        return
-    raise RuntimeError("Refusing resource with missing or foreign ownership tags")
-
-
-def _workload_arn(directory_arn, name):
-    return directory_arn + "/workload-identity/" + name
-
-
-def _assert_workload_owned(client, name, expected_arn, tags):
-    response = client.get_workload_identity(name=name)
-    if response.get("name") != name or response.get("workloadIdentityArn") != expected_arn:
-        raise RuntimeError("Workload identity response does not match the exact expected identity")
-    _assert_tags(client, expected_arn, tags)
-
-
-def _unique_workload_name(prefix, request_id):
-    # Live-proven (2026-09-23, five consecutive rollbacks): a FIXED deterministic
-    # WorkloadIdentity name is not a safe dependency. TagResource on an existing
-    # identity returns a service 500; after DeleteWorkloadIdentity the name is
-    # tombstoned -- GetWorkloadIdentity reports not-found while
-    # CreateWorkloadIdentity keeps reporting 'already exists' (CLI-reproduced,
-    # persisting > 20 minutes). Every Create therefore mints a fresh name from
-    # the CloudFormation RequestId (unique per lifecycle request), and the
-    # Runtime learns the name from this resource's attributes, never from a
-    # synth-time constant. Ownership is proven by exact ARN + all five tags.
-    suffix = "".join(ch for ch in request_id.lower() if ch in "0123456789abcdef")[:12]
-    if len(suffix) < 12:
-        raise RuntimeError("CloudFormation RequestId did not yield a 12-hex workload suffix")
-    return prefix + "_" + suffix
-
-
-def _assert_provider_owned(client, name, expected_arn, tags):
-    response = client.get_oauth2_credential_provider(name=name)
-    if response.get("name") != name or response.get("credentialProviderArn") != expected_arn:
-        raise RuntimeError("Credential provider response does not match the exact expected provider")
-    _assert_tags(client, expected_arn, tags)
-
-
-def _wait_provider(client, provider_name):
-    for _ in range(50):
-        try:
-            response = client.get_oauth2_credential_provider(name=provider_name)
-        except ClientError as e:
-            if _is_not_found(e):
-                time.sleep(5)
-                continue
-            raise
-        status = response.get("status")
-        if status == "READY":
-            return
-        if status in _TERMINAL:
-            raise RuntimeError("Credential provider reached terminal status " + str(status))
-        if status not in _PENDING:
-            raise RuntimeError("Credential provider returned unknown status " + repr(status))
-        time.sleep(5)
-    raise TimeoutError("Credential provider did not reach READY within 250 seconds")
+def require(value):
+    if not value:
+        raise RuntimeError("Exact immutable broker handoff differs")
 
 
 def on_event(event, context):
-    rt = event["RequestType"]
     props = event["ResourceProperties"]
-    region = props["Region"]
-    provider_name = props["ProviderName"]
-    provider_arn = props["ProviderArn"]
-    workload_prefix = props["WorkloadNamePrefix"]
-    directory_arn = props["WorkloadDirectoryArn"]
-    tags = props["Tags"]
-    client = boto3.client("bedrock-agentcore-control", region_name=region)
-
-    # The physical id carries the exact workload-identity name this resource
-    # owns ("<provider>|<workload>"); Delete and Update read it back so they
-    # only ever touch the identity this resource created.
-    physical_id = event.get("PhysicalResourceId") or ""
-    owned_workload = physical_id.split("|", 1)[1] if "|" in physical_id else None
-
-    if rt == "Delete":
-        try:
-            _assert_provider_owned(client, provider_name, provider_arn, tags)
-            client.delete_oauth2_credential_provider(name=provider_name)
-        except ClientError as e:
-            if not _is_not_found(e):
-                raise
-        if owned_workload and owned_workload.startswith(workload_prefix + "_"):
-            try:
-                _assert_workload_owned(
-                    client, owned_workload, _workload_arn(directory_arn, owned_workload), tags
-                )
-                client.delete_workload_identity(name=owned_workload)
-            except ClientError as e:
-                if not _is_not_found(e):
-                    raise
-        return {"PhysicalResourceId": physical_id or provider_name}
-
-    # Create/Update: read the secret in-process only and bind it to the synth input.
-    secrets = boto3.client("secretsmanager", region_name=region)
-    raw = secrets.get_secret_value(SecretId=props["SecretArn"])["SecretString"]
-    data = json.loads(raw)
-    if data.get("scope") != props["Scope"]:
-        raise RuntimeError("Platform M2M secret scope does not match the synth input")
-    client_id = data["clientId"]
-    client_secret = data["clientSecret"]
-
-    # Update: keep the identity this resource already owns when it is intact
-    # (exact ARN + all five tags); otherwise mint a replacement below.
-    workload_name = None
-    if rt == "Update" and owned_workload and owned_workload.startswith(workload_prefix + "_"):
-        try:
-            _assert_workload_owned(
-                client, owned_workload, _workload_arn(directory_arn, owned_workload), tags
-            )
-            workload_name = owned_workload
-        except ClientError as e:
-            if not _is_not_found(e):
-                raise
-    minted_this_request = False
-    if workload_name is None:
-        workload_name = _unique_workload_name(workload_prefix, event["RequestId"])
-        # A fresh per-request name must never collide; any 'already exists'
-        # here is a real defect (or a tombstone) and fails closed by design.
-        client.create_workload_identity(name=workload_name, tags=tags)
-        _assert_workload_owned(client, workload_name, _workload_arn(directory_arn, workload_name), tags)
-        minted_this_request = True
-
-    provider_config = {
-        "includedOauth2ProviderConfig": {
-            "clientId": client_id,
-            "clientSecret": client_secret,
-            "issuer": data["issuer"],
-            "authorizationEndpoint": data["authorizationEndpoint"],
-            "tokenEndpoint": data["tokenEndpoint"],
-        }
+    require(set(props) == {"ServiceToken", "Region", "BrokerVersionArn", "BrokerConfigSha256"})
+    arn = props["BrokerVersionArn"]
+    account = event["StackId"].split(":")[4]
+    require(re.fullmatch(
+        "arn:aws:lambda:" + re.escape(props["Region"]) + ":" + re.escape(account)
+        + r":function:AgenticAI-D03-(nonprod|prod)-[A-Za-z0-9_-]+-idbroker:[1-9][0-9]*", arn))
+    require(re.fullmatch(r"[a-f0-9]{64}", props["BrokerConfigSha256"]))
+    require(event["RequestType"] in {"Create", "Update", "Delete"})
+    payload = {
+        "schema": 1, "requestType": event["RequestType"], "stackId": event["StackId"],
+        "logicalResourceId": event["LogicalResourceId"], "requestId": event["RequestId"],
+        "physicalResourceId": event.get("PhysicalResourceId", "") if event["RequestType"] != "Create" else "",
+        "notAfter": int(time.time() + min(570, context.get_remaining_time_in_millis() / 1000 - 15)),
     }
-    try:
-        try:
-            client.create_oauth2_credential_provider(
-                name=provider_name,
-                credentialProviderVendor="CognitoOauth2",
-                oauth2ProviderConfigInput=provider_config,
-                tags=tags,
-            )
-        except ClientError as e:
-            if not _is_already_exists(e):
-                raise
-            _assert_provider_owned(client, provider_name, provider_arn, tags)
-            client.update_oauth2_credential_provider(
-                name=provider_name,
-                credentialProviderVendor="CognitoOauth2",
-                oauth2ProviderConfigInput=provider_config,
-            )
-        _wait_provider(client, provider_name)
-        _assert_provider_owned(client, provider_name, provider_arn, tags)
-    except Exception:
-        # Live-proven (2026-09-23): when Create fails, CloudFormation's rollback
-        # Delete arrives with a service-generated PhysicalResourceId, not ours,
-        # so the identity minted above would be orphaned. Compensate here: the
-        # identity is exactly ours (just created + ownership-verified), so
-        # removing it is safe; the original error is re-raised unchanged.
-        if minted_this_request:
-            try:
-                client.delete_workload_identity(name=workload_name)
-            except ClientError:
-                pass
-        raise
-    finally:
-        del client_secret, provider_config, data, raw
-    return {
-        "PhysicalResourceId": provider_name + "|" + workload_name,
-        "Data": {"WorkloadName": workload_name},
-    }
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    client = boto3.Session(region_name=props["Region"]).client("lambda", config=Config(
+        retries={"total_max_attempts": 1, "mode": "standard"},
+        connect_timeout=5, read_timeout=590, proxies={}))
+    dispatch = client.invoke
+    require(time.time() < payload["notAfter"])
+    # One Invoke. SDK/CFN transport ambiguity never causes a handler-local retry.
+    response = dispatch(FunctionName=arn, InvocationType="RequestResponse", Payload=body)
+    require(response.get("StatusCode") == 200 and not response.get("FunctionError")
+            and response.get("ExecutedVersion") == arn.rsplit(":", 1)[1])
+    raw = response["Payload"].read(4097)
+    require(len(raw) <= 4096)
+    result = json.loads(raw)
+    require(result.get("ok") is True and result.get("requestId") == payload["requestId"]
+            and result.get("requestType") == payload["requestType"]
+            and result.get("brokerConfigSha256") == props["BrokerConfigSha256"]
+            and result.get("brokerOwnsCreatorReceipts") is True)
+    require(isinstance(result.get("physicalResourceId"), str)
+            and isinstance(result.get("workloadName"), str))
+    return {"PhysicalResourceId": result["physicalResourceId"],
+            "Data": {"WorkloadName": result["workloadName"]}}
+
 `;
 
 /*
@@ -716,6 +573,9 @@ export class D03WorkstreamRuntimeMemoryStack extends Stack {
     props: D03WorkstreamRuntimeMemoryStackProps,
   ) {
     super(scope, id, props);
+    if (props.identityProvisionerPermissionsBoundaryName !== undefined && props.agentImageVariant !== "generated-agent") {
+      throw new Error("D03WorkstreamRuntimeMemoryStack: identity provisioner boundary requires the generated-agent variant.");
+    }
 
     // The scan gate adds Lambda, IAM, and Step Functions support resources.
     // Apply the mandatory five-tag contract at stack scope so every taggable
@@ -968,188 +828,75 @@ export class D03WorkstreamRuntimeMemoryStack extends Stack {
     props: D03WorkstreamRuntimeMemoryStackProps,
   ): CustomResource {
     if (!props.generatedAgentRuntimeConfig) {
-      throw new Error(
-        "D03WorkstreamRuntimeMemoryStack: generatedAgentRuntimeConfig is required when agentImageVariant is 'generated-agent'.",
-      );
+      throw new Error("generatedAgentRuntimeConfig is required when using the generated-agent.");
     }
-    const cfg = props.generatedAgentRuntimeConfig!;
-    const providerName = this.credentialProviderName(props);
-    const workloadPrefix = this.workloadIdentityNamePrefix(props);
-    const providerArn = `arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:token-vault/default/oauth2credentialprovider/${providerName}`;
-    // Family ARNs: the authorizer evaluates create-time tagging against the
-    // LITERAL family ARN ".../workload-identity/*" (live-proven 2026-09-23:
-    // narrowing this to "<prefix>_*" was denied because the request resource
-    // is the literal wildcard string, which "<prefix>_*" does not match). Do
-    // not narrow here; the runtime role's token grant is the place that scopes
-    // to the "<prefix>_*" family of real, named identities.
-    const providerFamilyArn = `arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:token-vault/default/oauth2credentialprovider/*`;
-    const workloadFamilyArn = `arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default/workload-identity/*`;
-    // Container ARNs: the modeled parent resource of each create action.
-    const tokenVaultArn = `arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:token-vault/default`;
-    const workloadDirectoryArn = `arn:${this.partition}:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default`;
-
+    const boundaryName = props.identityProvisionerPermissionsBoundaryName;
+    const qualifier = this.node.tryGetContext("agenticai/bootstrapQualifier");
+    const defaultName = this.node.tryGetContext("agenticai/workloadRoleBoundaryName");
+    const expectedName = typeof defaultName === "string" && defaultName.endsWith("-RoleBoundary")
+      ? defaultName.replace(/-RoleBoundary$/, "-IdentityProvisionerBoundary") : undefined;
+    if (typeof qualifier !== "string" || qualifier === "hnb659fds" ||
+        !/^[A-Za-z0-9]{1,10}$/.test(qualifier) || boundaryName !== expectedName ||
+        typeof boundaryName !== "string") {
+      throw new Error("Identity broker delegation requires the reviewed owned provisioner boundary.");
+    }
     const roleName = `AgenticAI-D03-${props.envName}-${props.tenantId}-${props.agentId}-idprov`;
     if (roleName.length > 64) {
-      throw new Error(
-        `D03WorkstreamRuntimeMemoryStack: credential-provider role name '${roleName}' exceeds 64 characters.`,
-      );
+      throw new Error("Identity provisioner name exceeds 64 characters.");
     }
+    const bindings = this.node.tryGetContext("agenticai/identityProvisionerBrokerByAllocation");
+    const key = `${this.account}:${this.region}:${props.envName}:${props.tenantId}:${props.agentId}`;
+    const binding = bindings?.[key];
+    const brokerName = `AgenticAI-D03-${props.envName}-${props.tenantId}-${props.agentId}-idbroker`;
+    const expectedPrefix = `arn:aws:lambda:${this.region}:${this.account}:function:${brokerName}:`;
+    if (typeof binding !== "object" || binding === null ||
+        Object.keys(binding).sort().join(",") !== "configSha256,versionArn" ||
+        typeof binding.versionArn !== "string" || !binding.versionArn.startsWith(expectedPrefix) ||
+        !/^[1-9][0-9]*$/.test(binding.versionArn.slice(expectedPrefix.length)) ||
+        typeof binding.configSha256 !== "string" || !/^[a-f0-9]{64}$/.test(binding.configSha256)) {
+      throw new Error("Identity broker requires an exact reviewed published version/config binding for this allocation.");
+    }
+    const sourceFunctionArn = `arn:${this.partition}:lambda:${this.region}:${this.account}:function:${roleName}`;
     const role = new Role(this, "InferenceCredProviderRole", {
       roleName,
       assumedBy: new ServicePrincipal("lambda.amazonaws.com"),
-      description:
-        "Pipeline-owned Workstream role that seeds the CognitoOauth2 credential provider from the Platform M2M secret.",
+      description: "Delegates this allocation's identity lifecycle to the exact immutable owned broker version.",
       inlinePolicies: {
-        SeedCredentialProvider: new PolicyDocument({
-          statements: [
-            new PolicyStatement({
-              sid: "ReadPlatformM2mSecret",
-              effect: Effect.ALLOW,
-              actions: [
-                "secretsmanager:GetSecretValue",
-                "secretsmanager:DescribeSecret",
-              ],
-              resources: [cfg.m2mSecretArn],
-            }),
-            new PolicyStatement({
-              // Live-proven (2026-09-23): CreateOauth2CredentialProvider with a
-              // MANAGED client secret stores it in a Secrets Manager secret it
-              // creates on the CALLER's behalf and fails closed with
-              // "not authorized to perform: secretsmanager:CreateSecret". The
-              // service names those secrets under its reserved
-              // "bedrock-agentcore-identity!" prefix, so the grant is scoped to
-              // that family in this account/region only -- never the Platform
-              // M2M secret, never a bare "*".
-              sid: "AllowServiceManagedProviderSecret",
-              effect: Effect.ALLOW,
-              actions: [
-                "secretsmanager:CreateSecret",
-                "secretsmanager:TagResource",
-              ],
-              resources: [
-                `arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:bedrock-agentcore-identity!*`,
-              ],
-            }),
-            new PolicyStatement({
-              // Live-proven (2026-09-24 teardown): DeleteOauth2CredentialProvider
-              // deletes that managed secret as the CALLER and fails closed with
-              // "not authorized to perform: secretsmanager:DeleteSecret",
-              // leaving the stack DELETE_FAILED. Unlike create, the secret's
-              // name is known at delete time -- the service names it
-              // "<prefix>default/oauth2/<providerName>-<random>" -- so this
-              // grant is pinned to exactly this provider's secret (trailing
-              // "-*" covers only the Secrets Manager random suffix).
-              sid: "AllowServiceManagedProviderSecretDelete",
-              effect: Effect.ALLOW,
-              actions: ["secretsmanager:DeleteSecret"],
-              resources: [
-                `arn:${this.partition}:secretsmanager:${this.region}:${this.account}:secret:bedrock-agentcore-identity!default/oauth2/${providerName}-*`,
-              ],
-            }),
-            new PolicyStatement({
-              sid: "DecryptPlatformM2mSecret",
-              effect: Effect.ALLOW,
-              actions: ["kms:Decrypt"],
-              resources: ["*"],
-              conditions: {
-                StringEquals: {
-                  "kms:ViaService": `secretsmanager.${this.region}.amazonaws.com`,
-                  "kms:EncryptionContext:SecretARN": cfg.m2mSecretArn,
-                },
-              },
-            }),
-            new PolicyStatement({
-              sid: "InitializeDefaultTokenVault",
-              effect: Effect.ALLOW,
-              actions: ["bedrock-agentcore:CreateTokenVault"],
-              resources: [tokenVaultArn],
-            }),
-            new PolicyStatement({
-              // Service reference (bedrock-agentcore): the WorkloadIdentity and
-              // Oauth2CredentialProvider actions authorize on BOTH the named
-              // resource and its parent container (`workload-identity-directory`
-              // / `token-vault`). Live-proven three times (2026-09-23): the
-              // exact-ARN scoping was denied for create-time TagResource on the
-              // family, then on the bare directory ARN, then for the post-create
-              // ListTagsForResource read on the same directory ARN. Every
-              // handler call (create/get/update/delete/tag/list-tags) is
-              // therefore granted on the two default containers plus the two
-              // deterministic families in this account/region -- never "*".
-              sid: "ManageIdentityAndProvider",
-              effect: Effect.ALLOW,
-              actions: [
-                "bedrock-agentcore:CreateWorkloadIdentity",
-                "bedrock-agentcore:GetWorkloadIdentity",
-                "bedrock-agentcore:DeleteWorkloadIdentity",
-                "bedrock-agentcore:CreateOauth2CredentialProvider",
-                "bedrock-agentcore:GetOauth2CredentialProvider",
-                "bedrock-agentcore:UpdateOauth2CredentialProvider",
-                "bedrock-agentcore:DeleteOauth2CredentialProvider",
-                "bedrock-agentcore:TagResource",
-                "bedrock-agentcore:ListTagsForResource",
-              ],
-              resources: [
-                workloadDirectoryArn,
-                workloadFamilyArn,
-                tokenVaultArn,
-                providerFamilyArn,
-              ],
-            }),
-          ],
-        }),
+        InvokeOwnedIdentityBroker: new PolicyDocument({ statements: [new PolicyStatement({
+          sid: "InvokeExactImmutableBroker",
+          effect: Effect.ALLOW,
+          actions: ["lambda:InvokeFunction"],
+          resources: [binding.versionArn],
+          conditions: { ArnEquals: { "lambda:SourceFunctionArn": sourceFunctionArn } },
+        })] }),
       },
-      managedPolicies: [
-        ManagedPolicy.fromAwsManagedPolicyName(
-          "service-role/AWSLambdaBasicExecutionRole",
-        ),
-      ],
+      managedPolicies: [ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole")],
     });
-
+    RolePermissionsBoundary.of(role).apply(
+      ManagedPolicy.fromManagedPolicyName(this, "InferenceCredProviderBoundary", boundaryName),
+    );
     const handler = new LambdaFunction(this, "InferenceCredProviderFn", {
+      functionName: roleName,
       runtime: LambdaRuntime.PYTHON_3_13,
       handler: "index.on_event",
-      // Bounded worst case: 120s delete-wait + 120s name-reservation retry +
-      // 250s provider READY wait. Must exceed the handler's own loops so a
-      // slow path fails on its explicit bound, never on a truncated invoke.
       timeout: Duration.minutes(10),
       role,
       code: Code.fromInline(CREDENTIAL_PROVIDER_HANDLER),
     });
-    const provider = new Provider(this, "InferenceCredProviderProvider", {
-      onEventHandler: handler,
-    });
+    const provider = new Provider(this, "InferenceCredProviderProvider", { onEventHandler: handler });
+    bindReviewedIdentityProviderFramework(provider);
     const resource = new CustomResource(this, "InferenceCredProvider", {
       serviceToken: provider.serviceToken,
       properties: {
-        // A change to any of these re-runs the custom resource.
         Region: this.region,
-        SecretArn: cfg.m2mSecretArn,
-        ProviderName: providerName,
-        ProviderArn: providerArn,
-        // The identity name is minted per Create by the handler (see
-        // _unique_workload_name) and surfaced as the `WorkloadName` attribute.
-        WorkloadNamePrefix: workloadPrefix,
-        WorkloadDirectoryArn: workloadDirectoryArn,
-        Scope: cfg.inferenceScope,
-        Tags: this.allocationTagRecord(props),
+        BrokerVersionArn: binding.versionArn,
+        BrokerConfigSha256: binding.configSha256,
       },
     });
-    NagSuppressions.addResourceSuppressions(
-      role,
-      [
-        {
-          id: "AwsSolutions-IAM5",
-          reason:
-            "SEC-011: bedrock-agentcore WorkloadIdentity/Oauth2CredentialProvider lifecycle and create-time TagResource are scoped to the modeled parent containers (default token vault and workload-identity directory) plus the two deterministic resource families in this account/region -- never a bare '*'; kms:Decrypt is constrained by ViaService + the exact secret's encryption context.",
-        },
-        {
-          id: "AwsSolutions-IAM4",
-          reason:
-            "SEC-005: the AWS-managed AWSLambdaBasicExecutionRole is the standard least-privilege log-write policy for a custom-resource Lambda.",
-        },
-      ],
-      true,
-    );
+    NagSuppressions.addResourceSuppressions(role, [{
+      id: "AwsSolutions-IAM4",
+      reason: "The existing basic log-write attachment is additionally limited by the reviewed purpose boundary to this source handler's log group.",
+    }], true);
     return resource;
   }
 
@@ -1183,6 +930,8 @@ export class D03WorkstreamRuntimeMemoryStack extends Stack {
     props: D03WorkstreamRuntimeMemoryStackProps,
   ): Record<string, string> {
     return {
+      ...(this.node.tryGetContext("agenticai/workloadRoleBoundaryName")
+        ? { "deployment-scope": "fresh-security-remediation" } : {}),
       "application-id": props.applicationId,
       "agent-id": props.agentId,
       "tenant-id": props.tenantId,

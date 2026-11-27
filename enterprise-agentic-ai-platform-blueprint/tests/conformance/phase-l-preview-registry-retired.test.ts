@@ -20,8 +20,9 @@
  * SPDX-License-Identifier: MIT-0
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { extname, join, relative, sep } from 'node:path';
 
 import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
@@ -87,9 +88,35 @@ const FORBIDDEN: ReadonlyArray<{ readonly label: string; readonly re: RegExp }> 
   },
 ];
 
-/** Every git-tracked source file under the blueprint, as repo-relative paths. */
-function trackedSourceFiles(): readonly string[] {
-  const out = execFileSync(
+/** Scan source archives too: CodePipeline's S3 source does not contain .git. */
+function archiveSourceFiles(root: string): readonly string[] {
+  const extensions = new Set(['.ts', '.py', '.sh', '.json', '.yaml', '.yml', '.md']);
+  const generated = new Set([
+    '.git', 'node_modules', 'dist', 'build', 'coverage', '.nyc_output',
+    '__pycache__', '.pytest_cache', '.venv', 'venv', '.mypy_cache', '.ruff_cache',
+  ]);
+  const files: string[] = [];
+  function visit(directory: string): void {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (!generated.has(entry.name) && entry.name !== 'cdk.out' && !entry.name.startsWith('cdk.out.')) {
+          visit(path);
+        }
+      } else if (entry.isFile() && extensions.has(extname(entry.name))) {
+        files.push(relative(root, path));
+      }
+    }
+  }
+  visit(root);
+  return files.sort();
+}
+
+/** Git includes uncommitted source; an archive scans every source file present. */
+function trackedSourceFiles(root: string = ROOT): readonly string[] {
+  let out: string;
+  try {
+    out = execFileSync(
     'git',
     [
       'ls-files',
@@ -109,8 +136,16 @@ function trackedSourceFiles(): readonly string[] {
       '*.yml',
       '*.md',
     ],
-    { cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
-  );
+      { cwd: root, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: 'pipe' },
+    );
+  } catch (error) {
+    const failure = error as { status?: number; stderr?: Buffer };
+    // Other Git failures must remain hard failures rather than narrowing a scan.
+    if (failure.status !== 128 || !failure.stderr?.toString().includes('not a git repository')) {
+      throw error;
+    }
+    return archiveSourceFiles(root);
+  }
   return out
     .split('\0')
     .filter((f) => f.length > 0)
@@ -125,6 +160,24 @@ describe('Phase L — preview AgentCore Registry stays retired', () => {
   it('finds source files to scan (guards against a broken glob silently passing)', () => {
     expect(files.length).toBeGreaterThan(200);
     expect(files).toContain('apps/platform-account/lib/d03-platform-core-stack.ts');
+  });
+
+  it('scans nested untracked source in a Git-free archive while excluding generated dependencies', () => {
+    const root = mkdtempSync(join(tmpdir(), 'registry-archive-'));
+    try {
+      const source = 'packages/new/src/unsafe.ts';
+      mkdirSync(join(root, 'packages/new/src'), { recursive: true });
+      writeFileSync(join(root, source), 'bedrock-agentcore:GetRegistry');
+      mkdirSync(join(root, 'node_modules/dependency'), { recursive: true });
+      writeFileSync(join(root, 'node_modules/dependency/ignored.ts'), 'bedrock-agentcore:GetRegistry');
+      mkdirSync(join(root, 'cdk.out.stage'), { recursive: true });
+      writeFileSync(join(root, 'cdk.out.stage/generated.json'), '{}');
+      const archive = trackedSourceFiles(root);
+      expect(archive).toEqual([source]);
+      expect(FORBIDDEN[0].re.test(readFileSync(join(root, archive[0]), 'utf8'))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   for (const { label, re } of FORBIDDEN) {

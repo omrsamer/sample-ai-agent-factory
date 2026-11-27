@@ -12,11 +12,11 @@
  *             deny — now accompanied by a `Null: aws:SourceVpce = true`
  *             twin deny.
  *   - SCP-04: same bypass / same fix as SCP-03.
- *   - SCP-05: exact-match `StringNotEquals` on `aws:PrincipalArn` ignored
- *             the STS assumed-role session form — now `ArnNotLike` against
- *             both role and assumed-role patterns.
+ *   - Protected business exceptions: a matching mutable role name was enough
+ *             to inherit authority. Exact IAM role ARN and immutable RoleId
+ *             are now enforced by independent Denies.
  *
- * Every fixed SCP must also carry a `PrincipalIsAWSService=false` guard so
+ * Business SCPs carry a `PrincipalIsAWSService=false` guard so
  * AWS-owned service principals (Config, GuardDuty, CloudTrail, …) are not
  * self-denied.
  *
@@ -31,6 +31,7 @@ import {
   allowedModelArns,
   PLATFORM_APPROVED_REGIONS,
 } from "@agenticai/platform-baselines";
+import { authorityFixture } from "../fixtures/protected-authority";
 
 const PLATFORM_GUARDRAIL_ADMIN_ROLE_ARN =
   "arn:aws:iam::111111111111:role/AgenticAI-GuardrailAdmin";
@@ -50,6 +51,7 @@ function renderSet(
     platformAccountId?: string;
     gatewayAdminWorkloadAccountIds?: readonly string[];
     allowedToolTargetArns?: readonly string[];
+    protectedAuthorityManifest?: unknown;
   } = {},
 ) {
   return buildScpSet({
@@ -62,6 +64,14 @@ function renderSet(
     platformAccountId: opts.platformAccountId,
     gatewayAdminWorkloadAccountIds: opts.gatewayAdminWorkloadAccountIds,
     allowedToolTargetArns: opts.allowedToolTargetArns,
+    protectedAuthorityManifest:
+      "protectedAuthorityManifest" in opts
+        ? opts.protectedAuthorityManifest
+        : opts.gatewayAdminWorkloadAccountIds
+          ? authorityFixture({
+              governedAccountIds: opts.gatewayAdminWorkloadAccountIds,
+            })
+          : undefined,
   });
 }
 
@@ -93,6 +103,33 @@ function arnNotLikeFires(
 }
 function arnLikeFires(patterns: readonly string[], candidate: string): boolean {
   return patterns.some((p) => arnLikeMatch(p, candidate));
+}
+
+/** Bounded IAM condition model for the rendered business identity gates. */
+function principalGateDenies(
+  statements: any[],
+  action: string,
+  context: Record<string, string>,
+): boolean {
+  return statements.some((statement) => {
+    if (!statement.Action.includes(action)) return false;
+    return Object.entries(statement.Condition ?? {}).every(([operator, values]) =>
+      Object.entries(values as Record<string, string | string[]>).every(([key, raw]) => {
+        const expected = [raw].flat();
+        const actual = context[key];
+        if (operator === "ArnNotEquals") {
+          return actual === undefined || !expected.includes(actual);
+        }
+        if (operator === "StringNotLike") {
+          return actual === undefined || !expected.some((pattern) => arnLikeMatch(pattern, actual));
+        }
+        if (operator === "BoolIfExists") {
+          return actual === undefined || expected.includes(actual);
+        }
+        throw new Error(`Unexpected identity-gate operator ${operator}`);
+      }),
+    );
+  });
 }
 
 describe("SCP bypass regression — SCP-02 (empty-string GuardrailIdentifier)", () => {
@@ -136,7 +173,7 @@ describe("SCP bypass regression — SCP-02 (empty-string GuardrailIdentifier)", 
       expect(
         parsed.Statement[0].Condition.Null["bedrock:GuardrailIdentifier"],
       ).toBe("true");
-      expect(parsed.Statement[1].Sid).toBe("DenyDirectMantleInference");
+      expect(parsed.Statement[1].Sid).toBe("DenyDirectMantleInferenceNoAuthority");
       expect(warn).toHaveBeenCalledWith(
         expect.stringContaining("TODO-APPROVED-GUARDRAILS"),
       );
@@ -185,8 +222,8 @@ describe("SCP bypass regression — SCP-04 (IfExists on aws:SourceVpce)", () => 
   });
 });
 
-describe("SCP bypass regression — SCP-05 (PrincipalArn session form)", () => {
-  it("uses ArnNotLike with both role and assumed-role forms", () => {
+describe("SCP bypass regression — SCP-05 default API compatibility", () => {
+  it("preserves the exact configured role discriminator when no protected manifest is selected", () => {
     const scp05 = renderSet()[4];
     const parsed = scp05.body as any;
     const stmt = parsed.Statement[0];
@@ -199,6 +236,44 @@ describe("SCP bypass regression — SCP-05 (PrincipalArn session form)", () => {
         "arn:aws:sts::111111111111:assumed-role/AgenticAI-GuardrailAdmin/*",
       ]),
     );
+  });
+
+  it("with a manifest requires both the approved admin ARN and its immutable RoleId", () => {
+    const manifest = authorityFixture({ governedAccountIds: [WORKLOAD_ACCOUNT_ID] });
+    const admin = manifest.roles.find((role) => role.id === "central-owner")!;
+    const statements = (renderSet({ protectedAuthorityManifest: manifest })[4].body as any).Statement;
+    expect(statements).toHaveLength(2);
+    expect(statements.find((statement: any) => statement.Condition.ArnNotEquals)
+      .Condition.ArnNotEquals["aws:PrincipalArn"]).toEqual([admin.arn]);
+    expect(statements.find((statement: any) => statement.Condition.StringNotLike)
+      .Condition.StringNotLike["aws:userid"]).toEqual([`${admin.roleId}:*`]);
+    expect(statements.every((statement: any) =>
+      !(statement.Condition.ArnNotEquals && statement.Condition.StringNotLike),
+    )).toBe(true);
+    for (const action of [
+      "bedrock:CreateGuardrail",
+      "bedrock:UpdateGuardrail",
+      "bedrock:DeleteGuardrail",
+      "bedrock:CreateGuardrailVersion",
+    ]) {
+      const legitimate: Record<string, string> = {
+        "aws:PrincipalArn": admin.arn,
+        "aws:userid": `${admin.roleId}:approved-session`,
+        "aws:PrincipalIsAWSService": "false",
+      };
+      expect(principalGateDenies(statements, action, legitimate)).toBe(false);
+      expect(principalGateDenies(statements, action, {
+        ...legitimate,
+        "aws:userid": "AROA99999999999999999:recreated-role",
+      })).toBe(true);
+      expect(principalGateDenies(statements, action, {
+        ...legitimate,
+        "aws:PrincipalArn": `${admin.arn}-lookalike`,
+      })).toBe(true);
+      const missingEntity = { ...legitimate };
+      delete missingEntity["aws:userid"];
+      expect(principalGateDenies(statements, action, missingEntity)).toBe(true);
+    }
   });
 });
 
@@ -241,30 +316,32 @@ describe("SCP bypass regression — SCP-09 (Gateway mutation lockdown)", () => {
     return scp09;
   }
 
-  it("ArnNotLike fires when the evaluated aws:PrincipalArn is the literal empty string", () => {
+  it("the exact ARN gate denies an empty principal", () => {
     // Bypass scenario: a malformed principal evaluation surfaces "" as the
     // aws:PrincipalArn value. ArnNotLike must still treat "" as not-like any
     // allowed admin ARN, so the Deny fires.
     const parsed = getScp09().body as any;
     const allowed: string[] =
-      parsed.Statement[0].Condition.ArnNotLike["aws:PrincipalArn"];
+      parsed.Statement[0].Condition.ArnNotEquals["aws:PrincipalArn"];
     expect(arnNotLikeFires(allowed, "")).toBe(true);
   });
 
-  it("role-name case-difference matches via ArnNotLike (so case-altered forgeries still trip Deny)", () => {
+  it("case-altered role forgeries fail the exact ARN gate", () => {
     // IAM ARNs are technically case-sensitive in string comparisons, but
     // ArnNotLike against the canonical spelling means a case-different forgery
     // (e.g. "AGENTICAI-d03-GATEWAYADMIN") is NOT a match → Deny fires.
     const parsed = getScp09().body as any;
     const allowed: string[] =
-      parsed.Statement[0].Condition.ArnNotLike["aws:PrincipalArn"];
-    const forged = `arn:aws:sts::${WORKLOAD_ACCOUNT_ID}:assumed-role/AGENTICAI-d03-nonprod-GATEWAYADMIN/session-1`;
+      parsed.Statement[0].Condition.ArnNotEquals["aws:PrincipalArn"];
+    const forged = `arn:aws:iam::${WORKLOAD_ACCOUNT_ID}:role/AGENTICAI-d03-nonprod-GATEWAYADMIN`;
     expect(arnNotLikeFires(allowed, forged)).toBe(true);
   });
 
-  it("AWS-service principals are not self-denied (BoolIfExists guard)", () => {
+  it("direct AWS-service principals preserve the business service guard", () => {
     // AgentCore Gateway may be acted on internally by an AWS service
-    // principal (e.g. pipeline Lambda with service principal). The
+    // principal. Lambda execution-role calls instead use the ordinary role
+    // ARN/RoleId controls; they are not direct AWS-service principal calls.
+    // The
     // PrincipalIsAWSService=false guard prevents the Deny from firing.
     const parsed = getScp09().body as any;
     const stmt = parsed.Statement[0];
@@ -277,22 +354,57 @@ describe("SCP bypass regression — SCP-09 (Gateway mutation lockdown)", () => {
     expect(actions.every((a) => a.startsWith("bedrock-agentcore:"))).toBe(true);
   });
 
-  it("admin session ARN matches and plain role ARN matches — Deny does NOT fire for either", () => {
+  it("the approved assumed-role context uses its IAM role ARN and live entity ID", () => {
     const parsed = getScp09().body as any;
-    const allowed: string[] =
-      parsed.Statement[0].Condition.ArnNotLike["aws:PrincipalArn"];
+    const role = authorityFixture({
+      governedAccountIds: [WORKLOAD_ACCOUNT_ID],
+    }).roles.find((candidate) => candidate.purposes.includes("gateway-admin"))!;
+    const context = {
+      "aws:PrincipalArn": role.arn,
+      "aws:userid": `${role.roleId}:session-abc123`,
+      "aws:PrincipalIsAWSService": "false",
+    };
+    expect(principalGateDenies(parsed.Statement, "bedrock-agentcore:UpdateGateway", context)).toBe(false);
+    expect(principalGateDenies(parsed.Statement, "bedrock-agentcore:CreateGateway", context)).toBe(false);
+    expect(principalGateDenies(parsed.Statement, "bedrock-agentcore:UpdateGateway", {
+      ...context,
+      "aws:PrincipalArn": `arn:aws:sts::${WORKLOAD_ACCOUNT_ID}:assumed-role/AgenticAI-D03-nonprod-GatewayAdmin/session-abc123`,
+    })).toBe(true);
+  });
 
-    const sessionArn = `arn:aws:sts::${WORKLOAD_ACCOUNT_ID}:assumed-role/AgenticAI-D03-nonprod-GatewayAdmin/session-abc123`;
-    const roleArn = `arn:aws:iam::${WORKLOAD_ACCOUNT_ID}:role/AgenticAI-D03-nonprod-GatewayAdmin`;
+  it.each(["bedrock-agentcore:CreateGateway", "bedrock-agentcore:UpdateGateway"])(
+    "same-name recreation, lookalikes and missing entity context cannot call %s",
+    (action) => {
+      const parsed = getScp09().body as any;
+      const role = authorityFixture({
+        governedAccountIds: [WORKLOAD_ACCOUNT_ID],
+      }).roles.find((candidate) => candidate.purposes.includes("gateway-admin"))!;
+      const approved = {
+        "aws:PrincipalArn": role.arn,
+        "aws:userid": `${role.roleId}:session`,
+        "aws:PrincipalIsAWSService": "false",
+      };
+      const hostileContexts: Record<string, string>[] = [
+        { ...approved, "aws:userid": "AROA99999999999999999:session" },
+        { ...approved, "aws:PrincipalArn": `${role.arn}Lookalike` },
+        { ...approved, "aws:PrincipalArn": role.arn.replace(WORKLOAD_ACCOUNT_ID, "555555555555") },
+        { "aws:PrincipalArn": role.arn, "aws:PrincipalIsAWSService": "false" },
+        { "aws:userid": `${role.roleId}:session`, "aws:PrincipalIsAWSService": "false" },
+      ];
+      for (const hostile of hostileContexts) {
+        expect(principalGateDenies(parsed.Statement, action, hostile)).toBe(true);
+      }
+      expect(parsed.Statement.every((statement: any) =>
+        !(statement.Condition.ArnNotEquals && statement.Condition.StringNotLike),
+      )).toBe(true);
+    },
+  );
 
-    // Both admin forms are ArnLike (match) one of the allowed patterns, so
-    // ArnNotLike is FALSE and the Deny does NOT fire.
-    expect(arnNotLikeFires(allowed, sessionArn)).toBe(false);
-    expect(arnNotLikeFires(allowed, roleArn)).toBe(false);
-
-    // But a workload runtime-role session in the SAME account does trip Deny.
-    const workloadSession = `arn:aws:sts::${WORKLOAD_ACCOUNT_ID}:assumed-role/AgenticAI-D03-foo-runtime/session-xyz`;
-    expect(arnNotLikeFires(allowed, workloadSession)).toBe(true);
+  it("refuses the original wildcard-only account configuration", () => {
+    expect(() => renderSet({
+      gatewayAdminWorkloadAccountIds: [WORKLOAD_ACCOUNT_ID],
+      protectedAuthorityManifest: undefined,
+    })).toThrow(/protectedAuthorityManifest/i);
   });
 });
 

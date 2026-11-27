@@ -46,7 +46,6 @@ except ImportError:  # pragma: no cover — dev machines w/o boto3 still collect
 
 PLATFORM_STACK_NAME = 'AgenticAI-D03-PlatformCoreStack'
 WORKLOAD_STACK_NAME = 'AgenticAI-D03-WorkloadAgentStack'
-BEDROCK_CALLER_ROLE_NAME = 'AgenticAI-D03-BedrockCaller'
 
 
 def _session_from_env(prefix: str, default_profile: str) -> Optional['boto3.session.Session']:
@@ -175,7 +174,7 @@ def assume_bedrock_caller(
     sts = workload_session.client('sts')
     workload_account_id = sts.get_caller_identity()['Account']
     session_name = f'workload-{workload_account_id}-{tenant_id}-{agent_id}'
-    role_arn = f'arn:aws:iam::{platform_account_id}:role/{BEDROCK_CALLER_ROLE_NAME}'
+    role_arn = f'arn:aws:iam::{platform_account_id}:role/AgenticAI-D03-{tenant_id}-{agent_id}-BedrockCaller'
 
     kwargs = {
         'RoleArn': role_arn,

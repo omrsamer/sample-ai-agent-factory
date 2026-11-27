@@ -25,29 +25,26 @@
  * against the AWS managed policies CloudWatchOmniSpaceAccessPolicy and
  * CloudWatchOmniDomainAccessPolicy, 2026-11-06).
  *
- * Exemption shape mirrors SCP-09/11: both the role ARN and the
- * `assumed-role/<name>/*` session form are matched, and AWS service
- * principals are never self-denied. The pipeline role is matched by name
- * pattern across accounts because the policy attaches to an OU, not to one
- * account; the default pattern is the CDK bootstrap CloudFormation execution
- * role every cell is bootstrapped with.
+ * Exemptions require the reviewed protected authority manifest. Separate
+ * ARN and RoleId checks bind each exception to an exact live IAM role entity.
+ * There is no CDK role-name or account wildcard fallback.
  *
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: MIT-0
  */
 import { toScpDefinition, type ScpDefinition } from "./index";
+import {
+  principalEntityDenyStatements,
+  protectedRolesForPurpose,
+  validateProtectedAuthorityManifest,
+} from "../protected-authority";
 
 export interface Scp13Options {
-  /**
-   * Role-name patterns (IAM wildcards) of the pipeline principals allowed to
-   * manage spaces, Transaction Search and Runtime deliveries in a cell.
-   * Default: the CDK bootstrap CloudFormation execution role.
-   */
+  /** Reviewed telemetry deployment and optional recovery identities. */
+  readonly protectedAuthorityManifest?: unknown;
+  /** Removed insecure option; rejected with migration guidance. */
   readonly pipelineRoleNamePatterns?: readonly string[];
-  /**
-   * Exact break-glass role names (for example `AgenticAI-ObservabilityAdmin`)
-   * that may also operate these controls. Default none.
-   */
+  /** Removed insecure option; rejected with migration guidance. */
   readonly breakGlassRoleNames?: readonly string[];
 }
 
@@ -90,31 +87,26 @@ export const SCP13_DELIVERY_ACTIONS: readonly string[] = [
   "logs:UpdateDeliveryConfiguration",
 ];
 
-const ROLE_NAME_PATTERN = /^[\w+=,.@*?-]{1,64}$/;
-
-export function scp13OmniTelemetryLockdown(opts: Scp13Options = {}): ScpDefinition {
-  const pipelinePatterns = opts.pipelineRoleNamePatterns ?? ["cdk-*-cfn-exec-role-*"];
-  const breakGlass = opts.breakGlassRoleNames ?? [];
-  for (const name of [...pipelinePatterns, ...breakGlass]) {
-    if (!ROLE_NAME_PATTERN.test(name)) {
-      throw new Error(
-        `SCP-13: role name or pattern '${name}' is not a valid IAM role name pattern (1-64 chars of [\\w+=,.@*?-]).`,
-      );
-    }
+export function scp13OmniTelemetryLockdown(
+  opts: Scp13Options = {},
+): ScpDefinition {
+  if (
+    opts.pipelineRoleNamePatterns !== undefined ||
+    opts.breakGlassRoleNames !== undefined
+  ) {
+    throw new Error(
+      "SCP-13: role names and patterns are no longer accepted. Supply protectedAuthorityManifest with exact ARN/RoleId-bound telemetry identities and their authority protections.",
+    );
   }
-  if (pipelinePatterns.length === 0) {
-    throw new Error("SCP-13: at least one pipeline role-name pattern is required, or the pipeline locks itself out.");
+  const roles = protectedRolesForPurpose(
+    validateProtectedAuthorityManifest(opts.protectedAuthorityManifest),
+    "telemetry",
+  );
+  if (roles.length === 0) {
+    throw new Error(
+      "SCP-13: the protected authority manifest needs telemetry identities.",
+    );
   }
-  const exemptNames = [...new Set([...pipelinePatterns, ...breakGlass])];
-  // OU-wide policy: the account component is a wildcard, the role name is the discriminator.
-  const exemptArns = exemptNames.flatMap((name) => [
-    `arn:aws:iam::*:role/${name}`,
-    `arn:aws:sts::*:assumed-role/${name}/*`,
-  ]);
-  const pipelineOnly = {
-    ArnNotLike: { "aws:PrincipalArn": exemptArns },
-    BoolIfExists: { "aws:PrincipalIsAWSService": "false" },
-  };
   const everyone = {
     BoolIfExists: { "aws:PrincipalIsAWSService": "false" },
   };
@@ -129,34 +121,34 @@ export function scp13OmniTelemetryLockdown(opts: Scp13Options = {}): ScpDefiniti
         Resource: "*",
         Condition: everyone,
       },
-      {
-        Sid: "DenyOmniSpaceLifecycleExceptPipeline",
-        Effect: "Deny",
-        Action: Array.from(SCP13_SPACE_ACTIONS),
-        Resource: "*",
-        Condition: pipelineOnly,
-      },
-      {
-        Sid: "DenyTransactionSearchTamperingExceptPipeline",
-        Effect: "Deny",
-        Action: Array.from(SCP13_TRANSACTION_SEARCH_ACTIONS),
-        Resource: "*",
-        Condition: pipelineOnly,
-      },
-      {
-        Sid: "DenyRuntimeDeliveryTamperingExceptPipeline",
-        Effect: "Deny",
-        Action: Array.from(SCP13_DELIVERY_ACTIONS),
-        Resource: "*",
-        Condition: pipelineOnly,
-      },
+      ...principalEntityDenyStatements(
+        "DenyOmniSpaceLifecycleExceptPipeline",
+        SCP13_SPACE_ACTIONS,
+        ["*"],
+        roles,
+        { awsServiceExempt: true },
+      ),
+      ...principalEntityDenyStatements(
+        "DenyTransactionSearchTamperingExceptPipeline",
+        SCP13_TRANSACTION_SEARCH_ACTIONS,
+        ["*"],
+        roles,
+        { awsServiceExempt: true },
+      ),
+      ...principalEntityDenyStatements(
+        "DenyRuntimeDeliveryTamperingExceptPipeline",
+        SCP13_DELIVERY_ACTIONS,
+        ["*"],
+        roles,
+        { awsServiceExempt: true },
+      ),
     ],
   };
 
   return toScpDefinition(
     "scp-13",
     "AgenticAI-SCP-13-OmniTelemetryLockdown",
-    "Cells cannot create Omni domains, hand-make spaces or grants, or switch off Transaction Search and Runtime log deliveries; only the Workload pipeline (and a named break-glass role) may (ADR-15).",
+    "Cells cannot create Omni domains or tamper with telemetry; only protected exact ARN/RoleId-bound telemetry identities may manage pipeline controls (ADR-15).",
     body,
   );
 }

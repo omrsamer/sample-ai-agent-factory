@@ -4,7 +4,7 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: MIT-0
  */
-import { App } from "aws-cdk-lib";
+import { App, DefaultStackSynthesizer, PermissionsBoundary as StagePermissionsBoundary } from "aws-cdk-lib";
 import { Template } from "aws-cdk-lib/assertions";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -79,6 +79,22 @@ function gaContext(environment: "nonprod" | "prod"): GaRegistryConsumerContext {
   };
 }
 
+// Synthetic numeric versions are used only by offline synthesis tests; they are not native bindings.
+function brokerContext(region = REGION): Record<string, unknown> {
+  return {
+    "agenticai/bootstrapQualifier": "isolated1",
+    "agenticai/workloadRoleBoundaryName": "Isolated-RoleBoundary",
+    "agenticai/identityProvisionerBrokerByAllocation": Object.fromEntries(
+      [[NONPROD_ACCOUNT, "nonprod"], [PROD_ACCOUNT, "prod"]].map(([account, stage]) => [
+        `${account}:${region}:${stage}:demo:primary`, {
+          versionArn: `arn:aws:lambda:${region}:${account}:function:AgenticAI-D03-${stage}-demo-primary-idbroker:17`,
+          configSha256: "a".repeat(64),
+        },
+      ]),
+    ),
+  };
+}
+
 function tagsToRecord(
   tags: Array<{ Key: string; Value: string }> | Record<string, string>,
 ): Record<string, string> {
@@ -99,7 +115,7 @@ function runtimeMemoryTemplate(
   region: string = REGION,
   withEvaluationRole = false,
 ): Template {
-  const app = new App();
+  const app = new App({ context: agentImageVariant === "generated-agent" ? brokerContext(region) : {} });
   const account = envName === "nonprod" ? NONPROD_ACCOUNT : PROD_ACCOUNT;
   return Template.fromStack(
     new D03WorkstreamRuntimeMemoryStack(app, `RuntimeMemory-${envName}`, {
@@ -111,6 +127,7 @@ function runtimeMemoryTemplate(
       costCentre: "engineering",
       runtimeExecutionRoleArnOverride: `arn:aws:iam::${account}:role/AgenticAI-D03-${envName}-demo-primary-runtime`,
       agentImageVariant,
+      identityProvisionerPermissionsBoundaryName: agentImageVariant === "generated-agent" ? "Isolated-IdentityProvisionerBoundary" : undefined,
       evaluationInvokerPrincipalArn: withEvaluationRole
         ? `arn:aws:iam::${PLATFORM_ACCOUNT}:role/AgenticAI-WLP-demo-primary-Evaluation`
         : undefined,
@@ -179,7 +196,7 @@ function pipeline(
   readonly stack: WorkloadPipelineStack;
   readonly template: Template;
 } {
-  const app = new App();
+  const app = new App({ context: generated ? brokerContext() : {} });
   const stack = new WorkloadPipelineStack(app, `Pipeline-${enabled}`, {
     env: { account: PLATFORM_ACCOUNT, region: REGION },
     githubRepo: "aws-samples/sample-ai-agent-factory",
@@ -198,6 +215,7 @@ function pipeline(
       gatewayRegion: REGION,
     },
     enablePipelineRuntimeMemory: enabled,
+    identityProvisionerPermissionsBoundaryName: generated ? "Isolated-IdentityProvisionerBoundary" : undefined,
     agentImageVariant: generated ? "generated-agent" : undefined,
     generatedAgentInference: generated
       ? {
@@ -340,8 +358,8 @@ describe("Phase 23 — native Runtime and Memory resources", () => {
       "Fn::GetAtt": ["InferenceCredProvider", "WorkloadName"],
     });
     const rendered = JSON.stringify(template.toJSON());
-    expect(rendered).toContain("get_oauth2_credential_provider");
-    expect(rendered).toContain("did not reach READY within 250 seconds");
+    expect(rendered).toContain("InvokeExactImmutableBroker");
+    expect(rendered).toContain("brokerOwnsCreatorReceipts");
   });
 
   it("generated-agent Region follows the deploy Region, not the reference one", () => {
@@ -406,169 +424,23 @@ describe("Phase 23 — native Runtime and Memory resources", () => {
     expect(invokeResources).not.toContain("*");
   });
 
-  it("initializes only the default token vault and tags Identity resources", () => {
+  it("delegates identity lifecycle only to the exact immutable broker version", () => {
     const template = runtimeMemoryTemplate("nonprod", "generated-agent");
-    const role = Object.values(template.findResources("AWS::IAM::Role")).find(
-      (resource: any) =>
-        resource.Properties.RoleName ===
-        "AgenticAI-D03-nonprod-demo-primary-idprov",
-    ) as any;
-    expect(role).toBeDefined();
-    const statements = role.Properties.Policies.flatMap(
-      (policy: any) => policy.PolicyDocument.Statement,
-    );
-    expect(statements).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          Sid: "InitializeDefaultTokenVault",
-          Effect: "Allow",
-          Action: "bedrock-agentcore:CreateTokenVault",
-        }),
-      ]),
-    );
-    const tokenVaultStatement = statements.find(
-      (statement: any) => statement.Sid === "InitializeDefaultTokenVault",
-    );
-    // Partition-safe ARN renders as Fn::Join; assert the exact immutable suffix
-    // and that it is the single default vault (no wildcard).
-    const tokenVaultResourceJson = JSON.stringify(tokenVaultStatement.Resource);
-    expect(tokenVaultResourceJson).toContain(
-      `:bedrock-agentcore:${REGION}:${NONPROD_ACCOUNT}:token-vault/default"`,
-    );
-    expect(tokenVaultResourceJson).not.toContain("*");
-
-    // Every bedrock-agentcore call the handler makes (create/get/update/delete,
-    // tag, list-tags) is scoped to the modeled parent containers and the two
-    // deterministic families (service reference: CreateWorkloadIdentity ->
-    // workload-identity + workload-identity-directory; CreateOauth2Credential-
-    // Provider -> oauth2credentialprovider + token-vault). Live-proven three
-    // times on 2026-09-23; pin the exact action set and resources so it can
-    // never widen to "*" nor silently drop a call the handler depends on.
-    const lifecycleStatement = statements.find(
-      (statement: any) => statement.Sid === "ManageIdentityAndProvider",
-    );
-    expect(lifecycleStatement).toBeDefined();
-    expect(lifecycleStatement.Effect).toBe("Allow");
-    expect([...lifecycleStatement.Action].sort()).toEqual(
-      [
-        "bedrock-agentcore:CreateOauth2CredentialProvider",
-        "bedrock-agentcore:CreateWorkloadIdentity",
-        "bedrock-agentcore:DeleteOauth2CredentialProvider",
-        "bedrock-agentcore:DeleteWorkloadIdentity",
-        "bedrock-agentcore:GetOauth2CredentialProvider",
-        "bedrock-agentcore:GetWorkloadIdentity",
-        "bedrock-agentcore:ListTagsForResource",
-        "bedrock-agentcore:TagResource",
-        "bedrock-agentcore:UpdateOauth2CredentialProvider",
-      ].sort(),
-    );
-    const lifecycleResources = lifecycleStatement.Resource;
-    expect(Array.isArray(lifecycleResources)).toBe(true);
-    expect(lifecycleResources).toHaveLength(4);
-    const lifecycleResourcesJson = JSON.stringify(lifecycleResources);
-    for (const suffix of [
-      `:bedrock-agentcore:${REGION}:${NONPROD_ACCOUNT}:workload-identity-directory/default"`,
-      // LITERAL family: the service authorizes create-time tags against the
-      // literal ".../workload-identity/*" request resource (live-proven: a
-      // "<prefix>_*" narrowing was denied). The runtime role, not this role,
-      // narrows to the "<prefix>_*" family of real named identities.
-      `:bedrock-agentcore:${REGION}:${NONPROD_ACCOUNT}:workload-identity-directory/default/workload-identity/*"`,
-      `:bedrock-agentcore:${REGION}:${NONPROD_ACCOUNT}:token-vault/default"`,
-      `:bedrock-agentcore:${REGION}:${NONPROD_ACCOUNT}:token-vault/default/oauth2credentialprovider/*`,
-    ]) {
-      expect(lifecycleResourcesJson).toContain(suffix);
-    }
-    expect(lifecycleResourcesJson).not.toMatch(/"\*"/);
-    // Live-proven (2026-09-24 teardown): DeleteOauth2CredentialProvider deletes
-    // the provider's managed secret as the caller. The create-time grant must
-    // stay on the reserved family (the random suffix is unknowable before
-    // create), but the delete grant is pinned to exactly THIS provider's
-    // secret and never widens to the family or gains extra actions.
-    const managedSecretCreate = statements.find(
-      (statement: any) => statement.Sid === "AllowServiceManagedProviderSecret",
-    );
-    expect([...managedSecretCreate.Action].sort()).toEqual(
-      ["secretsmanager:CreateSecret", "secretsmanager:TagResource"].sort(),
-    );
-    const managedSecretDelete = statements.find(
-      (statement: any) =>
-        statement.Sid === "AllowServiceManagedProviderSecretDelete",
-    );
-    expect(managedSecretDelete).toBeDefined();
-    expect(managedSecretDelete.Effect).toBe("Allow");
-    expect(managedSecretDelete.Action).toBe("secretsmanager:DeleteSecret");
-    const managedSecretDeleteJson = JSON.stringify(
-      managedSecretDelete.Resource,
-    );
-    expect(managedSecretDeleteJson).toContain(
-      `:secretsmanager:${REGION}:${NONPROD_ACCOUNT}:secret:bedrock-agentcore-identity!default/oauth2/AgenticAI_D03_nonprod_demo_primary_inference-*`,
-    );
-    expect(managedSecretDeleteJson).not.toContain("identity!*");
-    // No statement in the provider role may carry a bare "*" resource.
-    for (const statement of statements) {
-      const resources = Array.isArray(statement.Resource)
-        ? statement.Resource
-        : [statement.Resource];
-      if (statement.Sid === "DecryptPlatformM2mSecret") continue; // ViaService + context bound
-      expect(resources).not.toContain("*");
-    }
-
-    const credentialProviderResource = Object.values(
-      template.findResources("AWS::CloudFormation::CustomResource"),
-    ).find(
-      (resource: any) =>
-        resource.Properties.ProviderName ===
-        "AgenticAI_D03_nonprod_demo_primary_inference",
-    ) as any;
-    expect(credentialProviderResource).toBeDefined();
-    expect(credentialProviderResource.Properties.Tags).toEqual(REQUIRED_TAGS);
-    const providerArnJson = JSON.stringify(
-      credentialProviderResource.Properties.ProviderArn,
-    );
-    expect(providerArnJson).toContain("AWS::Partition");
-    expect(providerArnJson).toContain(
-      `:bedrock-agentcore:${REGION}:${NONPROD_ACCOUNT}:token-vault/default/oauth2credentialprovider/AgenticAI_D03_nonprod_demo_primary_inference`,
-    );
-    // The exact identity name is NOT a synth-time property: the resource
-    // receives the prefix + directory and the handler mints "<prefix>_<12 hex>".
-    expect(credentialProviderResource.Properties.WorkloadName).toBeUndefined();
-    expect(credentialProviderResource.Properties.WorkloadArn).toBeUndefined();
-    expect(credentialProviderResource.Properties.WorkloadNamePrefix).toBe(
-      "AgenticAI_D03_nonprod_demo_primary",
-    );
-    const directoryArnJson = JSON.stringify(
-      credentialProviderResource.Properties.WorkloadDirectoryArn,
-    );
-    expect(directoryArnJson).toContain("AWS::Partition");
-    expect(directoryArnJson).toContain(
-      `:bedrock-agentcore:${REGION}:${NONPROD_ACCOUNT}:workload-identity-directory/default"`,
-    );
-    const handlerCode = JSON.stringify(template.toJSON());
-    expect(handlerCode).toContain(
-      "create_workload_identity(name=workload_name, tags=tags)",
-    );
-    expect(handlerCode).toContain(
-      'code == \\"ValidationException\\" and \\"already exists\\" in message',
-    );
-    // Unique-per-create identity (live-proven 2026-09-23 over five rollbacks:
-    // TagResource on an existing identity returns a service 500 and a deleted
-    // name tombstones -- Get says not-found while Create says already-exists).
-    // The handler must mint from the RequestId, surface the name as the
-    // WorkloadName attribute, and never tag in place or adopt a retained name.
-    expect(handlerCode).toContain(
-      '_unique_workload_name(workload_prefix, event[\\"RequestId\\"])',
-    );
-    expect(handlerCode).toContain(
-      '\\"Data\\": {\\"WorkloadName\\": workload_name}',
-    );
-    expect(handlerCode).toContain(
-      "Refusing resource with missing or foreign ownership tags",
-    );
-    expect(handlerCode).not.toContain("_recover_untagged_workload");
-    expect(handlerCode).not.toContain("allow_untagged");
-    expect(handlerCode).not.toContain("client.tag_resource(");
-    expect(handlerCode).toContain("oauth2ProviderConfigInput=provider_config");
-    expect(handlerCode).toContain("tags=tags");
+    const role = Object.values(template.findResources("AWS::IAM::Role")).find((r: any) =>
+      r.Properties.RoleName === "AgenticAI-D03-nonprod-demo-primary-idprov") as any;
+    const statements = role.Properties.Policies.flatMap((p: any) => p.PolicyDocument.Statement);
+    expect(statements).toHaveLength(1);
+    expect(statements[0].Action).toBe("lambda:InvokeFunction");
+    expect(statements[0].Resource).toBe(`arn:aws:lambda:${REGION}:${NONPROD_ACCOUNT}:function:AgenticAI-D03-nonprod-demo-primary-idbroker:17`);
+    expect(JSON.stringify(statements[0].Condition)).toContain("lambda:SourceFunctionArn");
+    const custom = template.toJSON().Resources.InferenceCredProvider.Properties;
+    expect(Object.keys(custom).sort()).toEqual(["ServiceToken", "Region", "BrokerVersionArn", "BrokerConfigSha256"].sort());
+    expect(custom.BrokerConfigSha256).toBe("a".repeat(64));
+    const rendered = JSON.stringify(template.toJSON());
+    for (const forbidden of ["create_workload_identity", "tag_resource", "get_secret_value", "clientSecret", "oauth2ProviderConfigInput"])
+      expect(rendered).not.toContain(forbidden);
+    expect(rendered).toContain("ExecutedVersion");
+    expect(rendered).toContain("brokerOwnsCreatorReceipts");
   });
 
   it("generated-agent variant fails closed when its runtime config is absent", () => {
@@ -590,7 +462,7 @@ describe("Phase 23 — native Runtime and Memory resources", () => {
   });
 
   it("generated-agent variant fails closed on empty subscribedTools", () => {
-    const app = new App();
+    const app = new App({ context: brokerContext() });
     expect(
       () =>
         new D03WorkstreamRuntimeMemoryStack(app, "RuntimeMemory-empty-tools", {
@@ -602,6 +474,7 @@ describe("Phase 23 — native Runtime and Memory resources", () => {
           costCentre: "engineering",
           runtimeExecutionRoleArnOverride: `arn:aws:iam::${NONPROD_ACCOUNT}:role/AgenticAI-D03-nonprod-demo-primary-runtime`,
           agentImageVariant: "generated-agent",
+          identityProvisionerPermissionsBoundaryName: "Isolated-IdentityProvisionerBoundary",
           generatedAgentRuntimeConfig: {
             mcpGatewayUrl: `https://gw.gateway.bedrock-agentcore.${REGION}.amazonaws.com/mcp`,
             inferenceGatewayUrl: `https://inf.gateway.bedrock-agentcore.${REGION}.amazonaws.com/mcp`,
@@ -1078,6 +951,42 @@ describe("Phase 23 — fail-closed image scan preflight gate", () => {
 });
 
 describe("Phase 23 — prior-stage Runtime role", () => {
+  it("can pull the Runtime image from the selected isolated bootstrap repository", () => {
+    const app = new App();
+    const qualifier = "isolated26";
+    const props = {
+      env: { account: NONPROD_ACCOUNT, region: REGION },
+      envName: "nonprod" as const,
+      tenantId: "demo",
+      agentId: "primary",
+      applicationId: "demo",
+      costCentre: "engineering",
+    };
+    const rolesStack =
+      new D03WorkstreamRegistryRolesStack(app, "IsolatedRoles", {
+        ...props,
+        synthesizer: new DefaultStackSynthesizer({ qualifier }),
+        registryContext: gaContext("nonprod"),
+        enablePipelineRuntimeMemory: true,
+      });
+    const runtimeStack =
+      new D03WorkstreamRuntimeMemoryStack(app, "IsolatedRuntime", {
+        ...props,
+        synthesizer: new DefaultStackSynthesizer({ qualifier }),
+        runtimeExecutionRoleArnOverride: `arn:aws:iam::${NONPROD_ACCOUNT}:role/AgenticAI-D03-nonprod-demo-primary-runtime`,
+      });
+    const roles = Template.fromStack(rolesStack);
+    const runtime = Template.fromStack(runtimeStack);
+    const repository = `cdk-${qualifier}-container-assets-${NONPROD_ACCOUNT}-${REGION}`;
+    const statements = Object.values(roles.findResources("AWS::IAM::Policy"))
+      .flatMap((policy: any) => policy.Properties.PolicyDocument.Statement);
+    const pull = statements.find((statement: any) => statement.Sid === "PullAgentImage");
+    expect(pull.Resource).toBe(`arn:aws:ecr:${REGION}:${NONPROD_ACCOUNT}:repository/${repository}`);
+    expect(JSON.stringify(runtime.findResources("AWS::BedrockAgentCore::Runtime")))
+      .toContain(repository);
+    expect(pull.Resource).not.toContain("cdk-hnb659fds-");
+  });
+
   it("preserves the exact three-role R2 template while disabled", () => {
     const template = roleTemplate(false);
     template.resourceCountIs("AWS::IAM::Role", 3);
@@ -1451,5 +1360,55 @@ describe("Phase 23 — opt-in pipeline graph", () => {
           enablePipelineRuntimeMemory: true,
         }),
     ).toThrow(/requires GA Registry mode/);
+  });
+});
+
+
+describe("isolated immutable identity-broker handoff", () => {
+  function templates(envName: "nonprod" | "prod", override: Record<string, unknown> = {},
+                     boundary = "Isolated-IdentityProvisionerBoundary") {
+    const account = envName === "nonprod" ? NONPROD_ACCOUNT : PROD_ACCOUNT;
+    const app = new App({ context: { ...brokerContext(), ...override } });
+    return Template.fromStack(new D03WorkstreamRuntimeMemoryStack(app, "BrokerHandoff", {
+      env: { account, region: REGION }, envName, applicationId: "demo", tenantId: "demo", agentId: "primary",
+      costCentre: "engineering", agentImageVariant: "generated-agent",
+      identityProvisionerPermissionsBoundaryName: boundary,
+      generatedAgentRuntimeConfig: {
+        mcpGatewayUrl: `https://gw.gateway.bedrock-agentcore.${REGION}.amazonaws.com/mcp`,
+        inferenceGatewayUrl: `https://inf.gateway.bedrock-agentcore.${REGION}.amazonaws.com/mcp`,
+        inferenceScope: "scope/invoke", modelId: "model", guardrailId: `arn:aws:bedrock:${REGION}:${PLATFORM_ACCOUNT}:guardrail/example`,
+        subscribedTools: ["target-tool-echo___echo"],
+        m2mSecretArn: `arn:aws:secretsmanager:${REGION}:${PLATFORM_ACCOUNT}:secret:own-secret-abc`,
+      },
+    })).toJSON();
+  }
+  test.each(["nonprod", "prod"] as const)("retains exact published version and owned boundary in %s", (stage) => {
+    const t = templates(stage);
+    const account = stage === "nonprod" ? NONPROD_ACCOUNT : PROD_ACCOUNT;
+    const role = Object.values(t.Resources).find((r: any) => r.Properties?.RoleName?.endsWith("-idprov")) as any;
+    expect(JSON.stringify(role.Properties.PermissionsBoundary)).toContain(`:iam::${account}:policy/Isolated-IdentityProvisionerBoundary`);
+    const handler = Object.values(t.Resources).find((r: any) => r.Properties?.Handler === "index.on_event" && r.Properties?.FunctionName?.endsWith("-idprov")) as any;
+    expect(handler.Properties.FunctionName).toBe(`AgenticAI-D03-${stage}-demo-primary-idprov`);
+    expect(t.Resources.InferenceCredProvider.Properties.BrokerVersionArn).toBe(`arn:aws:lambda:${REGION}:${account}:function:AgenticAI-D03-${stage}-demo-primary-idbroker:17`);
+  });
+  test.each([
+    ["missing", undefined], ["alias", "PROD"], ["latest", "$LATEST"], ["zero", "0"],
+    ["cross-account", "17"], ["foreign-name", "17"],
+  ])("refuses %s broker bindings before native synthesis", (label, version) => {
+    const map = (brokerContext()["agenticai/identityProvisionerBrokerByAllocation"] as any);
+    const key = `${NONPROD_ACCOUNT}:${REGION}:nonprod:demo:primary`;
+    if (version === undefined) delete map[key];
+    else map[key].versionArn = `arn:aws:lambda:${REGION}:${label === "cross-account" ? PROD_ACCOUNT : NONPROD_ACCOUNT}:function:${label === "foreign-name" ? "Foreign" : "AgenticAI-D03-nonprod-demo-primary-idbroker"}:${version}`;
+    expect(() => templates("nonprod", { "agenticai/identityProvisionerBrokerByAllocation": map })).toThrow(/exact reviewed published version/);
+  });
+  test.each([
+    { "agenticai/bootstrapQualifier": "hnb659fds" },
+    { "agenticai/bootstrapQualifier": undefined },
+    { "agenticai/workloadRoleBoundaryName": "Foreign-RoleBoundary" },
+  ])("refuses an unreviewed source boundary %j", (override) => {
+    expect(() => templates("nonprod", override)).toThrow(/reviewed owned provisioner boundary/);
+  });
+  test("refuses a missing source boundary", () => {
+    expect(() => templates("nonprod", {}, "")).toThrow(/reviewed owned provisioner boundary/);
   });
 });

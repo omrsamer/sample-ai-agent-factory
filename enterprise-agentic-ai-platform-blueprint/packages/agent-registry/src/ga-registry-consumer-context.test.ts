@@ -6,6 +6,7 @@
  */
 import {
   GA_REGISTRY_CONSUMER_CONTEXT_SCHEMA,
+  GA_REGISTRY_ARCHIVE_CONTEXT_SCHEMA,
   parseGaRegistryConsumerContext,
 } from "./ga-registry-consumer-context";
 
@@ -75,6 +76,25 @@ function clone<T>(value: T): T {
 }
 
 describe("parseGaRegistryConsumerContext", () => {
+  it("accepts explicitly typed immutable archive provenance without pretending it is Git", () => {
+    const context = validContext();
+    const sha256 = "b".repeat(64);
+    context.schemaVersion = GA_REGISTRY_ARCHIVE_CONTEXT_SCHEMA;
+    context.sourceRevision = `s3-sha256:${sha256}`;
+    context.sourceArchive = {
+      bucketName: "reviewed-source-bucket", objectKey: `sources/${sha256}.zip`,
+      versionId: "immutable-version", sha256, ownerAccountId: PLATFORM,
+    };
+    expect(parseGaRegistryConsumerContext(context, EXPECTATION).sourceArchive).toEqual(context.sourceArchive);
+    for (const change of [
+      { versionId: "null" }, { sha256: "a".repeat(64) }, { objectKey: "mutable.zip" },
+      { ownerAccountId: "*" }, { unreviewed: true },
+    ]) {
+      const tampered = clone(context);
+      Object.assign(tampered.sourceArchive, change);
+      expect(() => parseGaRegistryConsumerContext(tampered, EXPECTATION)).toThrow();
+    }
+  });
   it("accepts a sorted, exact, template-bound context", () => {
     const parsed = parseGaRegistryConsumerContext(validContext(), EXPECTATION);
     expect(parsed.records.map((record) => record.document.toolId)).toEqual([

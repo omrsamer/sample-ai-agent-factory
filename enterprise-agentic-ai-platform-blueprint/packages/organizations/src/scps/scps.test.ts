@@ -18,6 +18,10 @@ import {
   allowedModelArns,
   PLATFORM_APPROVED_REGIONS,
 } from "@agenticai/platform-baselines";
+import {
+  authorityFixture,
+  fixtureRoles,
+} from "../../../../tests/fixtures/protected-authority";
 
 const PLATFORM_GUARDRAIL_ADMIN_ROLE_ARN =
   "arn:aws:iam::111111111111:role/AgenticAI-GuardrailAdmin";
@@ -52,6 +56,10 @@ function renderFullSet() {
     platformAccountId: PLATFORM_ACCOUNT_ID,
     gatewayAdminWorkloadAccountIds: WORKLOAD_ACCOUNT_IDS,
     allowedToolTargetArns: ALLOWED_TOOL_TARGET_ARNS,
+    protectedAuthorityManifest: authorityFixture({
+      gatewayAdminAccountIds: WORKLOAD_ACCOUNT_IDS,
+      registryAccountIds: [PLATFORM_ACCOUNT_ID],
+    }),
   });
 }
 
@@ -111,6 +119,10 @@ describe("buildScpSet", () => {
       allowedToolTargetArns: ALLOWED_TOOL_TARGET_ARNS,
       enableRegistryLockdown: true,
       enableDeveloperPlatformTagDeny: true,
+      protectedAuthorityManifest: authorityFixture({
+        gatewayAdminAccountIds: WORKLOAD_ACCOUNT_IDS,
+        registryAccountIds: [PLATFORM_ACCOUNT_ID],
+      }),
     });
     expect(set).toHaveLength(12);
     expect(set.length).toBeGreaterThan(SCP_MAX_ATTACHED_PER_TARGET - 1);
@@ -238,18 +250,40 @@ describe("SCP-02 enforce Guardrail", () => {
     expect(scp02.bodyJson).not.toContain("ForAllValues");
   });
 
-  it("denies direct Bedrock Mantle inference to everyone except the Platform inference Gateway role", () => {
+  it("denies direct Mantle inference without an approved authority inventory", () => {
     // Mantle has no guardrail condition key; guardrails on that path are
     // enforced only by the Platform Gateway's interceptor (2026-09-25).
     const parsed = renderSet()[1].body as any;
-    const mantle = parsed.Statement.find((s: any) => s.Sid === "DenyDirectMantleInference");
+    const mantle = parsed.Statement.find((s: any) => s.Sid.startsWith("DenyDirectMantleInference"));
     expect(mantle.Action).toEqual(["bedrock-mantle:CreateInference"]);
-    expect(mantle.Resource).toBe("*");
-    expect(mantle.Condition.ArnNotLike["aws:PrincipalArn"]).toEqual([
-      "arn:aws:iam::*:role/AgenticAI-InferenceGateway-*",
-      "arn:aws:sts::*:assumed-role/AgenticAI-InferenceGateway-*/*",
-    ]);
+    expect([mantle.Resource].flat()).toEqual(["*"]);
+    expect(mantle.Condition.ArnNotLike).toBeUndefined();
+    expect(mantle.Condition.ArnNotEquals).toBeUndefined();
     expect(mantle.Condition.BoolIfExists["aws:PrincipalIsAWSService"]).toBe("false");
+  });
+
+  it("binds configured Mantle exceptions independently to exact role ARNs and immutable entities", () => {
+    const manifest = authorityFixture();
+    const scp02 = buildScpSet({
+      allowedModelArns: allowedModelArns("us-west-2"),
+      approvedRegions: PLATFORM_APPROVED_REGIONS,
+      platformGuardrailAdminRoleArn: PLATFORM_GUARDRAIL_ADMIN_ROLE_ARN,
+      protectedAuthorityManifest: manifest,
+    })[1];
+    const gates = (scp02.body as any).Statement.filter(
+      (statement: any) => statement.Action.includes("bedrock-mantle:CreateInference"),
+    );
+    expect(gates).toHaveLength(2);
+    expect(gates.find((statement: any) => statement.Condition.ArnNotEquals)
+      .Condition.ArnNotEquals["aws:PrincipalArn"])
+      .toEqual(fixtureRoles("mantle", manifest).map((role) => role.arn).sort());
+    expect(gates.find((statement: any) => statement.Condition.StringNotLike)
+      .Condition.StringNotLike["aws:userid"])
+      .toEqual(fixtureRoles("mantle", manifest).map((role) => `${role.roleId}:*`).sort());
+    expect(gates.every((statement: any) =>
+      !(statement.Condition.ArnNotEquals && statement.Condition.StringNotLike),
+    )).toBe(true);
+    expect(scp02.bodyJson).not.toContain("arn:aws:iam::*:role/AgenticAI-InferenceGateway-");
   });
 
   it("rejects approved guardrail ids that are not unversioned guardrail ARNs", () => {
@@ -322,6 +356,34 @@ describe("SCP-05 Guardrail modification restriction", () => {
         platformGuardrailAdminRoleArn: "not-an-arn",
       }),
     ).toThrow(/full IAM role ARN/);
+  });
+
+  it("rejects a wildcard in the configured admin ARN", () => {
+    expect(() =>
+      buildScpSet({
+        allowedModelArns: allowedModelArns("us-west-2"),
+        approvedRegions: PLATFORM_APPROVED_REGIONS,
+        platformGuardrailAdminRoleArn:
+          "arn:aws:iam::111111111111:role/AgenticAI-GuardrailAdmin*",
+      }),
+    ).toThrow(/parseable role ARN/);
+  });
+
+  it("refuses a manifest whose exact configured admin lacks guardrail-admin authority", () => {
+    const manifest = authorityFixture();
+    const roles = manifest.roles.map((role) =>
+      role.id === "central-owner"
+        ? { ...role, purposes: ["controller" as const] }
+        : role,
+    );
+    expect(() =>
+      buildScpSet({
+        allowedModelArns: allowedModelArns("us-west-2"),
+        approvedRegions: PLATFORM_APPROVED_REGIONS,
+        platformGuardrailAdminRoleArn: PLATFORM_GUARDRAIL_ADMIN_ROLE_ARN,
+        protectedAuthorityManifest: { ...manifest, roles },
+      }),
+    ).toThrow(/one exact guardrail-admin identity/);
   });
 });
 
@@ -404,22 +466,29 @@ describe("SCP-09 gateway mutation lockdown", () => {
     return scp09!;
   }
 
-  it("emits Deny with ArnNotLike on both role-ARN forms", () => {
+  it("emits separate exact ARN and immutable RoleId denies for Gateway mutation", () => {
     const parsed = getScp09().body as any;
-    const stmt = parsed.Statement[0];
+    const stmt = parsed.Statement.find((statement: any) =>
+      statement.Action.includes("bedrock-agentcore:UpdateGateway") &&
+      statement.Condition.ArnNotEquals,
+    );
     expect(stmt.Effect).toBe("Deny");
-    expect(stmt.Condition.ArnNotLike).toBeDefined();
-    const arns: string[] = stmt.Condition.ArnNotLike["aws:PrincipalArn"];
-    expect(arns).toEqual([
-      ...WORKLOAD_ACCOUNT_IDS.map(
-        (accountId) =>
-          `arn:aws:iam::${accountId}:role/AgenticAI-D03-*-GatewayAdmin`,
-      ),
-      ...WORKLOAD_ACCOUNT_IDS.map(
-        (accountId) =>
-          `arn:aws:sts::${accountId}:assumed-role/AgenticAI-D03-*-GatewayAdmin/*`,
-      ),
-    ]);
+    expect(stmt.Condition.ArnNotLike).toBeUndefined();
+    const roles = fixtureRoles("gateway-admin").filter((role) =>
+      WORKLOAD_ACCOUNT_IDS.includes(role.arn.split(":")[4]),
+    );
+    expect(stmt.Condition.ArnNotEquals["aws:PrincipalArn"])
+      .toEqual(roles.map((role) => role.arn).sort());
+    const entity = parsed.Statement.find((statement: any) =>
+      statement.Action.includes("bedrock-agentcore:UpdateGateway") &&
+      statement.Condition.StringNotLike,
+    );
+    expect(entity.Condition.StringNotLike["aws:userid"])
+      .toEqual(roles.map((role) => `${role.roleId}:*`).sort());
+    expect(stmt.Condition.StringNotLike).toBeUndefined();
+    expect(entity.Condition.ArnNotEquals).toBeUndefined();
+    expect(getScp09().bodyJson).not.toContain("AgenticAI-D03-*-GatewayAdmin");
+    expect(getScp09().bodyJson).not.toContain("arn:aws:sts:");
   });
 
   it("includes PrincipalIsAWSService=false guard", () => {
@@ -445,13 +514,26 @@ describe("SCP-09 gateway mutation lockdown", () => {
 
   it("scopes mutations to arn:aws:bedrock-agentcore:*:*:gateway/* and creation to '*' (creates have no ARN yet)", () => {
     const parsed = getScp09().body as any;
-    expect(parsed.Statement[0].Resource).toBe(
-      "arn:aws:bedrock-agentcore:*:*:gateway/*",
+    const mutations = parsed.Statement.filter((statement: any) =>
+      statement.Action.includes("bedrock-agentcore:UpdateGateway"),
     );
-    expect(parsed.Statement[0].Action).not.toContain("bedrock-agentcore:CreateGateway");
-    expect(parsed.Statement[1].Action).toEqual(["bedrock-agentcore:CreateGateway"]);
-    expect(parsed.Statement[1].Resource).toBe("*");
-    expect(parsed.Statement[1].Condition).toEqual(parsed.Statement[0].Condition);
+    const creations = parsed.Statement.filter((statement: any) =>
+      statement.Action.includes("bedrock-agentcore:CreateGateway"),
+    );
+    expect(mutations).toHaveLength(2);
+    expect(creations).toHaveLength(2);
+    for (const mutation of mutations) {
+      expect([mutation.Resource].flat()).toEqual([
+        "arn:aws:bedrock-agentcore:*:*:gateway/*",
+      ]);
+      expect(mutation.Action).not.toContain("bedrock-agentcore:CreateGateway");
+    }
+    for (const creation of creations) {
+      expect(creation.Action).toEqual(["bedrock-agentcore:CreateGateway"]);
+      expect([creation.Resource].flat()).toEqual(["*"]);
+    }
+    expect(creations.map((statement: any) => statement.Condition))
+      .toEqual(mutations.map((statement: any) => statement.Condition));
   });
 
   it("body stays under the 5000-char soft limit", () => {
@@ -477,6 +559,15 @@ describe("SCP-09 gateway mutation lockdown", () => {
         gatewayAdminWorkloadAccountIds: ["not-an-account-id"],
       }),
     ).toThrow(/12-digit/);
+  });
+
+  it("refuses a requested Gateway exception without protected authority evidence", () => {
+    expect(() => buildScpSet({
+      allowedModelArns: allowedModelArns("us-west-2"),
+      approvedRegions: PLATFORM_APPROVED_REGIONS,
+      platformGuardrailAdminRoleArn: PLATFORM_GUARDRAIL_ADMIN_ROLE_ARN,
+      gatewayAdminWorkloadAccountIds: WORKLOAD_ACCOUNT_IDS,
+    })).toThrow(/protectedAuthorityManifest/i);
   });
 });
 
@@ -551,33 +642,36 @@ describe("SCP-11 registry mutation lockdown", () => {
       platformAccountId: PLATFORM_ACCOUNT_ID,
       allowedToolTargetArns: ALLOWED_TOOL_TARGET_ARNS,
       enableRegistryLockdown: true,
+      protectedAuthorityManifest: authorityFixture(),
     });
     const scp11 = set.find((s) => s.id === "scp-11");
     expect(scp11).toBeDefined();
     return scp11!;
   }
 
-  it("emits Deny with ArnNotLike on both RegistryAdmin role-ARN forms", () => {
+  it("emits exact entity-bound Registry authority exceptions", () => {
     const parsed = getScp11().body as any;
-    const stmt = parsed.Statement[0];
-    expect(stmt.Effect).toBe("Deny");
-    const arns: string[] = stmt.Condition.ArnNotLike["aws:PrincipalArn"];
-    expect(arns).toEqual(
-      expect.arrayContaining([
-        `arn:aws:iam::${PLATFORM_ACCOUNT_ID}:role/AgenticAI-RegistryAdmin`,
-        `arn:aws:sts::${PLATFORM_ACCOUNT_ID}:assumed-role/AgenticAI-RegistryAdmin/*`,
-      ]),
+    const stmt = parsed.Statement.find((statement: any) =>
+      statement.Condition.ArnNotEquals,
     );
+    expect(stmt.Effect).toBe("Deny");
+    const roles = fixtureRoles("registry").filter((role) =>
+      role.arn.split(":")[4] === PLATFORM_ACCOUNT_ID,
+    );
+    expect(stmt.Condition.ArnNotEquals["aws:PrincipalArn"])
+      .toEqual(roles.map((role) => role.arn).sort());
+    const entity = parsed.Statement.find((statement: any) =>
+      statement.Condition.StringNotLike,
+    );
+    expect(entity.Condition.StringNotLike["aws:userid"])
+      .toEqual(roles.map((role) => `${role.roleId}:*`).sort());
+    expect(stmt.Condition.StringNotLike).toBeUndefined();
+    expect(entity.Condition.ArnNotEquals).toBeUndefined();
   });
 
-  it("exempts the Platform pipeline's CloudFormation execution role (it deploys the GA Registry)", () => {
-    const arns: string[] = (getScp11().body as any).Statement[0].Condition.ArnNotLike["aws:PrincipalArn"];
-    expect(arns).toEqual(
-      expect.arrayContaining([
-        `arn:aws:iam::${PLATFORM_ACCOUNT_ID}:role/cdk-*-cfn-exec-role-${PLATFORM_ACCOUNT_ID}-*`,
-        `arn:aws:sts::${PLATFORM_ACCOUNT_ID}:assumed-role/cdk-*-cfn-exec-role-${PLATFORM_ACCOUNT_ID}-*/*`,
-      ]),
-    );
+  it("does not emit mutable account or bootstrap-role name patterns", () => {
+    expect(getScp11().bodyJson).not.toContain("cdk-*-cfn-exec-role-");
+    expect(getScp11().bodyJson).not.toContain("arn:aws:sts:");
   });
 
   it("denies registry-level mutations in BOTH the GA agent-registry and the AgentCore namespaces", () => {
@@ -585,7 +679,7 @@ describe("SCP-11 registry mutation lockdown", () => {
     // so a bedrock-agentcore-only SCP governed nothing that was deployed.
     const parsed = getScp11().body as any;
     const actions: string[] = parsed.Statement.flatMap((s: any) => s.Action);
-    expect([...actions].sort()).toEqual([
+    expect([...new Set(actions)].sort()).toEqual([
       "agent-registry:CreateRegistry",
       "agent-registry:DeleteRegistry",
       "agent-registry:UpdateRegistry",
@@ -610,16 +704,22 @@ describe("SCP-11 registry mutation lockdown", () => {
 
   it("scopes mutations to both Registry ARN families and creation to '*' (creates have no ARN yet)", () => {
     const parsed = getScp11().body as any;
-    expect(parsed.Statement[0].Resource).toEqual([
+    const mutation = parsed.Statement.find((statement: any) =>
+      statement.Action.includes("agent-registry:UpdateRegistry"),
+    );
+    const creation = parsed.Statement.find((statement: any) =>
+      statement.Action.includes("agent-registry:CreateRegistry"),
+    );
+    expect(mutation.Resource).toEqual([
       "arn:aws:agent-registry:*:*:registry/*",
       "arn:aws:bedrock-agentcore:*:*:registry/*",
     ]);
-    expect(parsed.Statement[1].Action).toEqual([
+    expect(creation.Action).toEqual([
       "agent-registry:CreateRegistry",
       "bedrock-agentcore:CreateRegistry",
     ]);
-    expect(parsed.Statement[1].Resource).toBe("*");
-    expect(parsed.Statement[1].Condition).toEqual(parsed.Statement[0].Condition);
+    expect([creation.Resource].flat()).toEqual(["*"]);
+    expect(creation.Condition).toEqual(mutation.Condition);
   });
 
   it("includes PrincipalIsAWSService=false guard", () => {
@@ -629,18 +729,13 @@ describe("SCP-11 registry mutation lockdown", () => {
     ).toBe("false");
   });
 
-  it("skipped (with warning) when enableRegistryLockdown=true but platformAccountId is omitted", () => {
-    warnSpy.mockClear();
-    const set = buildScpSet({
+  it("refuses enabled Registry lockdown when platformAccountId is omitted", () => {
+    expect(() => buildScpSet({
       allowedModelArns: allowedModelArns("us-west-2"),
       approvedRegions: PLATFORM_APPROVED_REGIONS,
       platformGuardrailAdminRoleArn: PLATFORM_GUARDRAIL_ADMIN_ROLE_ARN,
       enableRegistryLockdown: true,
-    });
-    expect(set.find((s) => s.id === "scp-11")).toBeUndefined();
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("TODO-PLATFORM-ACCOUNT-ID"),
-    );
+    })).toThrow(/platformAccountId/);
   });
 
   it("not emitted when enableRegistryLockdown is unset", () => {
@@ -733,6 +828,7 @@ describe("SCP-13 CloudWatch Omni telemetry lockdown (ADR-15)", () => {
       approvedAgentCoreVpceIds: AGENTCORE_VPCE_IDS,
       approvedBedrockVpceIds: BEDROCK_VPCE_IDS,
       enableOmniTelemetryLockdown: true,
+      protectedAuthorityManifest: authorityFixture(),
       ...extra,
     });
   }
@@ -754,30 +850,31 @@ describe("SCP-13 CloudWatch Omni telemetry lockdown (ADR-15)", () => {
     expect(domain.Condition.BoolIfExists["aws:PrincipalIsAWSService"]).toBe("false");
   });
 
-  it("exempts the pipeline role in both the role and assumed-role forms across accounts, plus named break-glass roles", () => {
-    const set = renderWithOmni({ omniBreakGlassRoleNames: ["AgenticAI-ObservabilityAdmin"] });
+  it("binds telemetry authority to exact reviewed ARNs and entities without name-based break glass", () => {
+    const set = renderWithOmni();
     for (const sid of [
       "DenyOmniSpaceLifecycleExceptPipeline",
       "DenyTransactionSearchTamperingExceptPipeline",
       "DenyRuntimeDeliveryTamperingExceptPipeline",
     ]) {
-      const st = statementsOf(set).find((s) => s.Sid === sid);
+      const matches = statementsOf(set).filter((statement) => statement.Sid.startsWith(sid));
+      const st = matches.find((statement) => statement.Condition.ArnNotEquals);
+      const entity = matches.find((statement) => statement.Condition.StringNotLike);
       expect(st.Effect).toBe("Deny");
-      expect(st.Condition.ArnNotLike["aws:PrincipalArn"]).toEqual(
-        expect.arrayContaining([
-          "arn:aws:iam::*:role/cdk-*-cfn-exec-role-*",
-          "arn:aws:sts::*:assumed-role/cdk-*-cfn-exec-role-*/*",
-          "arn:aws:iam::*:role/AgenticAI-ObservabilityAdmin",
-          "arn:aws:sts::*:assumed-role/AgenticAI-ObservabilityAdmin/*",
-        ]),
-      );
+      expect(st.Condition.ArnNotEquals["aws:PrincipalArn"])
+        .toEqual(fixtureRoles("telemetry").map((role) => role.arn).sort());
+      expect(entity.Condition.StringNotLike["aws:userid"])
+        .toEqual(fixtureRoles("telemetry").map((role) => `${role.roleId}:*`).sort());
+      expect(st.Condition.StringNotLike).toBeUndefined();
+      expect(entity.Condition.ArnNotEquals).toBeUndefined();
       expect(st.Condition.BoolIfExists["aws:PrincipalIsAWSService"]).toBe("false");
     }
+    expect(JSON.stringify(statementsOf(set))).not.toContain("arn:aws:iam::*:");
   });
 
   it("closes every switch that starves the hub: space lifecycle, Transaction Search, Runtime deliveries", () => {
     const st = statementsOf(renderWithOmni());
-    const actions = (sid: string) => st.find((s) => s.Sid === sid).Action as string[];
+    const actions = (sid: string) => st.find((s) => s.Sid.startsWith(sid)).Action as string[];
     expect(actions("DenyOmniSpaceLifecycleExceptPipeline")).toEqual(
       expect.arrayContaining(["cloudwatch:CreateSpace", "cloudwatch:DeleteSpace", "cloudwatch:CreateAccessGrant", "cloudwatch:DeleteAccessGrant"]),
     );
@@ -795,8 +892,21 @@ describe("SCP-13 CloudWatch Omni telemetry lockdown (ADR-15)", () => {
     expect(all).not.toContain("logs:PutLogEvents");
   });
 
-  it("rejects a malformed role pattern and an empty pipeline list", () => {
-    expect(() => renderWithOmni({ omniPipelineRoleNamePatterns: ["bad name/with slash"] })).toThrow(/not a valid IAM role name pattern/);
-    expect(() => renderWithOmni({ omniPipelineRoleNamePatterns: [] })).toThrow(/at least one pipeline role-name pattern/);
+  it("rejects legacy pipeline and break-glass name inputs instead of rendering name exemptions", () => {
+    expect(() => renderWithOmni({
+      omniPipelineRoleNamePatterns: ["cdk-*-cfn-exec-role-*"],
+    })).toThrow(/protectedAuthorityManifest|role.name|pattern/i);
+    expect(() => renderWithOmni({
+      omniBreakGlassRoleNames: ["AgenticAI-ObservabilityAdmin"],
+    })).toThrow(/protectedAuthorityManifest|role.name|break.glass/i);
+    expect(() => renderWithOmni({
+      omniPipelineRoleNamePatterns: [],
+    })).toThrow(/protectedAuthorityManifest|role.name|pattern/i);
+  });
+
+  it("refuses telemetry authority without an approved manifest", () => {
+    expect(() => renderWithOmni({
+      protectedAuthorityManifest: undefined,
+    })).toThrow(/protectedAuthorityManifest/i);
   });
 });

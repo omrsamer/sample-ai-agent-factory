@@ -111,17 +111,26 @@ class FakeControl:
         return {"tags": dict(self.provider["tags"])}
 
     def tag_resource(self, resourceArn, tags):
-        self.calls.append("tag_in_place")
-        raise _err("InternalServerErrorException", "Internal server error", 500)
+        if "/workload-identity/" in resourceArn:
+            self.calls.append("tag_in_place")
+            raise _err("InternalServerErrorException", "Internal server error", 500)
+        assert resourceArn == PR_ARN
+        self.calls.append("tag_provider")
+        self.provider["tags"] = dict(tags)
+        return {}
 
     # -- credential provider -------------------------------------------
-    def create_oauth2_credential_provider(self, name, credentialProviderVendor, oauth2ProviderConfigInput, tags):
+    def create_oauth2_credential_provider(self, name, credentialProviderVendor, oauth2ProviderConfigInput, **kwargs):
         self.calls.append("create_provider")
+        assert "tags" not in kwargs
         assert credentialProviderVendor == "CognitoOauth2"
         if self.provider is not None:
             raise _err("ConflictException", "exists", 409)
-        self.provider = {"tags": dict(tags), "status": "READY"}
-        return {"name": name, "credentialProviderArn": PR_ARN}
+        self.provider = {"tags": {}, "status": "READY", "secretArn":
+                         "arn:aws:secretsmanager:us-west-2:444444444444:secret:bedrock-agentcore-identity!default/oauth2/P-random"}
+        return {"name": name, "credentialProviderArn": PR_ARN,
+                "clientSecretArn": {"secretArn": self.provider["secretArn"]},
+                "ResponseMetadata": {"RequestId": "create-proof", "HTTPStatusCode": 201}}
 
     def update_oauth2_credential_provider(self, name, credentialProviderVendor, oauth2ProviderConfigInput):
         self.calls.append("update_provider")
@@ -135,7 +144,8 @@ class FakeControl:
     def get_oauth2_credential_provider(self, name):
         if self.provider is None:
             raise _err("ResourceNotFoundException", "nf", 404)
-        return {"name": name, "credentialProviderArn": PR_ARN, "status": self.provider["status"]}
+        return {"name": name, "credentialProviderArn": PR_ARN, "status": self.provider["status"],
+                "clientSecretArn": {"secretArn": self.provider["secretArn"]}}
 
 
 class FakeSecrets:
@@ -182,7 +192,7 @@ def _event(request_type: str, physical_id: str | None = None, request_id: str = 
 
 def _run(monkeypatch, handler, fake: FakeControl, event: dict):
     monkeypatch.setattr(
-        boto3, "client", lambda svc, region_name=None: fake if svc == "bedrock-agentcore-control" else FakeSecrets()
+        boto3, "client", lambda svc, region_name=None, config=None: fake if svc == "bedrock-agentcore-control" else FakeSecrets()
     )
     return handler.on_event(event, None)
 
@@ -324,3 +334,84 @@ def test_failed_provider_step_on_update_keeps_reused_identity(monkeypatch, handl
         _run(monkeypatch, handler, fake, _event("Update", physical_id=created["PhysicalResourceId"]))
     assert not any(c.startswith("delete_wl") for c in fake.calls)
     assert EXPECTED_NAME in fake.identities
+
+
+def test_provider_create_then_exact_child_tag(monkeypatch, handler):
+    fake = FakeControl()
+    _run(monkeypatch, handler, fake, _event("Create"))
+    assert fake.calls.index("create_provider") < fake.calls.index("tag_provider")
+    assert fake.provider["tags"] == TAGS
+    assert handler._SDK_CONFIG.retries["total_max_attempts"] == 1
+
+
+def test_known_untagged_creation_is_compensated_after_tag_denial(monkeypatch, handler):
+    fake = FakeControl()
+    def deny_tag(**kwargs):
+        assert kwargs["resourceArn"] == PR_ARN
+        fake.calls.append("tag_provider_denied")
+        raise _err("AccessDeniedException", "child tag denied", 403)
+    fake.tag_resource = deny_tag
+    with pytest.raises(ClientError, match="child tag denied"):
+        _run(monkeypatch, handler, fake, _event("Create"))
+    assert fake.calls.count("create_provider") == 1
+    assert fake.calls.index("tag_provider_denied") < fake.calls.index("delete_provider")
+    assert fake.provider is None and EXPECTED_NAME not in fake.identities
+
+
+def test_create_response_loss_never_adopts_tags_or_deletes_provider(monkeypatch, handler):
+    fake = FakeControl()
+    create = fake.create_oauth2_credential_provider
+    def lose_response(**kwargs):
+        create(**kwargs)
+        raise TimeoutError("ambiguous create")
+    fake.create_oauth2_credential_provider = lose_response
+    with pytest.raises(TimeoutError, match="ambiguous create"):
+        _run(monkeypatch, handler, fake, _event("Create"))
+    assert fake.calls.count("create_provider") == 1
+    assert "tag_provider" not in fake.calls and "delete_provider" not in fake.calls
+    assert fake.provider["tags"] == {}
+    # A retry/conflict cannot adopt the untagged provider either.
+    with pytest.raises(RuntimeError, match="missing or foreign ownership tags"):
+        _run(monkeypatch, handler, fake,
+             _event("Create", request_id="11111111-2222-3333-4444-555555555555"))
+    assert "tag_provider" not in fake.calls and "delete_provider" not in fake.calls
+
+
+@pytest.mark.parametrize("field,value", [
+    ("credentialProviderArn", PR_ARN + "-foreign"),
+    ("name", "foreign"),
+    ("clientSecretArn", {"secretArn": "arn:aws:secretsmanager:us-west-2:444444444444:secret:foreign"}),
+    ("ResponseMetadata", {"RequestId": "create-proof", "HTTPStatusCode": 200}),
+])
+def test_unproven_create_response_cannot_tag_or_delete(monkeypatch, handler, field, value):
+    fake = FakeControl()
+    create = fake.create_oauth2_credential_provider
+    def altered(**kwargs):
+        return {**create(**kwargs), field: value}
+    fake.create_oauth2_credential_provider = altered
+    with pytest.raises(RuntimeError, match="Create response did not prove"):
+        _run(monkeypatch, handler, fake, _event("Create"))
+    assert "tag_provider" not in fake.calls and "delete_provider" not in fake.calls
+
+
+def test_foreign_tags_after_creation_prevent_compensation(monkeypatch, handler):
+    fake = FakeControl()
+    def changed(**kwargs):
+        fake.provider["tags"] = {"owner": "another-actor"}
+        raise _err("AccessDeniedException", "tag rejected")
+    fake.tag_resource = changed
+    with pytest.raises(RuntimeError, match="read-only reconciliation"):
+        _run(monkeypatch, handler, fake, _event("Create"))
+    assert "delete_provider" not in fake.calls
+    assert fake.provider["tags"] == {"owner": "another-actor"}
+
+
+def test_changed_secret_after_creation_prevents_compensation(monkeypatch, handler):
+    fake = FakeControl()
+    def changed(**kwargs):
+        fake.provider["secretArn"] += "-changed"
+        raise _err("AccessDeniedException", "tag rejected")
+    fake.tag_resource = changed
+    with pytest.raises(RuntimeError, match="read-only reconciliation"):
+        _run(monkeypatch, handler, fake, _event("Create"))
+    assert "delete_provider" not in fake.calls

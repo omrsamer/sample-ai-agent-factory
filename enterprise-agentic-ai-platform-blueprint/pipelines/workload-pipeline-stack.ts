@@ -32,6 +32,7 @@
 import {
   Duration,
   Environment,
+  PermissionsBoundary,
   Stack,
   StackProps,
   Stage,
@@ -43,11 +44,10 @@ import {
   LinuxArmBuildImage,
   LinuxBuildImage,
 } from "aws-cdk-lib/aws-codebuild";
-import { PolicyStatement, Role, ServicePrincipal } from "aws-cdk-lib/aws-iam";
+import { CfnRole, ManagedPolicy, PermissionsBoundary as RolePermissionsBoundary, PolicyDocument, PolicyStatement, Role, ServicePrincipal } from "aws-cdk-lib/aws-iam";
 import {
   CodeBuildStep,
   CodePipeline,
-  CodePipelineSource,
   ManualApprovalStep,
   ShellStep,
   Step,
@@ -78,6 +78,12 @@ import {
   stageAwareSynthCommands,
 } from "./synth-commands";
 import { WorkstreamObservabilityStack } from "./workstream-observability-stack";
+import {
+  createPipelineSource,
+  pipelineSourceContext,
+  type PipelineSourceProps,
+} from "./pipeline-source";
+import { preserveArtifactCleanupPhysicalId } from "./artifact-cleanup-provider";
 
 export interface WorkloadGaRegistryConfig {
   readonly nonprod: GaRegistryConsumerContext;
@@ -93,6 +99,8 @@ export interface WorkloadPolicyEngineConfig {
 }
 
 export interface WorkloadStageProps extends StageProps {
+  /** Optional owned boundary applied only to the generated-agent identity provisioner. */
+  readonly identityProvisionerPermissionsBoundaryName?: string;
   readonly envName: "nonprod" | "prod";
   readonly tenantId: string;
   readonly agentId: string;
@@ -186,6 +194,7 @@ export class WorkloadDeploymentStage extends Stage {
               props.agentImageVariant === "generated-agent"
                 ? this.buildGeneratedAgentRuntimeConfig(props)
                 : undefined,
+            identityProvisionerPermissionsBoundaryName: props.identityProvisionerPermissionsBoundaryName,
             evaluationInvokerPrincipalArn: props.evaluationInvokerPrincipalArn,
             telemetry: props.runtimeTelemetry,
           },
@@ -411,10 +420,11 @@ export class WorkstreamRegistryRolesStage extends Stage {
   }
 }
 
-export interface WorkloadPipelineStackProps extends StackProps {
-  readonly githubRepo: string;
-  readonly githubBranch?: string;
-  readonly githubConnectionArn: string;
+export interface WorkloadPipelineStackProps extends StackProps, PipelineSourceProps {
+  /** Separate immutable application boundary for nested deployment stages. */
+  readonly workloadPermissionsBoundaryName?: string;
+  /** Optional owned identity-provisioner boundary; every other workload role keeps the default. */
+  readonly identityProvisionerPermissionsBoundaryName?: string;
   readonly tenantId: string;
   readonly agentId: string;
   readonly applicationId?: string;
@@ -534,6 +544,14 @@ export interface WorkloadPipelineStackProps extends StackProps {
    * remains intentionally fail-closed until a real traffic-shift API is wired,
    */
   readonly canaryDeployCommands?: readonly string[];
+  /** Real weighted Lambda alias; each published router pins an AgentCore endpoint. */
+  readonly runtimeCanary?: {
+    readonly aliasArn: string;
+    readonly baselineVersion: string;
+    readonly candidateVersion: string;
+    readonly routingRoleArn: string;
+    readonly alarmName?: string;
+  };
 }
 
 function shellQuote(value: string): string {
@@ -547,6 +565,8 @@ function registryResolverCommand(
   tenantId: string,
   agentId: string,
   costCentre: string,
+  s3Source?: PipelineSourceProps["s3Source"],
+  sourceOwner?: string,
 ): string {
   const expectedTools = context.records
     .map((record) => record.document.toolId)
@@ -566,6 +586,13 @@ function registryResolverCommand(
     `--cost-centre ${shellQuote(costCentre)}`,
     expectedTools,
     '--source-revision "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}"',
+    ...(s3Source ? [
+      `--source-bucket ${shellQuote(s3Source.bucketName)}`,
+      `--source-key ${shellQuote(s3Source.objectKey)}`,
+      `--source-sha256 ${shellQuote(s3Source.objectKey.split("/").pop()!.slice(0, -4))}`,
+      `--source-owner ${shellQuote(sourceOwner!)}`,
+      '--source-checkout "$CODEBUILD_SRC_DIR"',
+    ] : []),
     `--output "$${outputVariable}"`,
   ].join(" ");
   return (
@@ -581,6 +608,8 @@ function registryResolverCommands(
   tenantId: string,
   agentId: string,
   costCentre: string,
+  s3Source?: PipelineSourceProps["s3Source"],
+  sourceOwner?: string,
 ): {
   readonly commands: readonly string[];
   readonly contextFromEnvironment: Readonly<Record<string, string>>;
@@ -608,6 +637,8 @@ function registryResolverCommands(
         tenantId,
         agentId,
         costCentre,
+        s3Source,
+        sourceOwner,
       ),
       registryResolverCommand(
         config.prod,
@@ -616,6 +647,8 @@ function registryResolverCommands(
         tenantId,
         agentId,
         costCentre,
+        s3Source,
+        sourceOwner,
       ),
     ],
     contextFromEnvironment: {
@@ -667,6 +700,32 @@ export class WorkloadPipelineStack extends Stack {
 
     const applicationId = props.applicationId ?? props.tenantId;
     if (props.gaRegistry) {
+      if (props.s3Source) {
+        if (!/^sources\/[0-9a-f]{64}\.zip$/.test(props.s3Source.objectKey) ||
+            !props.env?.account || !/^\d{12}$/.test(props.env.account)) {
+          throw new Error("WorkloadPipelineStack: GA Registry S3 source requires a checksum-specific archive key and concrete owner account.");
+        }
+        const digest = props.s3Source.objectKey.slice(8, -4);
+        const archives = [props.gaRegistry.nonprod, props.gaRegistry.prod].map(context => {
+          const archive = context.sourceArchive;
+          if (context.schemaVersion !== "agenticai.ga-registry-consumer-context/2.0" ||
+              !archive || archive.bucketName !== props.s3Source!.bucketName ||
+              archive.objectKey !== props.s3Source!.objectKey || archive.sha256 !== digest ||
+              archive.ownerAccountId !== props.env!.account ||
+              !archive.versionId || archive.versionId === "null" ||
+              context.sourceRevision !== `s3-sha256:${digest}`) {
+            throw new Error("WorkloadPipelineStack: Registry contexts must bind the exact verified immutable source archive.");
+          }
+          return archive;
+        });
+        if (archives[0].versionId !== archives[1].versionId) {
+          throw new Error("WorkloadPipelineStack: both Registry contexts must bind the same source version.");
+        }
+      } else if ([props.gaRegistry.nonprod, props.gaRegistry.prod].some(context =>
+        context.schemaVersion !== "agenticai.ga-registry-consumer-context/1.0" ||
+        context.sourceArchive || !/^[0-9a-f]{40}$/.test(context.sourceRevision))) {
+        throw new Error("WorkloadPipelineStack: GitHub workloads require full Git revision provenance.");
+      }
       const { nonprod, prod, gatewayRegion } = props.gaRegistry;
       if (nonprod.environment !== "nonprod" || prod.environment !== "prod") {
         throw new Error(
@@ -802,14 +861,39 @@ export class WorkloadPipelineStack extends Stack {
       "WorkloadPipelineArtifacts",
       resourceTags,
     );
+    const cleanupProvider = this.node.tryFindChild("Custom::S3AutoDeleteObjectsCustomResourceProvider");
+    if (!cleanupProvider) {
+      throw new Error("WorkloadPipelineStack: the exact artifact auto-delete provider is required.");
+    }
+    preserveArtifactCleanupPhysicalId(cleanupProvider);
 
-    const source = CodePipelineSource.connection(
-      props.githubRepo,
-      props.githubBranch ?? "main",
-      {
-        connectionArn: props.githubConnectionArn,
-      },
-    );
+    const cleanupBoundaryName = this.node.tryGetContext("agenticai/artifactCleanupRoleBoundaryName");
+    if (cleanupBoundaryName !== undefined) {
+      const qualifier = this.node.tryGetContext("agenticai/bootstrapQualifier");
+      const defaultName = this.node.tryGetContext("agenticai/workloadRoleBoundaryName");
+      const pipelineName = this.node.tryGetContext("agenticai/pipelineRoleBoundaryName");
+      const expectedName = typeof defaultName === "string" && defaultName.endsWith("-RoleBoundary")
+        ? defaultName.replace(/-RoleBoundary$/, "-ArtifactCleanupBoundary") : undefined;
+      const expectedPipelineName = typeof defaultName === "string" && defaultName.endsWith("-RoleBoundary")
+        ? defaultName.replace(/-RoleBoundary$/, "-PipelineBoundary") : undefined;
+      if (typeof qualifier !== "string" || qualifier === "hnb659fds" ||
+          !/^[A-Za-z0-9]{1,10}$/.test(qualifier) ||
+          typeof cleanupBoundaryName !== "string" || !/^[A-Za-z0-9+=,.@_-]{1,128}$/.test(cleanupBoundaryName) ||
+          cleanupBoundaryName !== expectedName || pipelineName !== expectedPipelineName) {
+        throw new Error("WorkloadPipelineStack: artifact cleanup boundary must match the owned isolated bootstrap policy name.");
+      }
+      const provider = this.node.tryFindChild("Custom::S3AutoDeleteObjectsCustomResourceProvider");
+      const cleanupRole = provider?.node.tryFindChild("Role");
+      if (!cleanupRole || !CfnRole.isCfnRole(cleanupRole)) {
+        throw new Error("WorkloadPipelineStack: the exact artifact auto-delete provider role is required.");
+      }
+      // This public role-scoped override preserves the generated role and every other boundary.
+      RolePermissionsBoundary.of(cleanupRole).apply(
+        ManagedPolicy.fromManagedPolicyName(this, "ArtifactCleanupBoundary", cleanupBoundaryName),
+      );
+    }
+
+    const source = createPipelineSource(this, props);
 
     const baseSynthOptions = {
       stage: props.synthStage ?? "pipeline",
@@ -831,6 +915,8 @@ export class WorkloadPipelineStack extends Stack {
         props.tenantId,
         props.agentId,
         props.costCentre,
+        props.s3Source,
+        props.env?.account,
       );
       const synthRole = new Role(this, "RegistrySynthRole", {
         roleName: registrySynthRoleName(props.tenantId, props.agentId),
@@ -847,6 +933,13 @@ export class WorkloadPipelineStack extends Stack {
           ],
         }),
       );
+      if (props.s3Source) {
+        synthRole.addToPolicy(new PolicyStatement({
+          actions: ["s3:GetObjectVersion"],
+          resources: [`arn:${this.partition}:s3:::${props.s3Source.bucketName}/${props.s3Source.objectKey}`],
+          conditions: { StringEquals: { "s3:ResourceAccount": props.env!.account! } },
+        }));
+      }
       synthStep = new CodeBuildStep("Synth", {
         input: source,
         role: synthRole,
@@ -893,6 +986,8 @@ export class WorkloadPipelineStack extends Stack {
         this,
         "RegistryRoles",
         {
+          permissionsBoundary: props.workloadPermissionsBoundaryName
+            ? PermissionsBoundary.fromName(props.workloadPermissionsBoundaryName) : undefined,
           tenantId: props.tenantId,
           agentId: props.agentId,
           applicationId,
@@ -944,6 +1039,8 @@ export class WorkloadPipelineStack extends Stack {
 
     // Non-prod stage.
     const nonprodStage = new WorkloadDeploymentStage(this, "Nonprod", {
+      permissionsBoundary: props.workloadPermissionsBoundaryName
+        ? PermissionsBoundary.fromName(props.workloadPermissionsBoundaryName) : undefined,
       env: props.workloadNonprodEnv,
       envName: "nonprod",
       tenantId: props.tenantId,
@@ -958,6 +1055,7 @@ export class WorkloadPipelineStack extends Stack {
       enablePipelineRuntimeMemory: props.enablePipelineRuntimeMemory,
       agentImageVariant: props.agentImageVariant,
       generatedAgentInference: props.generatedAgentInference?.nonprod,
+      identityProvisionerPermissionsBoundaryName: props.identityProvisionerPermissionsBoundaryName,
       evaluationInvokerPrincipalArn: evaluationEnabled
         ? evaluationRoleArn
         : undefined,
@@ -1003,6 +1101,7 @@ export class WorkloadPipelineStack extends Stack {
     // Evaluation gate — CodeBuild step running the regression suite against
     // the just-deployed non-prod agent Runtime. Fails if any threshold is breached.
     const evalStep = new CodeBuildStep("EvaluationGate", {
+      input: source,
       commands: [
         "set -eu",
         enterBlueprintSourceDirectory(),
@@ -1070,6 +1169,7 @@ export class WorkloadPipelineStack extends Stack {
     const goldenStep =
       golden && evaluationRuntimeStack
         ? new CodeBuildStep("GoldenDatasetGate", {
+            input: source,
             commands: [
               "set -eu",
               enterBlueprintSourceDirectory(),
@@ -1139,13 +1239,47 @@ export class WorkloadPipelineStack extends Stack {
     // end of the soak halts the pipeline before Prod.
     const canaryPercent = props.canaryPercent ?? 5;
     const canarySoakMinutes = props.canarySoakMinutes ?? 30;
-    const onlineEvalAlarmName = `agenticai-online-eval-nonprod-${props.tenantId}-${props.agentId}`;
+    const onlineEvalAlarmName = props.runtimeCanary?.alarmName ??
+      `agenticai-online-eval-nonprod-${props.tenantId}-${props.agentId}`;
+    if (props.runtimeCanary) {
+      const cfg = props.runtimeCanary;
+      const aliasMatch = /^arn:aws:lambda:([a-z0-9-]+):(\d{12}):function:([A-Za-z0-9_-]+):([A-Za-z0-9_-]+)$/.exec(cfg.aliasArn);
+      if (!aliasMatch || aliasMatch[1] !== props.workloadNonprodEnv.region ||
+          aliasMatch[2] !== props.workloadNonprodEnv.account || /^\d+$/.test(aliasMatch[4]) ||
+          !/^[1-9]\d*$/.test(cfg.baselineVersion) || !/^[1-9]\d*$/.test(cfg.candidateVersion) ||
+          cfg.baselineVersion === cfg.candidateVersion ||
+          !new RegExp(`^arn:aws:iam::${aliasMatch[2]}:role/[A-Za-z0-9+=,.@_/-]+$`).test(cfg.routingRoleArn) ||
+          !/^[A-Za-z0-9_.-]{1,255}$/.test(onlineEvalAlarmName) ||
+          !Number.isInteger(canaryPercent) || canaryPercent < 1 || canaryPercent >= 100 ||
+          !Number.isInteger(canarySoakMinutes) || canarySoakMinutes < 1 || canarySoakMinutes > 55) {
+        throw new Error("WorkloadPipelineStack: runtimeCanary requires reviewed nonprod alias, distinct published versions, routing role and bounded soak.");
+      }
+      if (props.canaryDeployCommands) {
+        throw new Error("WorkloadPipelineStack: choose runtimeCanary or custom canary commands, never both.");
+      }
+      if (!evaluationEnabled) {
+        throw new Error("WorkloadPipelineStack: runtimeCanary requires the generated-agent evaluation gate.");
+      }
+    }
+    const canaryRole = props.runtimeCanary ? new Role(this, "CanaryRole", {
+      roleName: `AgenticAI-WLP-${props.tenantId}-${props.agentId}-Canary`,
+      assumedBy: new ServicePrincipal("codebuild.amazonaws.com"),
+      inlinePolicies: {
+        AssumeRoutingRole: new PolicyDocument({
+          statements: [new PolicyStatement({
+            actions: ["sts:AssumeRole"], resources: [props.runtimeCanary.routingRoleArn],
+          })],
+        }),
+      },
+    }) : undefined;
     const describeAlarmState =
       `aws cloudwatch describe-alarms --alarm-names ${onlineEvalAlarmName}` +
       ` --alarm-types CompositeAlarm --query 'CompositeAlarms[0].StateValue' --output text`;
 
     const canaryDeployStep = new CodeBuildStep("CanaryDeploy", {
+      input: source,
       commands: this.canaryDeployCommands(props, canaryPercent),
+      ...(canaryRole ? { role: canaryRole } : {}),
       partialBuildSpec: BuildSpec.fromObject({
         version: "0.2",
         env: { variables: { CANARY_PERCENT: String(canaryPercent) } },
@@ -1155,7 +1289,11 @@ export class WorkloadPipelineStack extends Stack {
     });
 
     const canarySoakStep = new CodeBuildStep("CanarySoak", {
-      commands: [
+      input: source,
+      ...(props.runtimeCanary ? {
+        env: { CANARY_OWNED_REVISION: canaryDeployStep.exportedVariable("CANARY_OWNED_REVISION") },
+      } : {}),
+      commands: props.runtimeCanary ? this.runtimeCanaryCommands(props, "soak", canaryPercent) : [
         "set -eu",
         `echo "Soaking canary ${canarySoakMinutes} minutes against composite alarm ${onlineEvalAlarmName}"`,
         // The alarm must exist before the soak starts. A missing alarm means
@@ -1184,10 +1322,13 @@ export class WorkloadPipelineStack extends Stack {
       ],
       buildEnvironment: { buildImage: LinuxBuildImage.STANDARD_7_0 },
       timeout: Duration.minutes(canarySoakMinutes + 5),
+      ...(canaryRole ? { role: canaryRole } : {}),
     });
 
     // Prod stage gated by evaluation + manual approval + canary + soak.
     const prodStage = new WorkloadDeploymentStage(this, "Prod", {
+      permissionsBoundary: props.workloadPermissionsBoundaryName
+        ? PermissionsBoundary.fromName(props.workloadPermissionsBoundaryName) : undefined,
       env: props.workloadProdEnv,
       envName: "prod",
       tenantId: props.tenantId,
@@ -1202,6 +1343,7 @@ export class WorkloadPipelineStack extends Stack {
       enablePipelineRuntimeMemory: props.enablePipelineRuntimeMemory,
       agentImageVariant: props.agentImageVariant,
       generatedAgentInference: props.generatedAgentInference?.prod,
+      identityProvisionerPermissionsBoundaryName: props.identityProvisionerPermissionsBoundaryName,
       auditOamSinkArn: props.auditOamSinkArn,
       runtimeTelemetry: props.runtimeTelemetry,
       notificationEmail: props.notificationEmail,
@@ -1212,7 +1354,7 @@ export class WorkloadPipelineStack extends Stack {
         comment: props.policyEngine
           ? `Approve only after nonproduction Registry/MCP denial twins and PolicyEngine ${props.policyEngine.mode} behavior match the retained Lambda wrapper. Production must not lead nonproduction mode evidence.`
           : evaluationEnabled
-            ? "The generated-agent evaluation gate passed through the nonproduction Runtime. Approve only after its Registry, MCP, guardrail, Memory, and denial evidence is attached."
+            ? "The generated-agent evaluation gate passed through the nonproduction Runtime. Approve only after its Registry, MCP, guardrail, Memory, and denial evidence is attached. Canary routing and soak must then pass before production deploys."
             : props.enablePipelineRuntimeMemory
               ? "Approve only after nonproduction Gateway targets pass live Registry, tools/list, tools/call, and denial twins, and the native Runtime+Memory compatibility foundation reached Runtime READY / Memory ACTIVE."
               : "Approve only after nonproduction Gateway targets pass live Registry, tools/list, tools/call, and denial twins. No agent runtime/canary exists in the R2 Gateway-only slice.",
@@ -1220,8 +1362,14 @@ export class WorkloadPipelineStack extends Stack {
       if (evaluationEnabled) {
         gaApproval.addStepDependency(lastPromotionGate);
       }
+      if (evaluationEnabled) {
+        canaryDeployStep.addStepDependency(gaApproval);
+        canarySoakStep.addStepDependency(canaryDeployStep);
+      }
       this.pipeline.addStage(prodStage, {
-        pre: evaluationEnabled ? [...promotionGates, gaApproval] : [gaApproval],
+        pre: evaluationEnabled
+          ? [...promotionGates, gaApproval, canaryDeployStep, canarySoakStep]
+          : [gaApproval],
       });
     } else {
       const approvalStep = new ManualApprovalStep("ProdApproval", {
@@ -1336,8 +1484,7 @@ export class WorkloadPipelineStack extends Stack {
     props: WorkloadPipelineStackProps,
   ): Record<string, string> {
     const derived: Record<string, string> = {
-      "agenticai/githubRepo": props.githubRepo,
-      "agenticai/githubConnectionArn": props.githubConnectionArn,
+      ...pipelineSourceContext(props),
       "agenticai/pipelineSelection": "workload",
       "agenticai/tenantId": props.tenantId,
       "agenticai/agentId": props.agentId,
@@ -1413,9 +1560,15 @@ export class WorkloadPipelineStack extends Stack {
         props.generatedAgentInference,
       );
     }
+    if (props.runtimeCanary) {
+      derived["agenticai/runtimeCanary"] = JSON.stringify(props.runtimeCanary);
+      derived["agenticai/canaryPercent"] = String(props.canaryPercent ?? 5);
+      derived["agenticai/canarySoakMinutes"] = String(props.canarySoakMinutes ?? 30);
+    }
     return {
       ...derived,
       ...(props.synthContext ?? {}),
+      ...pipelineSourceContext(props),
       "agenticai/pipelineSelection": "workload",
     };
   }
@@ -1433,6 +1586,9 @@ export class WorkloadPipelineStack extends Stack {
     props: WorkloadPipelineStackProps,
     canaryPercent: number,
   ): string[] {
+    if (props.runtimeCanary) {
+      return this.runtimeCanaryCommands(props, "start", canaryPercent);
+    }
     if (props.canaryDeployCommands && props.canaryDeployCommands.length > 0) {
       return ["set -eu", ...props.canaryDeployCommands];
     }
@@ -1442,6 +1598,27 @@ export class WorkloadPipelineStack extends Stack {
       'echo "This step fails closed on purpose: promoting to Prod without a real canary would be an unverified claim."',
       'echo "Supply WorkloadPipelineStackProps.canaryDeployCommands with a real AgentCore traffic-shift call to enable it."',
       "exit 1",
+    ];
+  }
+
+  private runtimeCanaryCommands(
+    props: WorkloadPipelineStackProps, action: "start" | "soak", percent: number,
+  ): string[] {
+    const cfg = props.runtimeCanary!;
+    const invocation =
+      `python3 pipelines/runtime_canary.py --action ${action} ` +
+      `--alias-arn ${shellQuote(cfg.aliasArn)} --baseline-version ${shellQuote(cfg.baselineVersion)} ` +
+      `--candidate-version ${shellQuote(cfg.candidateVersion)} --assume-role-arn ${shellQuote(cfg.routingRoleArn)} ` +
+      `--percent ${percent} --minutes ${props.canarySoakMinutes ?? 30} ` +
+      `--alarm ${shellQuote(props.runtimeCanary?.alarmName ?? `agenticai-online-eval-nonprod-${props.tenantId}-${props.agentId}`)}` +
+      (action === "soak" ? ` --owned-revision "$CANARY_OWNED_REVISION"` : "");
+    return [
+      "set -eu", enterBlueprintSourceDirectory(),
+      'python3 -m pip install --disable-pip-version-check "boto3==1.43.98"',
+      ...(action === "start" ? [
+        `${invocation} >runtime-canary-start-result.json`,
+        `export CANARY_OWNED_REVISION="$(python3 -c 'import json; print(json.load(open("runtime-canary-start-result.json"))["ownedRevisionId"])')"`,
+      ] : [invocation]),
     ];
   }
 }

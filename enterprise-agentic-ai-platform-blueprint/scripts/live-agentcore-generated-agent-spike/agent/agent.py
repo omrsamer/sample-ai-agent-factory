@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence
@@ -68,7 +69,7 @@ HANDSHAKE_MARKER = "agentcore-generated-agent-ok"
 #: which revision is serving without reading container digests. Bump it on
 #: every behaviour-changing agent release; the deployment-continuity probe
 #: gates on the observed transition.
-AGENT_VERSION = "1.3.3"
+AGENT_VERSION = "1.3.4"
 #: Exact public error text emitted by the Platform Guardrail interceptor. A
 #: 403 with any other message is an auth/permission failure and must propagate.
 GUARDRAIL_INTERVENTION_MESSAGE = (
@@ -834,6 +835,15 @@ def _load_entrypoint():  # pragma: no cover - exercised only in the live contain
 
     @app.entrypoint
     def invoke(payload: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
+        # This is an IAM-authenticated service endpoint. Its trusted caller must
+        # bind actorId to authenticated application identity. Missing identity
+        # must never collapse unrelated requests into shared "default" Memory.
+        payload_map = payload if isinstance(payload, Mapping) else {}
+        prompt = payload_map.get(PROMPT_FIELD)
+        actor = payload_map.get(ACTOR_FIELD)
+        if (not isinstance(prompt, str) or not prompt or len(prompt.encode("utf-8")) > 8192
+                or not isinstance(actor, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", actor)):
+            raise AgentError("A bounded prompt and explicit actorId are required")
         cfg = ReferenceAgentConfig(
             tenant_id=os.environ["AGENTCORE_TENANT_ID"],
             agent_id=os.environ["AGENTCORE_AGENT_ID"],
@@ -868,11 +878,8 @@ def _load_entrypoint():  # pragma: no cover - exercised only in the live contain
             mcp_auth=mcp_auth,
             mcp_bearer_token=os.environ.get("AGENTCORE_GATEWAY_BEARER"),
         )
-        payload_map = payload if isinstance(payload, Mapping) else {}
-        prompt = payload_map.get(PROMPT_FIELD)
-        prompt_text = prompt if isinstance(prompt, str) else "Reply with exactly the word verified."
-        actor = payload_map.get(ACTOR_FIELD)
-        actor_id = actor if isinstance(actor, str) and actor else "default-actor"
+        prompt_text = prompt
+        actor_id = actor
         session_id = ReferenceAgentCore._fingerprint(actor_id)[:16]
         result = core.run(prompt_text, actor_id=actor_id, session_id=session_id)
         return {

@@ -1,7 +1,7 @@
 """D-03 Bedrock cross-account invocation tests.
 
 Exercise the full workload-agent -> BedrockCallerRole -> Bedrock Converse
-path. Each test assumes the platform's ``AgenticAI-D03-BedrockCaller``
+path. Each test assumes its allocation's ``AgenticAI-D03-<tenant>-<agent>-BedrockCaller``
 role from the workload account using the stable ``RoleSessionName``
 convention. NO session tags (see README §3.3 / BUG-005).
 

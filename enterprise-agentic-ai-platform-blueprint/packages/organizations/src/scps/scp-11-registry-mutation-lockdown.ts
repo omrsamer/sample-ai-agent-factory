@@ -26,25 +26,27 @@
  * discovery) are intentionally not denied here; IAM scopes them per
  * principal.
  *
- * Both the role ARN and the `assumed-role/<name>/*` session form are matched
- * (bypass-regression, same shape as SCP-05/SCP-09); AWS service principals
- * are exempt.
+ * Approved identities are bound to their exact IAM role ARN and live RoleId.
+ * Name patterns and recreated roles cannot inherit an exception.
  *
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: MIT-0
  */
 import { toScpDefinition, type ScpDefinition } from "./index";
+import {
+  principalEntityDenyStatements,
+  protectedRolesForPurpose,
+  validateProtectedAuthorityManifest,
+} from "../protected-authority";
 
 export interface Scp11Options {
   /** Platform account id hosting the Registry. Required. */
   readonly platformAccountId: string;
-  /** Break-glass admin role name. Default `AgenticAI-RegistryAdmin`. */
+  /** Reviewed exact Registry authorities and their protected execution chain. */
+  readonly protectedAuthorityManifest?: unknown;
+  /** Removed insecure option; rejected with migration guidance. */
   readonly registryAdminRoleName?: string;
-  /**
-   * Role-name patterns of the Platform pipeline principals that deploy the
-   * Registry. Default: the CDK bootstrap CloudFormation execution role for
-   * any qualifier and region.
-   */
+  /** Removed insecure option; rejected with migration guidance. */
   readonly pipelineRoleNamePatterns?: readonly string[];
 }
 
@@ -75,41 +77,47 @@ export function scp11RegistryMutationLockdown(
       `SCP-11: platformAccountId must be a 12-digit AWS account id; got '${opts.platformAccountId}'.`,
     );
   }
-  const account = opts.platformAccountId;
-  const roleNames = [
-    opts.registryAdminRoleName ?? "AgenticAI-RegistryAdmin",
-    ...(opts.pipelineRoleNamePatterns ?? [`cdk-*-cfn-exec-role-${account}-*`]),
-  ];
-  const exempt = roleNames.flatMap((name) => [
-    `arn:aws:iam::${account}:role/${name}`,
-    `arn:aws:sts::${account}:assumed-role/${name}/*`,
-  ]);
-
-  const exemptCondition = {
-    ArnNotLike: { "aws:PrincipalArn": exempt },
-    BoolIfExists: { "aws:PrincipalIsAWSService": "false" },
-  };
+  if (
+    opts.registryAdminRoleName !== undefined ||
+    opts.pipelineRoleNamePatterns !== undefined
+  ) {
+    throw new Error(
+      "SCP-11: role names and patterns are no longer accepted. Supply protectedAuthorityManifest with exact ARN/RoleId-bound Registry identities.",
+    );
+  }
+  const roles = protectedRolesForPurpose(
+    validateProtectedAuthorityManifest(opts.protectedAuthorityManifest),
+    "registry",
+  );
+  if (
+    roles.length === 0 ||
+    roles.some((role) => role.arn.split(":")[4] !== opts.platformAccountId)
+  ) {
+    throw new Error(
+      "SCP-11: protected Registry identities must be in the configured platformAccountId.",
+    );
+  }
 
   const body = {
     Version: "2012-10-17",
     Statement: [
-      {
-        Sid: "DenyRegistryMutationExceptPlatformPipeline",
-        Effect: "Deny",
-        Action: Array.from(SCP11_REGISTRY_ACTIONS),
-        Resource: [
+      ...principalEntityDenyStatements(
+        "DenyRegistryMutationExceptPlatformPipeline",
+        SCP11_REGISTRY_ACTIONS,
+        [
           "arn:aws:agent-registry:*:*:registry/*",
           "arn:aws:bedrock-agentcore:*:*:registry/*",
         ],
-        Condition: exemptCondition,
-      },
-      {
-        Sid: "DenyRegistryCreationExceptPlatformPipeline",
-        Effect: "Deny",
-        Action: Array.from(SCP11_REGISTRY_CREATE_ACTIONS),
-        Resource: "*",
-        Condition: exemptCondition,
-      },
+        roles,
+        { awsServiceExempt: true },
+      ),
+      ...principalEntityDenyStatements(
+        "DenyRegistryCreationExceptPlatformPipeline",
+        SCP11_REGISTRY_CREATE_ACTIONS,
+        ["*"],
+        roles,
+        { awsServiceExempt: true },
+      ),
     ],
   };
 

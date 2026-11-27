@@ -26,5 +26,11 @@ export {
   OrganizationConstruct,
   type OrganizationConstructProps,
   type OrganizationalUnitKey,
-} from './organization-construct';
-export { buildScpSet, type ScpDefinition } from './scps';
+} from "./organization-construct";
+export { buildScpSet, type ScpDefinition } from "./scps";
+export {
+  validateProtectedAuthorityManifest,
+  renderProtectedAuthorityStatements,
+  type ProtectedAuthorityManifest,
+} from "./protected-authority";
+export { buildProtectedAuthorityPolicies } from "./protected-authority-policies";

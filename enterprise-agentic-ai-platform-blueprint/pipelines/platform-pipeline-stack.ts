@@ -13,7 +13,6 @@ import { PipelineType } from "aws-cdk-lib/aws-codepipeline";
 import { Role, ServicePrincipal } from "aws-cdk-lib/aws-iam";
 import {
   CodePipeline,
-  CodePipelineSource,
   ShellStep,
   ManualApprovalStep,
   CodeBuildStep,
@@ -35,6 +34,11 @@ import {
   type PipelineResourceTags,
 } from "./pipeline-artifacts";
 import { stageAwareSynthCommands } from "./synth-commands";
+import {
+  createPipelineSource,
+  pipelineSourceContext,
+  type PipelineSourceProps,
+} from "./pipeline-source";
 
 /** Per-stage account environment tuple. */
 export interface PipelineStageEnv {
@@ -46,10 +50,7 @@ export type GaRegistryRecordGenerationsByEnvironment = Readonly<
   Partial<Record<"nonprod" | "prod", Readonly<Record<string, number>>>>
 >;
 
-export interface PlatformPipelineStackProps extends StackProps {
-  readonly githubRepo: string;
-  readonly githubBranch?: string;
-  readonly githubConnectionArn: string;
+export interface PlatformPipelineStackProps extends StackProps, PipelineSourceProps {
   readonly organizationId: string;
   readonly logArchive: PipelineStageEnv;
   readonly audit: PipelineStageEnv;
@@ -63,6 +64,8 @@ export interface PlatformPipelineStackProps extends StackProps {
   /** Regional Management/Governance OAM sink for Platform telemetry. */
   readonly auditOamSinkArn?: string;
   readonly inferenceModelRateLimits: readonly InferenceModelRateLimit[];
+  readonly inferenceGatewayAuthorizerType?: "AWS_IAM" | "CUSTOM_JWT";
+  readonly trustedSystemPromptHashes?: readonly string[];
   readonly grantGatewayInvokePermissions?: boolean;
   readonly gatewayServiceRoleArns?: readonly string[];
   readonly gatewayWorkloadAccountIds?: Readonly<
@@ -109,6 +112,8 @@ export interface PlatformDeploymentStageProps extends StageProps {
   readonly tenantId: string;
   readonly costCentre: string;
   readonly inferenceModelRateLimits: readonly InferenceModelRateLimit[];
+  readonly inferenceGatewayAuthorizerType?: "AWS_IAM" | "CUSTOM_JWT";
+  readonly trustedSystemPromptHashes?: readonly string[];
   readonly grantGatewayInvokePermissions?: boolean;
   readonly gatewayServiceRoleArns?: readonly string[];
   readonly gatewayWorkloadAccountId?: string;
@@ -170,6 +175,8 @@ export class PlatformDeploymentStage extends Stage {
         tenantId: props.tenantId,
         costCentre: props.costCentre,
         modelRateLimits: props.inferenceModelRateLimits,
+        authorizerType: props.inferenceGatewayAuthorizerType,
+        trustedSystemPromptHashes: props.trustedSystemPromptHashes,
         // The stage's own baseline guardrail is enforced server-side on every
         // inference request by the Gateway REQUEST interceptor.
         inputGuardrail: {
@@ -219,11 +226,7 @@ export class PlatformPipelineStack extends Stack {
     });
     const pipelineServiceRoleArn = `arn:${this.partition}:iam::${this.account}:role/${pipelineServiceRoleName}`;
 
-    const source = CodePipelineSource.connection(
-      props.githubRepo,
-      props.githubBranch ?? "main",
-      { connectionArn: props.githubConnectionArn },
-    );
+    const source = createPipelineSource(this, props);
 
     this.pipeline = new CodePipeline(this, "PlatformPipeline", {
       artifactBucket,
@@ -259,6 +262,8 @@ export class PlatformPipelineStack extends Stack {
       tenantId: props.tenantId,
       costCentre: props.costCentre,
       inferenceModelRateLimits: props.inferenceModelRateLimits,
+      inferenceGatewayAuthorizerType: props.inferenceGatewayAuthorizerType,
+      trustedSystemPromptHashes: props.trustedSystemPromptHashes,
       oamTrustedAccountIds,
       registrySynthAccountId: props.platformNonprod.env.account,
       grantGatewayInvokePermissions: props.grantGatewayInvokePermissions,
@@ -406,8 +411,7 @@ export class PlatformPipelineStack extends Stack {
     pipelineServiceRoleArn: string,
   ): Record<string, string> {
     const derived: Record<string, string> = {
-      "agenticai/githubRepo": props.githubRepo,
-      "agenticai/githubConnectionArn": props.githubConnectionArn,
+      ...pipelineSourceContext(props),
       "agenticai/pipelineSelection": "platform",
       "agenticai/organizationId": props.organizationId,
       "agenticai/platformNonprodAccountId": props.platformNonprod.env.account,
@@ -422,6 +426,11 @@ export class PlatformPipelineStack extends Stack {
       "agenticai/costCentre": props.costCentre,
       "agenticai/inferenceModelRateLimits": JSON.stringify(
         props.inferenceModelRateLimits,
+      ),
+      "agenticai/inferenceGatewayAuthorizerType":
+        props.inferenceGatewayAuthorizerType ?? "CUSTOM_JWT",
+      "agenticai/trustedSystemPromptHashes": JSON.stringify(
+        props.trustedSystemPromptHashes ?? [],
       ),
     };
     if (props.githubBranch) {
@@ -450,6 +459,7 @@ export class PlatformPipelineStack extends Stack {
     return {
       ...derived,
       ...(props.synthContext ?? {}),
+      ...pipelineSourceContext(props),
       "agenticai/pipelineSelection": "platform",
       "agenticai/pipelineRoleArn": pipelineServiceRoleArn,
     };

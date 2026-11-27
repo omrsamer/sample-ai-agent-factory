@@ -747,6 +747,11 @@ Recommended cadence:
 
 ### 10.2 Threat and evidence model
 
+The [2026-11-25 remediation migration](docs/SECURITY_REMEDIATION_MIGRATION.md)
+documents the Management SCP-09 account inputs, exact approved protocol
+digests, legacy D-03 allocation migration, required deployment twins, and the
+protected authority manifests and enrollment for exact SCP exception identities.
+
 The design addresses STRIDE, the OWASP Top 10 for LLM Applications, and agent-specific risks such as prompt injection, excessive agency, insecure tools, cross-tenant memory access, supply-chain tampering, policy bypass, and unsafe rollback.
 
 A denied request is evidence only when it proves the intended control:

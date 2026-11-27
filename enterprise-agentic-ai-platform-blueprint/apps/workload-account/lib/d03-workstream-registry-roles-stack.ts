@@ -287,7 +287,7 @@ export class D03WorkstreamRegistryRolesStack extends Stack {
    * Stable AgentCore Runtime execution role. Trusted only by the AgentCore
    * service principal, bound to this account and the exact Runtime name family
    * so a Runtime in another account/name cannot assume it. It can pull the
-   * inert agent image from the account's default CDK bootstrap container-assets
+   * inert agent image from the account's selected CDK bootstrap container-assets
    * repository, obtain an ECR auth token, write its own Runtime logs/traces and
    * emit bedrock-agentcore metrics — and is explicitly DENIED direct Bedrock
    * model invocation, since the golden-path inference boundary is the Gateway,
@@ -316,9 +316,11 @@ export class D03WorkstreamRegistryRolesStack extends Stack {
         "Stable AgentCore Runtime execution role: ECR pull of the inert agent image, Runtime logs/tracing, bedrock-agentcore metrics; direct Bedrock invoke denied.",
     });
 
-    // ECR pull is scoped to the default CDK bootstrap container-assets repo in
-    // this Workstream account/region, where the pipeline publishes the image.
-    const qualifier = DefaultStackSynthesizer.DEFAULT_QUALIFIER;
+    // Use the bound synthesizer's qualifier so this grant follows the same
+    // isolated bootstrap repository to which the Runtime image is published.
+    const qualifier =
+      this.synthesizer.bootstrapQualifier ??
+      DefaultStackSynthesizer.DEFAULT_QUALIFIER;
     const containerAssetsRepoArn = `arn:aws:ecr:${this.region}:${this.account}:repository/cdk-${qualifier}-container-assets-${this.account}-${this.region}`;
     role.addToPolicy(
       new PolicyStatement({

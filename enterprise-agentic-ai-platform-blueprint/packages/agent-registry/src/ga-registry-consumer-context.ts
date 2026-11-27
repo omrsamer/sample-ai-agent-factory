@@ -9,6 +9,16 @@ import type { GaToolGovernanceDocument } from "./ga-platform-registry-construct"
 
 export const GA_REGISTRY_CONSUMER_CONTEXT_SCHEMA =
   "agenticai.ga-registry-consumer-context/1.0" as const;
+export const GA_REGISTRY_ARCHIVE_CONTEXT_SCHEMA =
+  "agenticai.ga-registry-consumer-context/2.0" as const;
+
+export interface VerifiedSourceArchive {
+  readonly bucketName: string;
+  readonly objectKey: string;
+  readonly versionId: string;
+  readonly sha256: string;
+  readonly ownerAccountId: string;
+}
 
 export interface GaResolvedRegistryRecord {
   readonly recordId: string;
@@ -18,11 +28,12 @@ export interface GaResolvedRegistryRecord {
 }
 
 export interface GaRegistryConsumerContext {
-  readonly schemaVersion: typeof GA_REGISTRY_CONSUMER_CONTEXT_SCHEMA;
+  readonly schemaVersion: typeof GA_REGISTRY_CONSUMER_CONTEXT_SCHEMA | typeof GA_REGISTRY_ARCHIVE_CONTEXT_SCHEMA;
   readonly environment: "nonprod" | "prod";
   readonly region: string;
   readonly platformAccountId: string;
   readonly sourceRevision: string;
+  readonly sourceArchive?: VerifiedSourceArchive;
   readonly registryId: string;
   readonly registryArn: string;
   readonly readerRoleArn: string;
@@ -227,6 +238,7 @@ export function parseGaRegistryConsumerContext(
   expected: GaRegistryConsumerExpectation,
 ): GaRegistryConsumerContext {
   const context = object(raw, "GA Registry consumer context");
+  const archiveSchema = context.schemaVersion === GA_REGISTRY_ARCHIVE_CONTEXT_SCHEMA;
   exactKeys(
     context,
     [
@@ -235,6 +247,7 @@ export function parseGaRegistryConsumerContext(
       "region",
       "platformAccountId",
       "sourceRevision",
+      ...(archiveSchema ? ["sourceArchive"] : []),
       "registryId",
       "registryArn",
       "readerRoleArn",
@@ -243,7 +256,7 @@ export function parseGaRegistryConsumerContext(
     ],
     "GA Registry consumer context",
   );
-  if (context.schemaVersion !== GA_REGISTRY_CONSUMER_CONTEXT_SCHEMA) {
+  if (context.schemaVersion !== GA_REGISTRY_CONSUMER_CONTEXT_SCHEMA && !archiveSchema) {
     throw new Error(
       "GA Registry consumer context schemaVersion is unsupported.",
     );
@@ -266,7 +279,25 @@ export function parseGaRegistryConsumerContext(
     context.sourceRevision,
     "GA Registry consumer context sourceRevision",
   );
-  if (!/^[0-9a-f]{40}$/.test(sourceRevision)) {
+  let sourceArchive: VerifiedSourceArchive | undefined;
+  if (archiveSchema) {
+    const archive = object(context.sourceArchive, "sourceArchive");
+    exactKeys(archive, ["bucketName", "objectKey", "versionId", "sha256", "ownerAccountId"], "sourceArchive");
+    const bucketName = string(archive.bucketName, "sourceArchive bucketName");
+    const objectKey = string(archive.objectKey, "sourceArchive objectKey");
+    const versionId = string(archive.versionId, "sourceArchive versionId");
+    const sha256 = string(archive.sha256, "sourceArchive sha256");
+    const ownerAccountId = string(archive.ownerAccountId, "sourceArchive ownerAccountId");
+    if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucketName) ||
+        !/^[0-9a-f]{64}$/.test(sha256) ||
+        objectKey !== `sources/${sha256}.zip` ||
+        versionId === "null" || versionId.length > 1024 ||
+        !/^\d{12}$/.test(ownerAccountId) ||
+        sourceRevision !== `s3-sha256:${sha256}`) {
+      throw new Error("GA Registry consumer context immutable S3 provenance is invalid.");
+    }
+    sourceArchive = { bucketName, objectKey, versionId, sha256, ownerAccountId };
+  } else if (!/^[0-9a-f]{40}$/.test(sourceRevision)) {
     throw new Error(
       "GA Registry consumer context sourceRevision must be a full Git SHA.",
     );
@@ -402,11 +433,12 @@ export function parseGaRegistryConsumerContext(
   }
 
   return {
-    schemaVersion: GA_REGISTRY_CONSUMER_CONTEXT_SCHEMA,
+    schemaVersion: archiveSchema ? GA_REGISTRY_ARCHIVE_CONTEXT_SCHEMA : GA_REGISTRY_CONSUMER_CONTEXT_SCHEMA,
     environment: expected.environment,
     region,
     platformAccountId: expected.platformAccountId,
     sourceRevision,
+    ...(sourceArchive ? { sourceArchive } : {}),
     registryId,
     registryArn,
     readerRoleArn,

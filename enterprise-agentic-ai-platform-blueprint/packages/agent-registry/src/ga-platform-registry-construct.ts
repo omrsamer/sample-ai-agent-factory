@@ -27,6 +27,7 @@ import {
 import { StringParameter } from "aws-cdk-lib/aws-ssm";
 import { NagSuppressions } from "cdk-nag";
 import { Construct } from "constructs";
+import { RegistryApprovalConstruct } from "./registry-approval-construct";
 
 import {
   PLATFORM_TOOL_CATALOGUE,
@@ -230,6 +231,14 @@ export class GaPlatformRegistryConstruct extends Construct {
     this.registryArn = this.registry.getAtt("RegistryArn").toString();
 
     const records: Record<string, CfnResource> = {};
+    const approvalRecords: Record<
+      string,
+      {
+        resource: CfnResource;
+        version: string;
+        descriptorData: string;
+      }
+    > = {};
     const recordIdParameters: Record<string, StringParameter> = {};
     this.parameterPrefix = `/agenticai/registry/v1/${props.envName}`;
 
@@ -283,11 +292,25 @@ export class GaPlatformRegistryConstruct extends Construct {
       record.addDependency(this.registry);
       record.applyRemovalPolicy(RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE);
       records[tool.toolId] = record;
-      recordIdParameters[tool.toolId] = parameter(
-        `RecordIdParameter-${tool.toolId}`,
-        `records/${tool.toolId}/id`,
-        record.getAtt("RecordId").toString(),
-        `GA Agent Registry record id for ${tool.toolId}.`,
+      approvalRecords[tool.toolId] = {
+        resource: record,
+        version: "2.0.0",
+        descriptorData: JSON.stringify(governance),
+      };
+    }
+    const approval = new RegistryApprovalConstruct(this, "Approval", {
+      registry: this.registry,
+      registryId: this.registryId,
+      registryArn: this.registryArn,
+      records: approvalRecords,
+      tags,
+    });
+    for (const [toolId, resource] of Object.entries(approval.resources)) {
+      recordIdParameters[toolId] = parameter(
+        `RecordIdParameter-${toolId}`,
+        `records/${toolId}/id`,
+        resource.getAttString("RecordId"),
+        `Approved GA Agent Registry record id for ${toolId}.`,
       );
     }
     this.records = records;
@@ -437,6 +460,14 @@ export class GaPlatformRegistryConstruct extends Construct {
       this.readerExternalId,
       `GA Agent Registry reader ExternalId for ${props.envName}.`,
     );
+    for (const discovery of [
+      registryIdParameter,
+      registryArnParameter,
+      readerRoleArnParameter,
+      readerExternalIdParameter,
+    ]) {
+      discovery.node.addDependency(approval);
+    }
 
     new CfnOutput(this, "RegistryId", { value: this.registryId });
     new CfnOutput(this, "RegistryArn", { value: this.registryArn });

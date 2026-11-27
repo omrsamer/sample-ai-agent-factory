@@ -79,6 +79,8 @@ export interface PlatformInferenceGatewayConstructProps {
    * construction impossible.
    */
   readonly inputGuardrail: InferenceInputGuardrail;
+  /** Protected-authority enrollment requires AWS_IAM and reviewed IAM callers. */
+  readonly authorizerType?: 'AWS_IAM' | 'CUSTOM_JWT';
   readonly gatewayName?: string;
   readonly targetName?: string;
   readonly rateLimitId?: string;
@@ -91,6 +93,12 @@ export interface PlatformInferenceGatewayConstructProps {
    */
   readonly maxGuardedCharacters?: number;
   /**
+   * Operator-approved SHA-256 digests of complete static system/developer
+   * prompts. Defaults to none: all client-controlled roles are evaluated.
+   * Never derive this list from request content or caller-provided metadata.
+   */
+  readonly trustedSystemPromptHashes?: readonly string[];
+  /**
    * Opt-in: 12-digit AWS account IDs (the Workstream accounts) allowed to read
    * the published M2M credential secret cross-account. When set, the construct
    * publishes a Secrets Manager secret holding the connection metadata plus the
@@ -99,6 +107,12 @@ export interface PlatformInferenceGatewayConstructProps {
    * is only created when a consumer account is declared.
    */
   readonly m2mSecretReaderAccountIds?: readonly string[];
+  /**
+   * Optional exact IAM role ARNs within the reader accounts. When supplied,
+   * both secret reads and CMK reader grants require the caller's PrincipalArn
+   * to match these roles. Account-only callers retain their existing behavior.
+   */
+  readonly m2mSecretReaderRoleArns?: readonly string[];
 }
 
 const MAX_RATE = 10_000_000;
@@ -311,6 +325,12 @@ export class PlatformInferenceGatewayConstruct extends Construct {
     super(scope, id);
 
     const stack = Stack.of(this);
+    const authorizerType = props.authorizerType ?? 'CUSTOM_JWT';
+    if (authorizerType !== 'AWS_IAM' && authorizerType !== 'CUSTOM_JWT') {
+      throw new Error(
+        'PlatformInferenceGatewayConstruct: authorizerType must be AWS_IAM or CUSTOM_JWT.',
+      );
+    }
     const gatewayName = props.gatewayName ?? `agenticai-inference-${props.envName}`;
     const targetName = props.targetName ?? `${gatewayName}-bedrock`;
     this.inferenceTargetName = targetName;
@@ -321,6 +341,18 @@ export class PlatformInferenceGatewayConstruct extends Construct {
     validateName('rateLimitId', this.rateLimitId, 64);
     validateModelRateLimits(props.modelRateLimits);
     validateInputGuardrail(props.inputGuardrail);
+    const trustedSystemPromptHashes = props.trustedSystemPromptHashes ?? [];
+    if (
+      !Array.isArray(trustedSystemPromptHashes) ||
+      trustedSystemPromptHashes.length > 32 ||
+      trustedSystemPromptHashes.some(
+        (value) => typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value),
+      )
+    ) {
+      throw new Error(
+        "PlatformInferenceGatewayConstruct: trustedSystemPromptHashes must contain at most 32 lowercase SHA-256 digests.",
+      );
+    }
     const maxGuardedCharacters = props.maxGuardedCharacters ?? 200_000;
     if (
       !Number.isInteger(maxGuardedCharacters) ||
@@ -399,6 +431,14 @@ export class PlatformInferenceGatewayConstruct extends Construct {
       userPoolName: `${gatewayName}-auth`,
       selfSignUpEnabled: false,
       deletionProtection: props.envName === 'prod',
+      passwordPolicy: {
+        minLength: 12,
+        requireLowercase: true,
+        requireUppercase: true,
+        requireDigits: true,
+        requireSymbols: true,
+        tempPasswordValidity: Duration.days(1),
+      },
     });
     const invokeScope = new ResourceServerScope({
       scopeName: 'invoke',
@@ -418,6 +458,12 @@ export class PlatformInferenceGatewayConstruct extends Construct {
       generateSecret: true,
       preventUserExistenceErrors: true,
       enableTokenRevocation: true,
+      authFlows: {
+        userSrp: false,
+        userPassword: false,
+        adminUserPassword: false,
+        custom: false,
+      },
       accessTokenValidity: props.accessTokenValidity ?? Duration.minutes(5),
       oAuth: {
         flows: { clientCredentials: true },
@@ -439,6 +485,12 @@ export class PlatformInferenceGatewayConstruct extends Construct {
           generateSecret: true,
           preventUserExistenceErrors: true,
           enableTokenRevocation: true,
+          authFlows: {
+            userSrp: false,
+            userPassword: false,
+            adminUserPassword: false,
+            custom: false,
+          },
           accessTokenValidity:
             props.accessTokenValidity ?? Duration.minutes(5),
           oAuth: {
@@ -465,6 +517,11 @@ export class PlatformInferenceGatewayConstruct extends Construct {
           id: 'AwsSolutions-COG3',
           reason:
             'SEC-028: Cognito threat-protection modes evaluate user authentication, while this pool permits only machine client-credentials grants.',
+        },
+        {
+          id: 'AwsSolutions-COG8',
+          reason:
+            'SEC-028: Plus-tier human sign-in and password protections are not applicable to this noninteractive pool. Both clients allow only OAuth client_credentials and explicitly disable SRP, password, admin-password and custom authentication flows; self sign-up is disabled.',
         },
       ],
       true,
@@ -502,26 +559,34 @@ export class PlatformInferenceGatewayConstruct extends Construct {
         ),
       ],
     });
-    this.guardrailInterceptor = new LambdaFunction(this, 'GuardrailInterceptor', {
-      functionName: interceptorName,
-      description:
+    this.guardrailInterceptor = new LambdaFunction(
+      this,
+      'GuardrailInterceptor',
+      {
+        functionName: interceptorName,
+        description:
         'AgentCore inference Gateway REQUEST interceptor: bedrock:ApplyGuardrail on every request body; fails closed.',
-      runtime: Runtime.PYTHON_3_13,
-      handler: 'index.handler',
-      timeout: Duration.seconds(25),
-      memorySize: 256,
-      role: this.guardrailInterceptorRole,
-      code: Code.fromAsset(
+        runtime: Runtime.PYTHON_3_13,
+        handler: 'index.handler',
+        timeout: Duration.seconds(25),
+        memorySize: 256,
+        reservedConcurrentExecutions: 10,
+        role: this.guardrailInterceptorRole,
+        code: Code.fromAsset(
         path.join(__dirname, '..', 'lambda', 'guardrail-interceptor'),
         { exclude: ['test_*.py', '__pycache__', '.pytest_cache'] },
       ),
-      environment: {
-        GUARDRAIL_IDENTIFIER: props.inputGuardrail.guardrailIdentifier,
-        GUARDRAIL_VERSION: props.inputGuardrail.guardrailVersion,
-        MAX_GUARDED_CHARACTERS: String(maxGuardedCharacters),
-        ENV_NAME: props.envName,
+        environment: {
+          GUARDRAIL_IDENTIFIER: props.inputGuardrail.guardrailIdentifier,
+          GUARDRAIL_VERSION: props.inputGuardrail.guardrailVersion,
+          MAX_GUARDED_CHARACTERS: String(maxGuardedCharacters),
+          TRUSTED_SYSTEM_PROMPT_SHA256: JSON.stringify(
+            trustedSystemPromptHashes,
+          ),
+          ENV_NAME: props.envName,
+        },
       },
-    });
+    );
     const interceptorInvokePolicy = new Policy(this, 'GuardrailInterceptorInvoke', {
       statements: [
         new PolicyStatement({
@@ -574,8 +639,8 @@ export class PlatformInferenceGatewayConstruct extends Construct {
           inputConfiguration: { passRequestHeaders: false },
         },
       ],
-      authorizerType: 'CUSTOM_JWT',
-      authorizerConfiguration: {
+      authorizerType,
+      authorizerConfiguration: authorizerType === 'CUSTOM_JWT' ? {
         customJwtAuthorizer: {
           discoveryUrl: this.discoveryUrl,
           allowedClients: [
@@ -586,7 +651,7 @@ export class PlatformInferenceGatewayConstruct extends Construct {
           ],
           allowedScopes: [this.oauthScope],
         },
-      },
+      } : undefined,
       description:
         'Central OpenAI-compatible inference Gateway for pipeline-managed agents',
       tags: requiredTags(props),
@@ -640,9 +705,26 @@ export class PlatformInferenceGatewayConstruct extends Construct {
       .toString();
 
     const readerAccounts = props.m2mSecretReaderAccountIds ?? [];
+    const readerRoles = props.m2mSecretReaderRoleArns;
+    if (readerRoles !== undefined) {
+      if (!Array.isArray(readerRoles) || readerRoles.length === 0) {
+        throw new Error('PlatformInferenceGatewayConstruct: m2mSecretReaderRoleArns must contain exact IAM role ARNs.');
+      }
+      for (const roleArn of readerRoles) {
+        const match = typeof roleArn === 'string' && roleArn.length <= 640
+          ? /^arn:aws(?:-us-gov|-cn)?:iam::(\d{12}):role\/(?:[A-Za-z0-9+=,.@_-]+\/)*[A-Za-z0-9+=,.@_-]{1,64}$/.exec(roleArn)
+          : null;
+        if (!match || !readerAccounts.includes(match[1])) {
+          throw new Error('PlatformInferenceGatewayConstruct: m2mSecretReaderRoleArns must be exact IAM roles in the declared reader accounts.');
+        }
+      }
+      if (readerAccounts.some(account => !readerRoles.some(roleArn => roleArn.includes(`::${account}:role/`)))) {
+        throw new Error('PlatformInferenceGatewayConstruct: every declared reader account must have an exact reader role.');
+      }
+    }
     if (readerAccounts.length > 0) {
       for (const acct of readerAccounts) {
-        if (!/^\d{12}$/.test(acct)) {
+        if (typeof acct !== 'string' || !/^\d{12}$/.test(acct)) {
           throw new Error(
             `PlatformInferenceGatewayConstruct: m2mSecretReaderAccountIds must be 12-digit account IDs; got '${acct}'.`,
           );
@@ -667,6 +749,11 @@ export class PlatformInferenceGatewayConstruct extends Construct {
               StringEquals: {
                 'kms:ViaService': `secretsmanager.${stack.region}.amazonaws.com`,
               },
+              ...(readerRoles === undefined ? {} : {
+                ArnEquals: {
+                  'aws:PrincipalArn': [...new Set(readerRoles.filter(roleArn => roleArn.includes(`::${acct}:role/`)))],
+                },
+              }),
             },
           }),
         );
@@ -707,6 +794,11 @@ export class PlatformInferenceGatewayConstruct extends Construct {
           principals: uniqueReaders.map((a) => new AccountPrincipal(a)),
           actions: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret'],
           resources: ['*'],
+          ...(readerRoles === undefined ? {} : {
+            conditions: {
+              ArnEquals: { 'aws:PrincipalArn': [...new Set(readerRoles)] },
+            },
+          }),
         }),
       );
       // Deploy-time populator: an explicitly-named role (inside the AgenticAI*
@@ -758,6 +850,15 @@ export class PlatformInferenceGatewayConstruct extends Construct {
         role: populatorRole,
         code: Code.fromInline(M2M_SECRET_POPULATOR_HANDLER),
       });
+      NagSuppressions.addResourceSuppressions(
+        populatorFn,
+        [{
+          id: 'AwsSolutions-L1',
+          reason:
+            'SEC-031: the M2M populator uses the supported Python 3.13 runtime, pinned with the tested inference interceptor release.',
+        }],
+        true,
+      );
       const frameworkRole = new Role(this, 'M2mSecretPopulatorFwRole', {
         roleName: `AgenticAI-InferenceM2mSecretFw-${props.envName}`.slice(0, 64),
         assumedBy: new ServicePrincipal('lambda.amazonaws.com'),

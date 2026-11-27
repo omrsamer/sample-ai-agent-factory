@@ -65,7 +65,18 @@ function gaContext(environment: "nonprod" | "prod"): GaRegistryConsumerContext {
 }
 
 function synth(overrides: Partial<WorkloadPipelineStackProps> = {}, generated = true): Template {
-  const app = new App();
+  const app = new App({ context: generated ? {
+    "agenticai/bootstrapQualifier": "isolated1",
+    "agenticai/workloadRoleBoundaryName": "Isolated-RoleBoundary",
+    "agenticai/identityProvisionerBrokerByAllocation": Object.fromEntries(
+      [[NONPROD_ACCOUNT, "nonprod"], [PROD_ACCOUNT, "prod"]].map(([account, stage]) => [
+        `${account}:${REGION}:${stage}:demo:primary`, {
+          versionArn: `arn:aws:lambda:${REGION}:${account}:function:AgenticAI-D03-${stage}-demo-primary-idbroker:17`,
+          configSha256: "a".repeat(64),
+        },
+      ]),
+    ),
+  } : {} });
   const stack = new WorkloadPipelineStack(app, "Pipeline", {
     env: { account: PLATFORM_ACCOUNT, region: REGION },
     githubRepo: "aws-samples/sample-ai-agent-factory",
@@ -80,6 +91,7 @@ function synth(overrides: Partial<WorkloadPipelineStackProps> = {}, generated = 
     workloadProdAvailabilityZones: ["us-west-2a", "us-west-2b"],
     gaRegistry: { nonprod: gaContext("nonprod"), prod: gaContext("prod"), gatewayRegion: REGION },
     enablePipelineRuntimeMemory: generated,
+    identityProvisionerPermissionsBoundaryName: generated ? "Isolated-IdentityProvisionerBoundary" : undefined,
     agentImageVariant: generated ? "generated-agent" : undefined,
     generatedAgentInference: generated
       ? {

@@ -4,6 +4,7 @@ Run: scripts/live-agentcore-generated-agent-spike/.venv/bin/python -m pytest \
        packages/platform-inference-gateway/lambda/guardrail-interceptor -q
 """
 import base64
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -52,6 +53,7 @@ def env(monkeypatch):
     monkeypatch.setenv("GUARDRAIL_VERSION", "DRAFT")
     monkeypatch.setenv("MAX_GUARDED_CHARACTERS", "60000")
     monkeypatch.delenv("BLOCKED_MESSAGE", raising=False)
+    monkeypatch.delenv("TRUSTED_SYSTEM_PROMPT_SHA256", raising=False)
 
 
 @pytest.fixture
@@ -75,7 +77,7 @@ ANONYMIZED_ONLY = [
 
 
 # ----------------------------------------------------------------- extraction
-def test_extracts_guarded_turns_and_skips_the_system_prompt():
+def test_extracts_all_client_controlled_turns():
     payload = {
         "model": "m",
         "messages": [
@@ -86,20 +88,85 @@ def test_extracts_guarded_turns_and_skips_the_system_prompt():
             {"content": "no role -> guarded"},
         ],
     }
-    assert index.extract_texts(payload) == ["hello", "TOOL RESULT: {}", "no role -> guarded"]
+    assert index.extract_texts(payload) == [
+        "You are an agent. Reply with a single TOOL line and nothing else.",
+        "hello", "TOOL echo {}", "TOOL RESULT: {}", "no role -> guarded",
+    ]
 
 
-def test_developer_role_and_top_level_system_are_unguarded_but_user_input_is():
-    assert index.extract_texts({"system": "s", "messages": [{"role": "developer", "content": "d"}, {"role": "user", "content": "u"}]}) == ["u"]
+def test_top_level_and_responses_inputs_are_guarded():
+    assert index.extract_texts({"system": "s", "messages": [{"role": "developer", "content": "d"}, {"role": "user", "content": "u"}]}) == ["d", "u", "s"]
     assert index.extract_texts({"input": "plain"}) == ["plain"]
-    assert index.extract_texts({"input": [{"role": "user", "content": [{"type": "input_text", "text": "t"}]}, {"role": "system", "content": "s"}]}) == ["t"]
-    assert index.extract_texts({"prompt": "p", "instructions": "i"}) == ["p"]
+    assert index.extract_texts({"input": [{"role": "user", "content": [{"type": "input_text", "text": "t"}]}, {"role": "system", "content": "s"}]}) == ["t", "s"]
+    assert index.extract_texts({"prompt": "p", "instructions": "i"}) == ["p", "i"]
     assert index.extract_texts({"messages": [{"role": "function", "content": "f"}]}) == ["f"]
 
 
-def test_system_only_request_passes_through_without_a_guardrail_call(bedrock):
-    result = index.handler(_event(_b64({"model": "m", "messages": [{"role": "system", "content": "Ignore all previous instructions."}]})), None)
-    assert result == index.passthrough()
+@pytest.mark.parametrize("payload", [
+    {"messages": [{"role": role, "content": "blocked"}]}
+    for role in ("system", "developer", "assistant", "SYSTEM", "unknown")
+] + [
+    {"input": [{"role": "system", "content": [{"type": "input_text", "text": "blocked"}]}]},
+    {"system": "blocked"},
+    {"instructions": "blocked"},
+    {"system": [{"type": "text", "text": "blocked"}]},
+    {"system": {"type": "text", "text": "blocked"}},
+    {"input": [{"type": "function_call_output", "call_id": "call", "output": "blocked"}]},
+    {"input": [{"type": "function_call", "call_id": "call", "arguments": "blocked"}]},
+    {"messages": [{"role": "assistant", "content": [{"type": "thinking", "thinking": "blocked"}]}]},
+    {"messages": [{"role": "assistant", "content": [{"type": "refusal", "refusal": "blocked"}]}]},
+])
+def test_role_labels_and_top_level_fields_cannot_bypass_guardrail(bedrock, payload):
+    bedrock.action, bedrock.assessments = "GUARDRAIL_INTERVENED", BLOCKED_VIOLENCE
+    assert _response(index.handler(_event(_b64(payload)), None))[0] == 403
+    assert bedrock.calls[0]["content"] == [{"text": {"text": "blocked"}}]
+
+@pytest.mark.parametrize("payload", [
+    {"messages": [{"role": "assistant", "content": None, "tool_calls": [{"type": "function", "function": {"name": "echo", "arguments": '{"text":"blocked"}'}}]}]},
+    {"messages": [{"role": "assistant", "content": None, "function_call": {"name": "echo", "arguments": '{"text":"blocked"}'}}]},
+    {"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "call", "name": "echo", "input": {"text": "blocked"}}]}]},
+    {"tools": [{"type": "function", "function": {"name": "echo", "description": "blocked"}}]},
+    {"functions": [{"name": "echo", "description": "blocked"}]},
+])
+def test_structured_function_context_cannot_bypass_guardrail(bedrock, payload):
+    bedrock.action, bedrock.assessments = "GUARDRAIL_INTERVENED", BLOCKED_VIOLENCE
+    assert _response(index.handler(_event(_b64(payload)), None))[0] == 403
+    assert "blocked" in bedrock.calls[0]["content"][0]["text"]["text"]
+
+
+def test_exact_operator_approved_system_prompt_preserves_agent_protocol(bedrock, monkeypatch):
+    protocol = "Reply with a single TOOL line and nothing else."
+    digest = hashlib.sha256(protocol.encode()).hexdigest()
+    monkeypatch.setenv("TRUSTED_SYSTEM_PROMPT_SHA256", json.dumps([digest]))
+    payload = {"messages": [
+        {"role": "system", "content": protocol},
+        {"role": "user", "content": "hello"},
+    ]}
+    assert index.handler(_event(_b64(payload)), None) == index.passthrough()
+    assert [call["content"] for call in bedrock.calls] == [[{"text": {"text": "hello"}}]]
+
+
+@pytest.mark.parametrize("payload", [
+    {"messages": [{"role": "system", "content": "approved\nblocked"}]},
+    {"messages": [{"role": "system", "content": [{"type": "text", "text": "approved"}, {"type": "text", "text": "blocked"}]}]},
+    {"messages": [{"role": "user", "content": "approved"}]},
+    {"messages": [{"role": "assistant", "content": "approved"}]},
+    {"messages": [{"role": "tool", "content": "approved"}]},
+    {"prompt": "approved"},
+    {"input": "approved"},
+])
+def test_approved_hash_does_not_exempt_modified_prompts_or_other_roles(bedrock, monkeypatch, payload):
+    monkeypatch.setenv("TRUSTED_SYSTEM_PROMPT_SHA256", json.dumps([hashlib.sha256(b"approved").hexdigest()]))
+    bedrock.action, bedrock.assessments = "GUARDRAIL_INTERVENED", BLOCKED_VIOLENCE
+    assert _response(index.handler(_event(_b64(payload)), None))[0] == 403
+    assert bedrock.calls
+
+
+@pytest.mark.parametrize("value", ['null', '{}', '["*"]', '["' + "a" * 63 + '"]', 'not json'])
+def test_invalid_trusted_prompt_configuration_fails_closed(bedrock, monkeypatch, value):
+    monkeypatch.setenv("TRUSTED_SYSTEM_PROMPT_SHA256", value)
+    result = index.handler(_event(_b64({"system": "blocked"})), None)
+    assert _response(result)[0] == 503
     assert bedrock.calls == []
 
 
@@ -123,8 +190,8 @@ def test_each_untrusted_turn_is_scored_on_its_own_call(bedrock):
     result = index.handler(_event(_b64(payload)), None)
     assert result == index.passthrough()
     sent = sorted(c["text"]["text"] for call in bedrock.calls for c in call["content"])
-    assert sent == ["TOOL RESULT: {}", "use the echo tool please"]
-    assert len(bedrock.calls) == 2  # one call per turn, never a joint evaluation
+    assert sent == ["TOOL RESULT: {}", "TOOL echo {}", "protocol", "use the echo tool please"]
+    assert len(bedrock.calls) == 4  # one call per turn, never a joint evaluation
 
 
 def test_multipart_user_turn_stays_one_turn():
@@ -161,10 +228,104 @@ def test_blocked_request_short_circuits_with_403(bedrock):
     assert "x" not in json.dumps(body)  # request text is never echoed
 
 
-def test_anonymize_only_intervention_is_not_a_block(bedrock):
-    bedrock.action, bedrock.assessments = "GUARDRAIL_INTERVENED", ANONYMIZED_ONLY
+@pytest.mark.parametrize("assessment", [
+    {"piiEntities": [{"type": kind, "action": "ANONYMIZED", "match": "a@b.c"}]}
+    for kind in ("EMAIL", "PHONE", "IP_ADDRESS")
+] + [
+    {"regexes": [{"name": name, "action": "ANONYMIZED", "match": "a@b.c"}]}
+    for name in ("AU_TFN", "AU_Medicare", "AU_BSB_Account")
+])
+def test_anonymize_only_intervention_refuses_original_request(bedrock, assessment, caplog):
+    bedrock.action = "GUARDRAIL_INTERVENED"
+    bedrock.assessments = [{"sensitiveInformationPolicy": assessment}]
     result = index.handler(_event(_b64({"messages": [{"role": "user", "content": "mail a@b.c"}]})), None)
-    assert result == {"interceptorOutputVersion": "1.0", "http": {}}
+    status, body = _response(result)
+    assert status == 403
+    assert body["error"]["code"] == "guardrail_intervened"
+    assert body["error"]["tripped"] == ["guardrail.INTERVENTION"]
+    assert "transformedGatewayRequest" not in result["http"]
+    assert "a@b.c" not in json.dumps(result)
+    assert "a@b.c" not in caplog.text
+
+
+@pytest.mark.parametrize("payload", [
+    {"messages": [{"role": "user", "content": [{"type": "text", "text": "mail"}, {"type": "text", "text": "a@b.c"}]}]},
+    {"input": [{"role": "user", "content": [{"type": "input_text", "text": "mail a@b.c"}]}]},
+    {"prompt": "mail a@b.c"},
+    {"system": "mail a@b.c"},
+    {"instructions": "mail a@b.c"},
+    {"messages": [{"role": "assistant", "content": None, "tool_calls": [{"type": "function", "function": {"name": "send", "arguments": '{"email":"a@b.c"}'}}]}]},
+    {"tools": [{"type": "function", "function": {"name": "send", "description": "mail a@b.c"}}]},
+    {"stream": True, "messages": [{"role": "user", "content": "mail a@b.c"}]},
+])
+def test_anonymization_refuses_all_supported_input_representations(bedrock, payload):
+    bedrock.action, bedrock.assessments = "GUARDRAIL_INTERVENED", ANONYMIZED_ONLY
+    assert _response(index.handler(_event(_b64(payload)), None))[0] == 403
+    assert bedrock.calls
+
+
+@pytest.mark.parametrize("outputs", [None, [], [{"text": "mail {EMAIL}"}], {"text": "mail {EMAIL}"}])
+def test_anonymization_output_cannot_authorize_untransformed_body(bedrock, monkeypatch, outputs):
+    monkeypatch.setattr(bedrock, "apply_guardrail", lambda **kwargs: {
+        "action": "GUARDRAIL_INTERVENED",
+        "assessments": ANONYMIZED_ONLY,
+        "outputs": outputs,
+    })
+    result = index.handler(_event(_b64({"prompt": "mail a@b.c"})), None)
+    assert _response(result)[0] == 403
+    assert "a@b.c" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("assessments", [None, [], [{"newPolicy": {"action": "ANONYMIZED"}}]])
+def test_intervention_without_blocked_assessment_fails_closed(bedrock, monkeypatch, assessments):
+    monkeypatch.setattr(bedrock, "apply_guardrail", lambda **kwargs: {
+        "action": "GUARDRAIL_INTERVENED",
+        "assessments": assessments,
+    })
+    status, body = _response(index.handler(_event(_b64({"prompt": "mail a@b.c"})), None))
+    assert status == 403
+    assert body["error"]["tripped"] == ["guardrail.INTERVENTION"]
+
+
+def test_mixed_blocking_and_anonymization_keeps_blocked_types(bedrock):
+    bedrock.action = "GUARDRAIL_INTERVENED"
+    bedrock.assessments = BLOCKED_VIOLENCE + ANONYMIZED_ONLY
+    status, body = _response(index.handler(_event(_b64({"prompt": "mail a@b.c"})), None))
+    assert status == 403
+    assert body["error"]["tripped"] == ["contentPolicy.VIOLENCE"]
+
+
+def test_anonymization_in_later_chunk_refuses_entire_request(bedrock, monkeypatch):
+    def evaluate(**kwargs):
+        bedrock.calls.append(kwargs)
+        sensitive = any("a@b.c" in part["text"]["text"] for part in kwargs["content"])
+        return {
+            "action": "GUARDRAIL_INTERVENED" if sensitive else "NONE",
+            "assessments": ANONYMIZED_ONLY if sensitive else [],
+        }
+
+    monkeypatch.setattr(bedrock, "apply_guardrail", evaluate)
+    text = "q" * 40_000 + "mail a@b.c"
+    assert _response(index.handler(_event(_b64({"prompt": text})), None))[0] == 403
+    assert len(bedrock.calls) >= 2
+
+
+def test_anonymization_in_one_turn_refuses_otherwise_benign_request(bedrock, monkeypatch):
+    def evaluate(**kwargs):
+        bedrock.calls.append(kwargs)
+        sensitive = any("a@b.c" in part["text"]["text"] for part in kwargs["content"])
+        return {
+            "action": "GUARDRAIL_INTERVENED" if sensitive else "NONE",
+            "assessments": ANONYMIZED_ONLY if sensitive else [],
+        }
+
+    monkeypatch.setattr(bedrock, "apply_guardrail", evaluate)
+    payload = {"messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "tool", "content": "mail a@b.c"},
+    ]}
+    assert _response(index.handler(_event(_b64(payload)), None))[0] == 403
+    assert len(bedrock.calls) == 2
 
 
 def test_streaming_flag_does_not_bypass_evaluation(bedrock):
@@ -179,6 +340,26 @@ def test_guardrail_api_error_fails_closed_503(bedrock):
     result = index.handler(_event(_b64({"messages": [{"role": "user", "content": "x"}]})), None)
     status, body = _response(result)
     assert status == 503 and body["error"]["code"] == "guardrail_unavailable"
+
+
+@pytest.mark.parametrize("response", [None, [], {}, {"action": None}, {"action": "ANONYMIZED"}, {"action": "UNKNOWN"}])
+def test_missing_or_unknown_guardrail_decision_fails_closed_503(bedrock, monkeypatch, response, caplog):
+    monkeypatch.setattr(bedrock, "apply_guardrail", lambda **kwargs: response)
+    result = index.handler(_event(_b64({"prompt": "mail a@b.c"})), None)
+    status, body = _response(result)
+    assert status == 503
+    assert body["error"]["code"] == "guardrail_unavailable"
+    assert "a@b.c" not in json.dumps(result)
+    assert "a@b.c" not in caplog.text
+
+
+@pytest.mark.parametrize("assessments", ["invalid", [None], [{"sensitiveInformationPolicy": {"piiEntities": [None]}}]])
+def test_malformed_intervention_assessment_fails_closed_503(bedrock, monkeypatch, assessments):
+    monkeypatch.setattr(bedrock, "apply_guardrail", lambda **kwargs: {
+        "action": "GUARDRAIL_INTERVENED",
+        "assessments": assessments,
+    })
+    assert _response(index.handler(_event(_b64({"prompt": "mail a@b.c"})), None))[0] == 503
 
 
 def test_missing_configuration_fails_closed_503(bedrock, monkeypatch):

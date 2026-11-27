@@ -17,11 +17,13 @@ import json
 import os
 import re
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = "agenticai.ga-registry-consumer-context/1.0"
+ARCHIVE_SCHEMA_VERSION = "agenticai.ga-registry-consumer-context/2.0"
 GOVERNANCE_SCHEMA_VERSION = "agenticai.tool-governance/1.0"
 SYSTEM_TAG_PREFIX = "aws:cloudformation:"
 TOOL_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,62}[a-z0-9]$")
@@ -81,12 +83,23 @@ class ResolverConfig:
     source_revision: str
     output: Path
     assume_reader: bool = False
+    source_archive: dict[str, str] | None = None
+    source_checkout: Path | None = None
 
     def __post_init__(self) -> None:
         require(bool(ACCOUNT_PATTERN.fullmatch(self.account_id)), "--account-id must be 12 digits")
         require(bool(REGION_PATTERN.fullmatch(self.region)), "--region is invalid")
         require(self.environment in {"nonprod", "prod"}, "--environment must be nonprod or prod")
-        require(bool(SHA_PATTERN.fullmatch(self.source_revision)), "--source-revision must be a full lower-case Git SHA")
+        if self.source_archive is None:
+            require(bool(SHA_PATTERN.fullmatch(self.source_revision)), "--source-revision must be a full lower-case Git SHA")
+        else:
+            from source_provenance import validate_archive
+            try:
+                validate_archive(self.source_archive)
+            except ValueError as error:
+                raise ResolutionError(str(error)) from error
+            require(self.source_revision == f"s3-sha256:{self.source_archive['sha256']}",
+                    "source revision must match the verified S3 archive")
         require(bool(self.expected_tool_ids), "--expected-tool-id is required")
         require(len(set(self.expected_tool_ids)) == len(self.expected_tool_ids), "--expected-tool-id values must be unique")
         for tool_id in self.expected_tool_ids:
@@ -150,6 +163,13 @@ class RegistryAws:
         import boto3  # Lazy: unit tests do not need or import the SDK.
 
         base = boto3.Session(region_name=config.region)
+        if config.source_archive:
+            from source_provenance import verify_archive
+            try:
+                verify_archive(base.client("s3"), config.source_archive,
+                               config.source_checkout or Path.cwd())
+            except (ValueError, OSError, zipfile.BadZipFile) as error:
+                raise ResolutionError("immutable source verification failed") from error
         identity = base.client("sts").get_caller_identity()
         caller_account = str(identity.get("Account", ""))
         if config.assume_reader:
@@ -365,11 +385,12 @@ def resolve_context(aws: Any, config: ResolverConfig) -> dict[str, Any]:
         )
 
     return {
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": ARCHIVE_SCHEMA_VERSION if config.source_archive else SCHEMA_VERSION,
         "environment": config.environment,
         "region": config.region,
         "platformAccountId": config.account_id,
         "sourceRevision": config.source_revision,
+        **({"sourceArchive": config.source_archive} if config.source_archive else {}),
         "registryId": registry_id,
         "registryArn": expected_registry_arn,
         "readerRoleArn": config.reader_role_arn,
@@ -399,6 +420,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cost-centre", required=True)
     parser.add_argument("--expected-tool-id", action="append", required=True)
     parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--source-bucket")
+    parser.add_argument("--source-key")
+    parser.add_argument("--source-sha256")
+    parser.add_argument("--source-owner")
+    parser.add_argument("--source-checkout", default=".")
     parser.add_argument("--output", required=True)
     parser.add_argument(
         "--assume-reader",
@@ -409,6 +435,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def config_from_args(args: argparse.Namespace) -> ResolverConfig:
+    archive_fields = (args.source_bucket, args.source_key, args.source_sha256, args.source_owner)
+    require(not any(archive_fields) or all(archive_fields), "all S3 provenance fields are required together")
+    archive = None
+    revision = args.source_revision
+    if all(archive_fields):
+        archive = {
+            "bucketName": args.source_bucket, "objectKey": args.source_key,
+            "versionId": revision, "sha256": args.source_sha256,
+            "ownerAccountId": args.source_owner,
+        }
+        revision = f"s3-sha256:{args.source_sha256}"
     return ResolverConfig(
         account_id=args.account_id,
         region=args.region,
@@ -418,9 +455,11 @@ def config_from_args(args: argparse.Namespace) -> ResolverConfig:
         tenant_id=args.tenant_id,
         cost_centre=args.cost_centre,
         expected_tool_ids=tuple(args.expected_tool_id),
-        source_revision=args.source_revision,
+        source_revision=revision,
         output=Path(args.output),
         assume_reader=bool(args.assume_reader),
+        source_archive=archive,
+        source_checkout=Path(args.source_checkout),
     )
 
 
@@ -430,7 +469,8 @@ def run(
     aws_factory: Any = RegistryAws,
 ) -> int:
     try:
-        config = config_from_args(parse_args(argv))
+        args = parse_args(argv)
+        config = config_from_args(args)
         context = resolve_context(aws_factory(config), config)
         atomic_write(config.output, context)
     except ResolutionError as error:

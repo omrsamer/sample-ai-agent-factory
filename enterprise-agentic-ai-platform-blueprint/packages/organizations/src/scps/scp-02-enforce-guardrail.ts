@@ -33,6 +33,11 @@
  * SPDX-License-Identifier: MIT-0
  */
 import { toScpDefinition, type ScpDefinition } from "./index";
+import {
+  principalEntityDenyStatements,
+  protectedRolesForPurpose,
+  validateProtectedAuthorityManifest,
+} from "../protected-authority";
 
 export interface Scp02Options {
   /**
@@ -41,6 +46,8 @@ export interface Scp02Options {
    * `Null`-only gate and emits a synth-time warning.
    */
   readonly approvedGuardrailIds?: readonly string[];
+  /** Exact protected Gateway identities; omission permits no Mantle exception. */
+  readonly protectedAuthorityManifest?: unknown;
 }
 
 /** Bedrock inference actions the guardrail requirement applies to (valid IAM actions only). */
@@ -53,14 +60,15 @@ const NOT_AWS_SERVICE = {
   BoolIfExists: { "aws:PrincipalIsAWSService": "false" },
 };
 
-/**
- * Role-name prefix of the Platform inference Gateway's Mantle role
- * (`AgenticAI-InferenceGateway-<env>`, platform-inference-gateway construct).
- */
-export const INFERENCE_GATEWAY_ROLE_PREFIX = "AgenticAI-InferenceGateway-";
-
 export function scp02EnforceGuardrail(opts: Scp02Options = {}): ScpDefinition {
   const approved = opts.approvedGuardrailIds ?? [];
+  const mantleRoles =
+    opts.protectedAuthorityManifest === undefined
+      ? []
+      : protectedRolesForPurpose(
+          validateProtectedAuthorityManifest(opts.protectedAuthorityManifest),
+          "mantle",
+        );
   for (const id of approved) {
     if (!/^arn:aws:bedrock:[a-z0-9-]+:\d{12}:guardrail\/[a-z0-9]+$/.test(id)) {
       throw new Error(
@@ -80,27 +88,19 @@ export function scp02EnforceGuardrail(opts: Scp02Options = {}): ScpDefinition {
         ...NOT_AWS_SERVICE,
       },
     },
-    {
+    ...principalEntityDenyStatements(
       // Bedrock Mantle has no guardrail condition key, so a direct
       // `bedrock-mantle:CreateInference` from a workload principal would skip
       // this SCP and the model allow-list. Guardrail enforcement on the
       // Mantle path exists only in the Platform inference Gateway's REQUEST
       // interceptor, so only that Gateway's role may call Mantle
       // (live-found gap, 2026-09-25).
-      Sid: "DenyDirectMantleInference",
-      Effect: "Deny",
-      Action: ["bedrock-mantle:CreateInference"],
-      Resource: "*",
-      Condition: {
-        ArnNotLike: {
-          "aws:PrincipalArn": [
-            `arn:aws:iam::*:role/${INFERENCE_GATEWAY_ROLE_PREFIX}*`,
-            `arn:aws:sts::*:assumed-role/${INFERENCE_GATEWAY_ROLE_PREFIX}*/*`,
-          ],
-        },
-        ...NOT_AWS_SERVICE,
-      },
-    },
+      "DenyDirectMantleInference",
+      ["bedrock-mantle:CreateInference"],
+      ["*"],
+      mantleRoles,
+      { awsServiceExempt: true },
+    ),
   ];
 
   if (approved.length > 0) {

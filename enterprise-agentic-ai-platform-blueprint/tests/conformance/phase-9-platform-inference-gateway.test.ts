@@ -30,6 +30,8 @@ const MODEL_LIMITS: readonly InferenceModelRateLimit[] = [
 
 function synth(
   modelRateLimits: readonly InferenceModelRateLimit[] = MODEL_LIMITS,
+  trustedSystemPromptHashes?: readonly string[],
+  authorizerType?: 'AWS_IAM' | 'CUSTOM_JWT',
 ): Template {
   const app = new App();
   const stack = new Stack(app, 'TestPlatformInferenceGateway', {
@@ -43,12 +45,15 @@ function synth(
     costCentre: 'platform',
     modelRateLimits,
     inputGuardrail: GUARDRAIL,
+    trustedSystemPromptHashes,
+    authorizerType,
   });
   return Template.fromStack(stack);
 }
 
 function synthWithReaders(
   readerAccountIds: readonly string[] | undefined,
+  readerRoleArns?: readonly string[],
 ): Template {
   const app = new App();
   const stack = new Stack(app, 'TestPlatformInferenceGatewayReaders', {
@@ -63,6 +68,7 @@ function synthWithReaders(
     modelRateLimits: MODEL_LIMITS,
     inputGuardrail: GUARDRAIL,
     m2mSecretReaderAccountIds: readerAccountIds,
+    m2mSecretReaderRoleArns: readerRoleArns,
   });
   return Template.fromStack(stack);
 }
@@ -138,6 +144,68 @@ describe('Phase 9 — native Platform inference Gateway', () => {
     expect(
       JSON.stringify(authorizer.CustomJWTAuthorizer.DiscoveryUrl),
     ).toContain('/.well-known/openid-configuration');
+  });
+
+  it('supports IAM-bound approved callers while retaining the REQUEST guardrail and target limits', () => {
+    const template = synth(MODEL_LIMITS, undefined, 'AWS_IAM');
+    const gateway = properties(
+      onlyResource(template, 'AWS::BedrockAgentCore::Gateway'),
+    );
+    expect(gateway.AuthorizerType).toBe('AWS_IAM');
+    expect(gateway.AuthorizerConfiguration).toBeUndefined();
+    expect(gateway.InterceptorConfigurations).toEqual([
+      expect.objectContaining({
+        InterceptionPoints: ['REQUEST'],
+        InputConfiguration: { PassRequestHeaders: false },
+        Interceptor: { Lambda: { Arn: expect.any(Object) } },
+      }),
+    ]);
+    template.resourceCountIs('AWS::BedrockAgentCore::GatewayTarget', 1);
+    template.resourceCountIs('AWS::BedrockAgentCore::GatewayRateLimit', 1);
+    expect(mantlePolicy(template)).toBeDefined();
+  });
+
+  it('keeps both machine clients outside human sign-in paths', () => {
+    const template = synthWithReaders(['111111111111']);
+    const clients = Object.values(
+      template.findResources('AWS::Cognito::UserPoolClient'),
+    );
+    expect(clients).toHaveLength(2);
+    for (const client of clients) {
+      const configuration = properties(client as Record<string, unknown>);
+      expect(configuration.AllowedOAuthFlows).toEqual(['client_credentials']);
+      expect(configuration.ExplicitAuthFlows).toEqual(['ALLOW_REFRESH_TOKEN_AUTH']);
+    }
+    const pool = properties(onlyResource(template, 'AWS::Cognito::UserPool'));
+    expect(pool.AdminCreateUserConfig).toEqual({ AllowAdminCreateUserOnly: true });
+    expect(pool.Policies).toEqual({
+      PasswordPolicy: {
+        MinimumLength: 12,
+        RequireLowercase: true,
+        RequireUppercase: true,
+        RequireNumbers: true,
+        RequireSymbols: true,
+        TemporaryPasswordValidityDays: 1,
+      },
+    });
+  });
+
+  it('bounds concurrent guardrail enforcement in IAM and JWT modes', () => {
+    for (const mode of ['AWS_IAM', 'CUSTOM_JWT'] as const) {
+      synth(MODEL_LIMITS, undefined, mode).hasResourceProperties(
+        'AWS::Lambda::Function',
+        {
+          FunctionName: 'agenticai-inference-guardrail-nonprod',
+          ReservedConcurrentExecutions: 10,
+        },
+      );
+    }
+  });
+
+  it.each(['NONE', 'AWS_IAM*', '', true])('rejects unsupported authorizer %s', (mode) => {
+    expect(() => synth(MODEL_LIMITS, undefined, mode as 'AWS_IAM')).toThrow(
+      /authorizerType must be AWS_IAM or CUSTOM_JWT/,
+    );
   });
 
   it('applies all five required tags to the taggable Gateway', () => {
@@ -479,6 +547,50 @@ describe('Phase 9 — opt-in cross-account M2M secret', () => {
       /12-digit account IDs/,
     );
   });
+
+  it('limits both secret and CMK reader grants to exact role ARNs without requiring those roles to exist', () => {
+    const role1 = 'arn:aws:iam::444444444444:role/AgenticAI-D03-nonprod-shared-shared-idprov';
+    const role2 = 'arn:aws:iam::555555555555:role/AgenticAI-D03-nonprod-shared-shared-idprov';
+    const template = synthWithReaders(['444444444444', '555555555555'], [role1, role2]);
+    const policy = properties(onlyResource(template, 'AWS::SecretsManager::ResourcePolicy')) as any;
+    const reader = policy.ResourcePolicy.Statement.find((statement: any) => statement.Sid === 'AllowWorkstreamRead');
+    expect(reader.Condition).toEqual({ ArnEquals: { 'aws:PrincipalArn': [role1, role2] } });
+    const key = properties(onlyResource(template, 'AWS::KMS::Key')) as any;
+    for (const [account, role] of [['444444444444', role1], ['555555555555', role2]]) {
+      const decrypt = key.KeyPolicy.Statement.find((statement: any) => statement.Sid === `AllowDecrypt${account}`);
+      expect(decrypt.Condition).toEqual({
+        StringEquals: { 'kms:ViaService': 'secretsmanager.us-west-2.amazonaws.com' },
+        ArnEquals: { 'aws:PrincipalArn': [role] },
+      });
+    }
+    // Reader narrowing preserves the owning account's default IAM delegation.
+    expect(key.KeyPolicy.Statement.some((statement: any) =>
+      statement.Action === 'kms:*' && JSON.stringify(statement.Principal).includes('123456789012'))).toBe(true);
+  });
+
+  it.each([
+    '',
+    'arn:aws:iam::444444444444:role/AgenticAI-*',
+    'arn:aws:iam::444444444444:user/reader',
+    'arn:aws:sts::444444444444:assumed-role/reader/session',
+    'arn:aws:iam::444444444444:role/',
+    'arn:aws:iam::444444444444:role//reader',
+    'arn:aws:iam::444444444444:role/reader ',
+    'arn:aws:iam::999999999999:role/foreign-reader',
+  ])('rejects a malformed, wildcard or foreign reader role %s', role => {
+    expect(() => synthWithReaders(['444444444444'], [role])).toThrow(/exact IAM roles/);
+  });
+
+  it('refuses an empty explicit role list or roles without declared reader accounts', () => {
+    const role = 'arn:aws:iam::444444444444:role/reader';
+    expect(() => synthWithReaders(['444444444444'], [])).toThrow(/exact IAM role ARNs/);
+    expect(() => synthWithReaders(undefined, [role])).toThrow(/declared reader accounts/);
+    expect(() => synthWithReaders(['444444444444', '555555555555'], [role])).toThrow(/every declared reader account/);
+  });
+
+  it('refuses a number coerced into a reader account string', () => {
+    expect(() => synthWithReaders([444444444444 as unknown as string])).toThrow(/12-digit account IDs/);
+  });
 });
 
 describe('Phase 9 — server-side guardrail enforcement (REQUEST interceptor)', () => {
@@ -511,11 +623,26 @@ describe('Phase 9 — server-side guardrail enforcement (REQUEST interceptor)', 
       GUARDRAIL_IDENTIFIER: 'abcdef123456',
       GUARDRAIL_VERSION: 'DRAFT',
       MAX_GUARDED_CHARACTERS: '200000',
+      TRUSTED_SYSTEM_PROMPT_SHA256: "[]",
       ENV_NAME: 'nonprod',
     });
     // Shipped as a file asset (real handler), not an inline stub.
     expect((fn.Code as any).S3Bucket).toBeDefined();
     expect((fn.Code as any).ZipFile).toBeUndefined();
+  });
+
+  it("publishes only operator-approved exact prompt digests and rejects wildcard configuration", () => {
+    const digest = "a".repeat(64);
+    const fn = properties(
+      onlyResource(synth(MODEL_LIMITS, [digest]), 'AWS::Lambda::Function'),
+    );
+    expect((fn.Environment as any).Variables.TRUSTED_SYSTEM_PROMPT_SHA256).toBe(
+      JSON.stringify([digest]),
+    );
+    expect(() => synth(MODEL_LIMITS, ['*'])).toThrow(/lowercase SHA-256/);
+    expect(() => synth(MODEL_LIMITS, [digest.toUpperCase()])).toThrow(
+      /lowercase SHA-256/,
+    );
   });
 
   it('grants the interceptor role ApplyGuardrail on exactly the platform guardrail ARN', () => {

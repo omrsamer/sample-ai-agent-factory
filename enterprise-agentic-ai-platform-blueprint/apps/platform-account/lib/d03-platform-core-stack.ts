@@ -23,7 +23,10 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: MIT-0
  */
-import { CfnOutput, Duration, RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib';
+import {
+  ArnFormat,
+  CfnOutput, Duration, RemovalPolicy, Stack, StackProps,
+} from 'aws-cdk-lib';
 import { CfnApplicationInferenceProfile } from 'aws-cdk-lib/aws-bedrock';
 import {
   AccountRecovery,
@@ -63,12 +66,23 @@ import {
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 
+import {
+  d03BedrockCallerRoleName,
+  d03RuntimeRoleName,
+} from "../../d03-authorization";
+
 import { PlatformBaselineGuardrail } from '@agenticai/bedrock-guardrails';
 import { allowedBedrockResources, PLATFORM_ALLOWED_MODELS } from '@agenticai/platform-baselines';
 import {
   PLATFORM_TOOL_CATALOGUE,
   composeCedarPolicyDocument,
 } from '@agenticai/platform-tool-catalogue';
+
+const REGISTRY_TABLE_NAMES = {
+  agents: 'agenticai-d03-registry-agents',
+  tools: 'agenticai-d03-registry-tools',
+  experiments: 'agenticai-d03-experiment-tracking',
+} as const;
 
 /**
  * Per-tenant allocation. One application inference profile is emitted per
@@ -117,7 +131,8 @@ export interface D03PlatformCoreStackProps extends StackProps {
 
 export class D03PlatformCoreStack extends Stack {
   readonly guardrail: PlatformBaselineGuardrail;
-  readonly bedrockCallerRole: Role;
+  /** One bounded caller role per `${tenantId}__${agentId}` allocation. */
+  readonly bedrockCallerRoles: Record<string, Role> = {};
   readonly userPool: UserPool;
   readonly userPoolClient: UserPoolClient;
   readonly agentTable: Table;
@@ -134,6 +149,45 @@ export class D03PlatformCoreStack extends Stack {
     const workloadPrincipals = props.workloadAccountIds.map(
       (acct) => new AccountPrincipal(acct),
     );
+    if (
+      props.workloadAccountIds.length === 0 ||
+      props.workloadAccountIds.some(
+        (acct) => typeof acct !== "string" || !/^[0-9]{12}$/.test(acct),
+      )
+    ) {
+      throw new Error(
+        "D03 workloadAccountIds must contain exact 12-digit AWS account IDs.",
+      );
+    }
+    const allocations: readonly D03TenantAllocation[] =
+      props.tenantAllocations ?? [
+        {
+          tenantId: 'demo',
+          agentId: 'primary',
+          workloadAccountId: props.workloadAccountIds[0],
+          costCentre: 'platform',
+          envName: 'nonprod',
+        },
+      ];
+    const allocationRoleNames = new Set<string>();
+    for (const alloc of allocations) {
+      const callerName = d03BedrockCallerRoleName(
+        alloc.tenantId,
+        alloc.agentId,
+      );
+      d03RuntimeRoleName(alloc.tenantId, alloc.agentId);
+      if (!props.workloadAccountIds.includes(alloc.workloadAccountId)) {
+        throw new Error(
+          "Every D03 allocation must belong to a configured workloadAccountId.",
+        );
+      }
+      if (allocationRoleNames.has(callerName)) {
+        throw new Error(
+          "D03 allocations must have distinct tenant/agent role names.",
+        );
+      }
+      allocationRoleNames.add(callerName);
+    }
 
     // Safe defaults: retain keys + 30d pending window. Flip via
     // `retainDataKeys: false` for dev-loop teardown only (see class JSDoc).
@@ -159,13 +213,13 @@ export class D03PlatformCoreStack extends Stack {
         resources: ['*'],
       }),
     );
-    for (const p of workloadPrincipals) {
+    for (const [index, alloc] of allocations.entries()) {
       registryKey.addToResourcePolicy(
         new PolicyStatement({
-          sid: `AllowWorkloadReadKms${p.accountId}`,
+          sid: `AllowAllocatedRuntimeKms${index}`,
           effect: Effect.ALLOW,
-          principals: [p],
-          actions: ['kms:Decrypt', 'kms:DescribeKey'],
+          principals: [new AccountPrincipal(alloc.workloadAccountId)],
+          actions: ['kms:Decrypt', "kms:GenerateDataKey", 'kms:DescribeKey'],
           resources: ['*'],
           // Tighten cross-account usage: the call MUST originate from the
           // named workload account AND be delegated by the DynamoDB service
@@ -173,8 +227,11 @@ export class D03PlatformCoreStack extends Stack {
           // `kms:Decrypt` by any principal in the workload account against
           // bare ciphertext obtained elsewhere.
           conditions: {
+            ArnEquals: {
+              'aws:PrincipalArn': `arn:aws:iam::${alloc.workloadAccountId}:role/${d03RuntimeRoleName(alloc.tenantId, alloc.agentId)}`,
+            },
             StringEquals: {
-              'kms:CallerAccount': p.accountId,
+              'kms:CallerAccount': alloc.workloadAccountId,
               'kms:ViaService': [
                 `dynamodb.${this.region}.amazonaws.com`,
               ],
@@ -340,121 +397,6 @@ export class D03PlatformCoreStack extends Stack {
       true,
     );
 
-    // ---- BedrockCallerRole — cross-account entry point for workloads ----
-    // Trust:
-    //   - Principal set = workload account roots (the identity space).
-    //   - StringEquals sts:ExternalId = shared rotated ExternalId.
-    //   - StringLike aws:PrincipalArn = the per-tenant runtime role ARNs the
-    //     workload accounts are expected to mint
-    //     (`arn:aws:iam::<acct>:role/AgenticAI-D03-*-runtime`). This narrows
-    //     the set of concrete principals within the workload accounts that
-    //     can actually assume — a random IAM user in the workload account
-    //     cannot.
-    //   - StringLike sts:RoleSessionName = `workload-*` (stable convention
-    //     `workload-<acct>-<tenant>-<agent>` documented in README section 9).
-    //     Audit attribution survives role chaining via RoleSessionName.
-    // AssumeRole only — we do NOT grant `sts:TagSession` because session
-    // tags do not survive the `account-root → runtime-role →
-    // cross-account-role` chain in AWS (BUG-005, verified in live test
-    // 2026-04-30). CUR attribution is instead carried by per-tenant
-    // platform-owned application inference profiles (see
-    // `appInferenceProfiles` below) whose tags flow directly to CUR.
-    this.bedrockCallerRole = new Role(this, 'BedrockCallerRole', {
-      roleName: 'AgenticAI-D03-BedrockCaller',
-      // A syntactically-valid placeholder; we overwrite the trust document
-      // below via the underlying CfnRole so we can emit a hand-tuned doc
-      // with the full Condition block (CDK's `externalIds` + `AssumedBy`
-      // sugar does not support additional StringLike conditions).
-      assumedBy: new (require('aws-cdk-lib/aws-iam').CompositePrincipal)(...workloadPrincipals),
-      description:
-        'D-03: cross-account role that workload agents assume to call Bedrock via platform-enforced guardrail.',
-      maxSessionDuration: Duration.hours(1),
-    });
-    // Hand-written trust policy — replaces the CDK-generated doc so we can
-    // add StringLike conditions on aws:PrincipalArn and sts:RoleSessionName.
-    const runtimeRoleArnGlobs = props.workloadAccountIds.map(
-      (acct) => `arn:aws:iam::${acct}:role/AgenticAI-D03-*-runtime`,
-    );
-    const cfnBedrockCallerRole = this.bedrockCallerRole.node
-      .defaultChild as import('aws-cdk-lib/aws-iam').CfnRole;
-    cfnBedrockCallerRole.assumeRolePolicyDocument = {
-      Version: '2012-10-17',
-      Statement: [
-        {
-          Sid: 'AllowWorkloadRuntimeRolesWithExternalId',
-          Effect: 'Allow',
-          Principal: {
-            AWS: props.workloadAccountIds.map((acct) => `arn:aws:iam::${acct}:root`),
-          },
-          Action: 'sts:AssumeRole',
-          Condition: {
-            StringEquals: {
-              'sts:ExternalId': props.externalId,
-            },
-            StringLike: {
-              // Only runtime roles named `AgenticAI-D03-*-runtime` may assume.
-              'aws:PrincipalArn': runtimeRoleArnGlobs,
-              // Stable audit-attribution session name convention
-              // `workload-<acct>-<tenant>-<agent>`.
-              'sts:RoleSessionName': 'workload-*',
-            },
-          },
-        },
-      ],
-    };
-    // NOTE: the `AllowInvokeAllowlistedBedrock` statement is attached AFTER
-    // per-tenant application inference profiles are created below, so it can
-    // list the exact per-tenant profile ARNs instead of a blanket
-    // `application-inference-profile/*` (which would cross tenant boundaries).
-
-    // Deny inference if `bedrock:GuardrailIdentifier` is missing OR wrong.
-    // Must be TWO statements:
-    //   (a) Null-gate: fires when the key is absent from the request.
-    //   (b) StringNotEquals: fires when the key IS present but carries an
-    //       id/arn other than the baseline guardrail (or empty string).
-    // A single `ForAnyValue:StringNotEquals` does NOT cover the missing-key
-    // case — when the request carries no value, the set is empty and
-    // `ForAnyValue` evaluates false, so the deny never fires. Live test
-    // 2026-05-01 T7 caught this: unguardrailed Converse passed when only
-    // the `ForAnyValue:StringNotEquals` statement was present.
-    this.bedrockCallerRole.addToPolicy(
-      new PolicyStatement({
-        sid: 'DenyInferenceWithMissingGuardrail',
-        effect: Effect.DENY,
-        actions: [
-          'bedrock:InvokeModel',
-          'bedrock:InvokeModelWithResponseStream',
-          'bedrock:Converse',
-          'bedrock:ConverseStream',
-        ],
-        resources: ['*'],
-        conditions: {
-          Null: { 'bedrock:GuardrailIdentifier': 'true' },
-        },
-      }),
-    );
-    this.bedrockCallerRole.addToPolicy(
-      new PolicyStatement({
-        sid: 'DenyInferenceWithWrongGuardrail',
-        effect: Effect.DENY,
-        actions: [
-          'bedrock:InvokeModel',
-          'bedrock:InvokeModelWithResponseStream',
-          'bedrock:Converse',
-          'bedrock:ConverseStream',
-        ],
-        resources: ['*'],
-        conditions: {
-          'ForAnyValue:StringNotEquals': {
-            'bedrock:GuardrailIdentifier': [
-              this.guardrail.guardrail.attrGuardrailId,
-              this.guardrail.guardrail.attrGuardrailArn,
-            ],
-          },
-        },
-      }),
-    );
-
     // ---- Cognito User Pool (platform-issued JWT) ----
     this.userPool = new UserPool(this, 'UserPool', {
       userPoolName: 'agenticai-d03-platform',
@@ -506,13 +448,13 @@ export class D03PlatformCoreStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     };
     this.agentTable = new Table(this, 'AgentTable', {
-      tableName: 'agenticai-d03-registry-agents',
+      tableName: REGISTRY_TABLE_NAMES.agents,
       partitionKey: { name: 'tenantId', type: AttributeType.STRING },
       sortKey: { name: 'agentId', type: AttributeType.STRING },
       ...commonTableProps,
     });
     this.toolTable = new Table(this, 'ToolTable', {
-      tableName: 'agenticai-d03-registry-tools',
+      tableName: REGISTRY_TABLE_NAMES.tools,
       partitionKey: { name: 'tenantId', type: AttributeType.STRING },
       sortKey: { name: 'toolId', type: AttributeType.STRING },
       ...commonTableProps,
@@ -520,7 +462,7 @@ export class D03PlatformCoreStack extends Stack {
 
     // ---- Experiment tracking table (ref-arch gap G4) ----
     this.experimentTable = new Table(this, 'ExperimentTable', {
-      tableName: 'agenticai-d03-experiment-tracking',
+      tableName: REGISTRY_TABLE_NAMES.experiments,
       partitionKey: { name: 'tenantId', type: AttributeType.STRING },
       sortKey: { name: 'runId', type: AttributeType.STRING },
       ...commonTableProps,
@@ -531,16 +473,60 @@ export class D03PlatformCoreStack extends Stack {
       sortKey: { name: 'timestamp', type: AttributeType.STRING },
     });
 
-    // H-A: scope cross-account DDB access to runtime-role ARNs only via
-    // identity-policy condition on the calling principal's IAM policy.
-    // Workload-side runtime role identity policies and
-    // dynamodb:LeadingKeys enforce tenant isolation without introducing a
-    // circular dependency across these tables.
-    for (const acct of props.workloadAccountIds) {
-      for (const table of [this.agentTable, this.toolTable, this.experimentTable]) {
-        table.grantReadData(new AccountPrincipal(acct));
+    // The platform resource policies enforce the allocation even if a
+    // workload administrator replaces a runtime's identity policy.
+    // Account roots are identity namespaces, never unconditioned delegates.
+    for (const [index, alloc] of allocations.entries()) {
+      const conditions = {
+        ArnEquals: {
+          'aws:PrincipalArn': `arn:aws:iam::${alloc.workloadAccountId}:role/${d03RuntimeRoleName(alloc.tenantId, alloc.agentId)}`,
+        },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [alloc.tenantId],
+        },
+        Null: { "dynamodb:LeadingKeys": "false" },
+      };
+      for (const [table, tableName] of [
+        [this.agentTable, REGISTRY_TABLE_NAMES.agents],
+        [this.toolTable, REGISTRY_TABLE_NAMES.tools],
+        [this.experimentTable, REGISTRY_TABLE_NAMES.experiments],
+      ] as const) {
+        // These tables have explicit physical names. A GetAtt of this same
+        // table inside its inline resource policy would be a CFN self-cycle.
+        const tableArn = this.formatArn({
+          service: "dynamodb",
+          resource: "table",
+          resourceName: tableName,
+          arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+        });
+        table.addToResourcePolicy(
+          new PolicyStatement({
+            sid: `AllowAllocatedRuntimeRead${index}`,
+            effect: Effect.ALLOW,
+            principals: [new AccountPrincipal(alloc.workloadAccountId)],
+            actions: ["dynamodb:GetItem", "dynamodb:Query"],
+            resources: [tableArn, `${tableArn}/index/*`],
+            conditions,
+          }),
+        );
       }
-      this.experimentTable.grantWriteData(new AccountPrincipal(acct));
+      this.experimentTable.addToResourcePolicy(
+        new PolicyStatement({
+          sid: `AllowAllocatedRuntimeWrite${index}`,
+          effect: Effect.ALLOW,
+          principals: [new AccountPrincipal(alloc.workloadAccountId)],
+          actions: ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+          resources: [
+            this.formatArn({
+              service: "dynamodb",
+              resource: "table",
+              resourceName: REGISTRY_TABLE_NAMES.experiments,
+              arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+            }),
+          ],
+          conditions,
+        }),
+      );
     }
 
     // ---- Shared ECR repo (ref-arch gap G2) ----
@@ -586,15 +572,6 @@ export class D03PlatformCoreStack extends Stack {
     // via `tag:application-id` / `tag:agent-id` / `tag:workload-account-id` /
     // `tag:cost-centre`. This is the compensating control for BUG-005
     // (session tags do not propagate across role chains).
-    const allocations: readonly D03TenantAllocation[] = props.tenantAllocations ?? [
-      {
-        tenantId: 'demo',
-        agentId: 'primary',
-        workloadAccountId: props.workloadAccountIds[0] ?? '000000000000',
-        costCentre: 'platform',
-        envName: 'nonprod',
-      },
-    ];
     for (const alloc of allocations) {
       const modelId = alloc.modelId ?? PLATFORM_ALLOWED_MODELS[1];
       const prefix = alloc.inferenceProfilePrefix ?? 'us';
@@ -629,31 +606,95 @@ export class D03PlatformCoreStack extends Stack {
       });
     }
 
-    // ---- BedrockCallerRole allow statement (attached AFTER profiles exist) ----
-    // Use explicit per-tenant profile ARNs rather than
-    // `application-inference-profile/*`, so the caller role cannot invoke
-    // profiles that belong to other tenants' allocations.
-    const tenantProfileArns = Object.values(this.appInferenceProfiles).map(
-      (p) => p.attrInferenceProfileArn,
-    );
-    this.bedrockCallerRole.addToPolicy(
-      new PolicyStatement({
-        sid: 'AllowInvokeAllowlistedBedrock',
-        effect: Effect.ALLOW,
-        actions: [
+    // Each allocation has a separate authority boundary. A workload runtime
+    // can assume only its own role; that role names only its own application
+    // inference profile. Session labels and caller tags cannot select another
+    // tenant's allocation.
+    for (const alloc of allocations) {
+      const key = `${alloc.tenantId}__${alloc.agentId}`;
+      const runtimeArn = `arn:aws:iam::${alloc.workloadAccountId}:role/${d03RuntimeRoleName(alloc.tenantId, alloc.agentId)}`;
+      const caller = new Role(this, `BedrockCallerRole-${key}`, {
+        roleName: d03BedrockCallerRoleName(alloc.tenantId, alloc.agentId),
+        assumedBy: new AccountPrincipal(alloc.workloadAccountId).withConditions(
+          {
+            ArnEquals: { 'aws:PrincipalArn': runtimeArn },
+            StringEquals: {
+              'sts:ExternalId': props.externalId,
+            },
+            StringLike: { 'sts:RoleSessionName': 'workload-*' },
+          },
+        ),
+        description: `D03 Bedrock caller for ${alloc.tenantId}/${alloc.agentId}.`,
+        maxSessionDuration: Duration.hours(1),
+      });
+      this.bedrockCallerRoles[key] = caller;
+      const inferenceActions = [
           'bedrock:InvokeModel',
           'bedrock:InvokeModelWithResponseStream',
           'bedrock:Converse',
           'bedrock:ConverseStream',
-          'bedrock:ApplyGuardrail',
-        ],
-        resources: [
-          ...allowedBedrockResources(this.region, this.account),
-          `arn:aws:bedrock:${this.region}:${this.account}:guardrail/*`,
-          ...tenantProfileArns,
-        ],
-      }),
-    );
+        ];
+      caller.addToPolicy(
+        new PolicyStatement({
+          sid: 'DenyInferenceWithMissingGuardrail',
+          effect: Effect.DENY,
+          actions: inferenceActions,
+          resources: ['*'],
+          conditions: {
+          Null: { 'bedrock:GuardrailIdentifier': 'true' },
+        },
+        }),
+      );
+      caller.addToPolicy(
+        new PolicyStatement({
+          sid: 'DenyInferenceWithWrongGuardrail',
+          effect: Effect.DENY,
+          actions: inferenceActions,
+          resources: ['*'],
+          conditions: {
+          'ForAnyValue:StringNotEquals': {
+            'bedrock:GuardrailIdentifier': [
+              this.guardrail.guardrail.attrGuardrailId,
+              this.guardrail.guardrail.attrGuardrailArn,
+            ],
+          },
+        },
+        }),
+      );
+      caller.addToPolicy(
+        new PolicyStatement({
+          sid: "AllowInvokeAllocatedBedrock",
+          effect: Effect.ALLOW,
+          actions: inferenceActions,
+          resources: [
+            ...allowedBedrockResources(this.region, this.account),
+            this.appInferenceProfiles[key].attrInferenceProfileArn,
+          ],
+          // Backing foundation models/system profiles are authorized only as
+          // part of this allocation's application-profile invocation. Direct
+          // raw-model calls would lose its mandatory tenant CUR attribution.
+          conditions: {
+            ArnEquals: {
+              "bedrock:InferenceProfileArn":
+                this.appInferenceProfiles[key].attrInferenceProfileArn,
+            },
+          },
+        }),
+      );
+      caller.addToPolicy(
+        new PolicyStatement({
+          sid: "AllowBaselineGuardrail",
+          effect: Effect.ALLOW,
+          actions: ['bedrock:ApplyGuardrail'],
+          resources: [this.guardrail.guardrail.attrGuardrailArn],
+        }),
+      );
+      new CfnOutput(this, `BedrockCallerRoleArn-${key}`, {
+        value: caller.roleArn,
+        description: `Bedrock caller ARN for ${alloc.tenantId}/${alloc.agentId}.`,
+        exportName: `AgenticAI-D03-BedrockCallerRoleArn-${alloc.tenantId}-${alloc.agentId}`,
+      });
+    }
 
     // Suppressions — narrow to the specific resources that legitimately need
     // them. Stack-wide `AwsSolutions-IAM5` has been intentionally removed and
@@ -714,21 +755,13 @@ export class D03PlatformCoreStack extends Stack {
       true,
     );
     NagSuppressions.addResourceSuppressions(
-      this.bedrockCallerRole,
+      Object.values(this.bedrockCallerRoles),
       [
         {
           id: 'AwsSolutions-IAM5',
           reason:
             'SEC-024: Deny-unless-matches guardrail gate applies to any bedrock:Invoke* call, hence Resource: *. This is a DENY statement whose scope is defined by the Condition, not the resource list.',
           appliesTo: ['Resource::*'],
-        },
-        {
-          id: 'AwsSolutions-IAM5',
-          reason:
-            'SEC-025: Baseline guardrail id is only known post-deploy (Bedrock mints it). `guardrail/*` in the platform account is scoped to this account only; the companion Deny statement forces any invoke to carry the baseline guardrail id. Cannot tighten further without a circular reference.',
-          appliesTo: [
-            `Resource::arn:aws:bedrock:${this.region}:${this.account}:guardrail/*`,
-          ],
         },
       ],
       true,
@@ -1075,11 +1108,6 @@ exports.handler = async (event, context) => {
       value: toolAliasArns['ping'],
       description: 'PROD alias ARN for the agenticai-d03-tool-ping demo Lambda.',
       exportName: 'AgenticAI-D03-ToolPingArn',
-    });
-    new CfnOutput(this, 'BedrockCallerRoleArn', {
-      value: this.bedrockCallerRole.roleArn,
-      description: 'ARN of the cross-account Bedrock caller role.',
-      exportName: 'AgenticAI-D03-BedrockCallerRoleArn',
     });
     new CfnOutput(this, 'GuardrailId', {
       value: this.guardrail.guardrail.attrGuardrailId,

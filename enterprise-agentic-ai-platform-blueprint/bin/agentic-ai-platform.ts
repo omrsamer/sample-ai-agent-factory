@@ -31,7 +31,9 @@ import {
   Aspects,
   CliCredentialsStackSynthesizer,
   DefaultStackSynthesizer,
+  PermissionsBoundary,
   RemovalPolicy,
+  Tags,
   type IStackSynthesizer,
 } from "aws-cdk-lib";
 import { AwsSolutionsChecks, NIST80053R5Checks } from "cdk-nag";
@@ -55,6 +57,7 @@ import { WorkloadAppStack } from "../apps/workload-account/lib/workload-app-stac
 import { PlatformPipelineStack } from "../pipelines/platform-pipeline-stack";
 import { WorkloadPipelineStack } from "../pipelines/workload-pipeline-stack";
 import type { GeneratedAgentInferenceInputs } from "../pipelines/workload-pipeline-stack";
+import { RuntimeRouterStack } from "../pipelines/runtime-router-stack";
 import { D03PlatformCoreStack } from "../apps/platform-account/lib/d03-platform-core-stack";
 import { parseGaRegistryConsumerContext } from "@agenticai/agent-registry";
 import { D03WorkloadAgentStack } from "../apps/workload-account/lib/d03-workload-agent-stack";
@@ -65,13 +68,72 @@ import {
 import { GapClosureStack } from "../apps/workload-account/lib/gap-closure-stack";
 import type { InferenceModelRateLimit } from "@agenticai/platform-inference-gateway";
 import { resolveDeploymentRegion } from "@agenticai/platform-baselines";
-import type { OrganizationalUnitKey } from "@agenticai/organizations";
+import {
+  validateProtectedAuthorityManifest,
+  type OrganizationalUnitKey,
+} from "@agenticai/organizations";
 
 const app = new App();
+const isolatedBootstrapQualifier = app.node.tryGetContext("agenticai/bootstrapQualifier");
+const isolatedRoleBoundaryName = app.node.tryGetContext("agenticai/workloadRoleBoundaryName");
+const isolatedPipelineBoundaryName = app.node.tryGetContext("agenticai/pipelineRoleBoundaryName");
+const identityProvisionerBoundaryName = app.node.tryGetContext("agenticai/identityProvisionerRoleBoundaryName");
+const artifactCleanupBoundaryName = app.node.tryGetContext("agenticai/artifactCleanupRoleBoundaryName");
+if (isolatedBootstrapQualifier !== undefined) {
+  if (typeof isolatedBootstrapQualifier !== "string" ||
+      !/^[A-Za-z0-9]{1,10}$/.test(isolatedBootstrapQualifier)) {
+    throw new Error("agenticai/bootstrapQualifier must contain 1–10 letters or digits.");
+  }
+  app.node.setContext("@aws-cdk/core:bootstrapQualifier", isolatedBootstrapQualifier);
+  if (isolatedBootstrapQualifier !== "hnb659fds") {
+    if (typeof isolatedRoleBoundaryName !== "string" ||
+      !/^[A-Za-z0-9+=,.@_-]{1,128}$/.test(isolatedRoleBoundaryName)) {
+      throw new Error("An isolated bootstrap requires an explicit workloadRoleBoundaryName.");
+    }
+    if (typeof isolatedPipelineBoundaryName !== "string" ||
+      !/^[A-Za-z0-9+=,.@_-]{1,128}$/.test(isolatedPipelineBoundaryName)) {
+      throw new Error("An isolated bootstrap requires an explicit pipelineRoleBoundaryName.");
+    }
+    app.node.setContext("@aws-cdk/core:permissionsBoundary", { name: isolatedRoleBoundaryName });
+    Tags.of(app).add("deployment-scope", "fresh-security-remediation");
+  }
+}
+
+if (identityProvisionerBoundaryName !== undefined) {
+  const expectedName = typeof isolatedRoleBoundaryName === "string" &&
+    isolatedRoleBoundaryName.endsWith("-RoleBoundary")
+    ? isolatedRoleBoundaryName.replace(/-RoleBoundary$/, "-IdentityProvisionerBoundary")
+    : undefined;
+  if (typeof isolatedBootstrapQualifier !== "string" || isolatedBootstrapQualifier === "hnb659fds" ||
+      typeof identityProvisionerBoundaryName !== "string" ||
+      !/^[A-Za-z0-9+=,.@_-]{1,128}$/.test(identityProvisionerBoundaryName) ||
+      identityProvisionerBoundaryName !== expectedName) {
+    throw new Error("identityProvisionerRoleBoundaryName requires the exact owned isolated bootstrap identity-provisioner policy name.");
+  }
+}
+
+if (artifactCleanupBoundaryName !== undefined) {
+  const expectedName = typeof isolatedRoleBoundaryName === "string" &&
+    isolatedRoleBoundaryName.endsWith("-RoleBoundary")
+    ? isolatedRoleBoundaryName.replace(/-RoleBoundary$/, "-ArtifactCleanupBoundary")
+    : undefined;
+  const expectedPipelineName = typeof isolatedRoleBoundaryName === "string" &&
+    isolatedRoleBoundaryName.endsWith("-RoleBoundary")
+    ? isolatedRoleBoundaryName.replace(/-RoleBoundary$/, "-PipelineBoundary")
+    : undefined;
+  if (typeof isolatedBootstrapQualifier !== "string" || isolatedBootstrapQualifier === "hnb659fds" ||
+      !/^[A-Za-z0-9]{1,10}$/.test(isolatedBootstrapQualifier) ||
+      typeof artifactCleanupBoundaryName !== "string" ||
+      !/^[A-Za-z0-9+=,.@_-]{1,128}$/.test(artifactCleanupBoundaryName) ||
+      artifactCleanupBoundaryName !== expectedName || isolatedPipelineBoundaryName !== expectedPipelineName) {
+    throw new Error("artifactCleanupRoleBoundaryName requires the exact owned isolated bootstrap artifact-cleanup policy name.");
+  }
+}
 
 const stage: string | undefined = app.node.tryGetContext("stage");
 const regulated: boolean =
-  app.node.tryGetContext("agenticai/regulated") !== false;
+  app.node.tryGetContext("agenticai/regulated") === undefined ||
+  booleanContext("agenticai/regulated");
 
 function deploymentRegion(): string {
   return resolveDeploymentRegion(
@@ -122,6 +184,13 @@ function stringArrayContext(key: string): readonly string[] {
     );
   }
   return parsed;
+}
+
+function booleanContext(key: string): boolean {
+  const raw: unknown = app.node.tryGetContext(key);
+  if (raw === undefined || raw === false || raw === "false") return false;
+  if (raw === true || raw === "true") return true;
+  throw new Error(`Context '${key}' must be true or false.`);
 }
 
 /**
@@ -517,9 +586,41 @@ function readRuntimeTelemetryContext():
 
 switch (stage) {
   case "management": {
-    const attachToWorkloadsOu: boolean =
-      app.node.tryGetContext("agenticai/attachScpsToWorkloadsOu") === true;
-    const breakGlassRaw = app.node.tryGetContext("agenticai/omniBreakGlassRoleNames");
+    const attachToWorkloadsOu = booleanContext(
+      "agenticai/attachScpsToWorkloadsOu",
+    );
+    const breakGlassRaw = app.node.tryGetContext(
+      "agenticai/omniBreakGlassRoleNames",
+    );
+    const authorityRaw = app.node.tryGetContext(
+      "agenticai/protectedAuthorityManifest",
+    );
+    const authorityPath = app.node.tryGetContext(
+      "agenticai/protectedAuthorityManifestPath",
+    );
+    if (authorityRaw !== undefined && authorityPath !== undefined) {
+      throw new Error(
+        "Supply only one of agenticai/protectedAuthorityManifest or agenticai/protectedAuthorityManifestPath.",
+      );
+    }
+    if (
+      authorityPath !== undefined &&
+      (typeof authorityPath !== "string" || authorityPath.trim().length === 0)
+    ) {
+      throw new Error(
+        "agenticai/protectedAuthorityManifestPath must name the approved manifest file.",
+      );
+    }
+    const protectedAuthorityManifest =
+      authorityRaw === undefined && authorityPath === undefined
+        ? undefined
+        : validateProtectedAuthorityManifest(
+            authorityPath !== undefined
+              ? JSON.parse(readFileSync(authorityPath as string, "utf8"))
+              : typeof authorityRaw === "string"
+                ? JSON.parse(authorityRaw)
+                : authorityRaw,
+          );
     // Adopt an existing AWS Organization (Control Tower or a hand-made org):
     // skip the AWS::Organizations::Organization resource and parent the OUs
     // under the supplied root. Both OrgStack props already exist; this wires
@@ -527,10 +628,13 @@ switch (stage) {
     const importExistingOrganization: boolean =
       app.node.tryGetContext("agenticai/importExistingOrganization") === true ||
       app.node.tryGetContext("agenticai/importExistingOrganization") === "true";
-    const existingRootIdRaw = app.node.tryGetContext("agenticai/existingRootId");
+    const existingRootIdRaw = app.node.tryGetContext(
+      "agenticai/existingRootId",
+    );
     if (
       importExistingOrganization &&
-      (typeof existingRootIdRaw !== "string" || !/^r-[0-9a-z]{4,32}$/.test(existingRootIdRaw))
+      (typeof existingRootIdRaw !== "string" ||
+        !/^r-[0-9a-z]{4,32}$/.test(existingRootIdRaw))
     ) {
       throw new Error(
         "management stage: agenticai/importExistingOrganization=true requires context 'agenticai/existingRootId' (r-xxxx).",
@@ -543,17 +647,28 @@ switch (stage) {
       },
       platformGuardrailAdminRoleArn: guardrailAdminRoleArn(),
       attachToWorkloadsOu,
+      gatewayAdminWorkloadAccountIds: stringArrayContext(
+        "agenticai/gatewayAdminWorkloadAccountIds",
+      ),
+      protectedAuthorityManifest,
       importExistingOrganization,
-      existingRootId: importExistingOrganization ? (existingRootIdRaw as string) : undefined,
+      existingRootId: importExistingOrganization
+        ? (existingRootIdRaw as string)
+        : undefined,
       organizationalUnitNames: organizationalUnitNamesContext(),
       // ADR-15: SCP-13 keeps cells from switching off the telemetry the Omni hub depends on.
       enableOmniTelemetryLockdown:
-        app.node.tryGetContext("agenticai/enableOmniTelemetryLockdown") === true ||
-        app.node.tryGetContext("agenticai/enableOmniTelemetryLockdown") === "true",
+        app.node.tryGetContext("agenticai/enableOmniTelemetryLockdown") ===
+          true ||
+        app.node.tryGetContext("agenticai/enableOmniTelemetryLockdown") ===
+          "true",
       omniBreakGlassRoleNames: Array.isArray(breakGlassRaw)
         ? breakGlassRaw.map(String)
         : typeof breakGlassRaw === "string" && breakGlassRaw.trim().length > 0
-          ? breakGlassRaw.split(",").map((r) => r.trim()).filter(Boolean)
+          ? breakGlassRaw
+              .split(",")
+              .map((r) => r.trim())
+              .filter(Boolean)
           : undefined,
     });
     break;
@@ -837,6 +952,17 @@ switch (stage) {
         tenantId: String(tenantId),
         costCentre: String(costCentre),
       });
+      const inferenceGatewayAuthorizerType =
+        app.node.tryGetContext("agenticai/inferenceGatewayAuthorizerType") ??
+        "CUSTOM_JWT";
+      if (
+        inferenceGatewayAuthorizerType !== "AWS_IAM" &&
+        inferenceGatewayAuthorizerType !== "CUSTOM_JWT"
+      ) {
+        throw new Error(
+          "Context 'agenticai/inferenceGatewayAuthorizerType' must be AWS_IAM or CUSTOM_JWT.",
+        );
+      }
       const inferenceGatewayStack = new InferenceGatewayStack(
         app,
         "AgenticAI-Platform-InferenceGatewayStack",
@@ -848,6 +974,8 @@ switch (stage) {
           agentId: String(agentId),
           costCentre: String(costCentre),
           modelRateLimits: inferenceModelRateLimits,
+          authorizerType: inferenceGatewayAuthorizerType,
+          trustedSystemPromptHashes: stringArrayContext("agenticai/trustedSystemPromptHashes"),
           inputGuardrail: {
             guardrailIdentifier:
               guardrailStack.baseline.guardrail.attrGuardrailId,
@@ -1185,6 +1313,15 @@ switch (stage) {
     const githubConnectionArn = app.node.tryGetContext(
       "agenticai/githubConnectionArn",
     );
+    const sourceBucketName = app.node.tryGetContext("agenticai/sourceBucketName");
+    const sourceObjectKey = app.node.tryGetContext("agenticai/sourceObjectKey");
+    if ((sourceBucketName === undefined) !== (sourceObjectKey === undefined)) {
+      throw new Error("Pipeline sourceBucketName and sourceObjectKey must be set together.");
+    }
+    const s3Source =
+      sourceBucketName !== undefined
+        ? { bucketName: String(sourceBucketName), objectKey: String(sourceObjectKey) }
+        : undefined;
     const organizationId = app.node.tryGetContext("agenticai/organizationId");
     const platformNonprodAccount = app.node.tryGetContext(
       "agenticai/platformNonprodAccountId",
@@ -1220,6 +1357,15 @@ switch (stage) {
     const inferenceModelRateLimits = inferenceModelRateLimitsContext(
       "agenticai/inferenceModelRateLimits",
     );
+    const inferenceGatewayAuthorizerType =
+      app.node.tryGetContext("agenticai/inferenceGatewayAuthorizerType") ?? "CUSTOM_JWT";
+    if (
+      inferenceGatewayAuthorizerType !== "AWS_IAM" &&
+      inferenceGatewayAuthorizerType !== "CUSTOM_JWT"
+    ) {
+      throw new Error("Context 'agenticai/inferenceGatewayAuthorizerType' must be AWS_IAM or CUSTOM_JWT.");
+    }
+    const trustedSystemPromptHashes = stringArrayContext("agenticai/trustedSystemPromptHashes");
     const auditOamSinkArn = app.node.tryGetContext("agenticai/auditOamSinkArn");
     const notificationEmail = app.node.tryGetContext(
       "agenticai/notificationEmail",
@@ -1289,8 +1435,8 @@ switch (stage) {
       app.node.tryGetContext("agenticai/workstreamGatewayRegion") ?? region;
 
     const missing: string[] = [];
-    if (typeof githubRepo !== "string") missing.push("agenticai/githubRepo");
-    if (typeof githubConnectionArn !== "string") {
+    if (!s3Source && typeof githubRepo !== "string") missing.push("agenticai/githubRepo");
+    if (!s3Source && typeof githubConnectionArn !== "string") {
       missing.push("agenticai/githubConnectionArn");
     }
     if (!platformNonprodAccount) {
@@ -1430,6 +1576,7 @@ switch (stage) {
         : undefined;
 
     const sharedSynthContext: Record<string, string> = {
+      "agenticai/regulated": String(regulated),
       "agenticai/githubRepo": githubRepo as string,
       "agenticai/githubConnectionArn": githubConnectionArn as string,
       "agenticai/pipelineSelection": pipelineSelection,
@@ -1441,9 +1588,32 @@ switch (stage) {
       "agenticai/applicationId": String(applicationId),
       "agenticai/costCentre": String(costCentre),
     };
+    if (typeof isolatedBootstrapQualifier === "string") {
+      sharedSynthContext["agenticai/bootstrapQualifier"] = isolatedBootstrapQualifier;
+      if (typeof isolatedRoleBoundaryName === "string") {
+        sharedSynthContext["agenticai/workloadRoleBoundaryName"] = isolatedRoleBoundaryName;
+        if (typeof artifactCleanupBoundaryName === "string") {
+          sharedSynthContext["agenticai/artifactCleanupRoleBoundaryName"] = artifactCleanupBoundaryName;
+        }
+        if (typeof identityProvisionerBoundaryName === "string") {
+          sharedSynthContext["agenticai/identityProvisionerRoleBoundaryName"] = identityProvisionerBoundaryName;
+        }
+      }
+      if (typeof isolatedPipelineBoundaryName === "string") {
+        sharedSynthContext["agenticai/pipelineRoleBoundaryName"] = isolatedPipelineBoundaryName;
+      }
+    }
     if (typeof githubBranch === "string") {
       sharedSynthContext["agenticai/githubBranch"] = githubBranch;
     }
+    if (s3Source) {
+      sharedSynthContext["agenticai/sourceBucketName"] = s3Source.bucketName;
+      sharedSynthContext["agenticai/sourceObjectKey"] = s3Source.objectKey;
+      delete sharedSynthContext["agenticai/githubRepo"];
+      delete sharedSynthContext["agenticai/githubConnectionArn"];
+    }
+    sharedSynthContext["agenticai/inferenceGatewayAuthorizerType"] = inferenceGatewayAuthorizerType;
+    sharedSynthContext["agenticai/trustedSystemPromptHashes"] = JSON.stringify(trustedSystemPromptHashes);
     if (platformProdAccount) {
       sharedSynthContext["agenticai/platformProdAccountId"] =
         String(platformProdAccount);
@@ -1527,6 +1697,7 @@ switch (stage) {
         githubBranch:
           typeof githubBranch === "string" ? githubBranch : undefined,
         githubConnectionArn: githubConnectionArn as string,
+        s3Source,
         organizationId: organizationId as string,
         logArchive: {
           env: { account: logArchiveAccount, region },
@@ -1552,6 +1723,8 @@ switch (stage) {
         auditOamSinkArn:
           typeof auditOamSinkArn === "string" ? auditOamSinkArn : undefined,
         inferenceModelRateLimits,
+        inferenceGatewayAuthorizerType,
+        trustedSystemPromptHashes,
         grantGatewayInvokePermissions: enableGaGatewayInvokePermissions,
         gatewayServiceRoleArns: gaGatewayServiceRoleArns,
         gatewayWorkloadAccountIds: {
@@ -1569,6 +1742,24 @@ switch (stage) {
       // The hub defaults to the Audit account in the deploy Region, where the
       // omni-hub stage deployed the runner role for this pipeline's evaluation role.
       const goldenDatasetId = app.node.tryGetContext("agenticai/goldenDatasetId");
+      const runtimeCanaryRaw = app.node.tryGetContext("agenticai/runtimeCanary");
+      let runtimeCanary: {
+        aliasArn: string; baselineVersion: string; candidateVersion: string; routingRoleArn: string;
+        alarmName?: string;
+      } | undefined;
+      if (runtimeCanaryRaw !== undefined) {
+        let parsed: unknown;
+        try { parsed = typeof runtimeCanaryRaw === "string" ? JSON.parse(runtimeCanaryRaw) : runtimeCanaryRaw; }
+        catch { throw new Error("agenticai/runtimeCanary must be JSON."); }
+        const keys = ["aliasArn", "baselineVersion", "candidateVersion", "routingRoleArn"];
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+            Object.keys(parsed).some(k => ![...keys, "alarmName"].includes(k)) ||
+            !keys.every(k => typeof (parsed as Record<string, unknown>)[k] === "string") ||
+            ("alarmName" in parsed && typeof (parsed as Record<string, unknown>).alarmName !== "string")) {
+          throw new Error("agenticai/runtimeCanary requires aliasArn, baselineVersion, candidateVersion and routingRoleArn, with optional alarmName.");
+        }
+        runtimeCanary = parsed as typeof runtimeCanary;
+      }
       const goldenDatasetVersion = app.node.tryGetContext("agenticai/goldenDatasetVersion");
       if ((goldenDatasetId === undefined) !== (goldenDatasetVersion === undefined)) {
         throw new Error(
@@ -1601,12 +1792,22 @@ switch (stage) {
             }
           : undefined;
       new WorkloadPipelineStack(app, "AgenticAI-WorkloadPipelineStack", {
+        permissionsBoundary: typeof isolatedPipelineBoundaryName === "string"
+          ? PermissionsBoundary.fromName(isolatedPipelineBoundaryName) : undefined,
+        workloadPermissionsBoundaryName: typeof isolatedRoleBoundaryName === "string"
+          ? isolatedRoleBoundaryName : undefined,
+        identityProvisionerPermissionsBoundaryName: typeof identityProvisionerBoundaryName === "string"
+          ? identityProvisionerBoundaryName : undefined,
         goldenDataset,
+        runtimeCanary,
+        canaryPercent: runtimeCanary ? Number(app.node.tryGetContext("agenticai/canaryPercent") ?? 5) : undefined,
+        canarySoakMinutes: runtimeCanary ? Number(app.node.tryGetContext("agenticai/canarySoakMinutes") ?? 30) : undefined,
         env: { account: platformNonprodAccount, region },
         githubRepo: githubRepo as string,
         githubBranch:
           typeof githubBranch === "string" ? githubBranch : undefined,
         githubConnectionArn: githubConnectionArn as string,
+        s3Source,
         tenantId: String(tenantId),
         agentId: String(agentId),
         applicationId: String(applicationId),
@@ -1636,6 +1837,74 @@ switch (stage) {
         synthContext: sharedSynthContext,
       });
     }
+    break;
+  }
+  case "workload-inference": {
+    const required = (key: string): string => {
+      const value = app.node.tryGetContext(`agenticai/${key}`);
+      if (typeof value !== "string" || !value.trim() || value !== value.trim()) {
+        throw new Error(`workload-inference requires agenticai/${key}.`);
+      }
+      return value;
+    };
+    const envName = required("envName");
+    if (envName !== "nonprod" && envName !== "prod") {
+      throw new Error("workload-inference envName must be nonprod or prod.");
+    }
+    const readers = stringArrayContext("agenticai/m2mSecretReaderAccountIds");
+    if (readers.length === 0) {
+      throw new Error("workload-inference requires explicit M2M secret reader accounts.");
+    }
+    const tenantId = required("tenantId");
+    const agentId = required("agentId");
+    if (tenantId !== "shared" || agentId !== "shared") {
+      throw new Error("workload-inference requires the shared/shared namespace.");
+    }
+    const readerRoles = stringArrayContext("agenticai/m2mSecretReaderRoleArns");
+    const expectedRoles = [...new Set(readers)].map(account =>
+      `arn:aws:iam::${account}:role/AgenticAI-D03-${envName}-shared-shared-idprov`);
+    if (readerRoles.length !== expectedRoles.length ||
+        new Set(readerRoles).size !== readerRoles.length ||
+        readerRoles.some(role => !expectedRoles.includes(role))) {
+      throw new Error("workload-inference requires exactly the fresh credential-provider reader roles for its environment and reader accounts.");
+    }
+    new InferenceGatewayStack(app, "AgenticAI-WorkloadInferenceStack", {
+      stackName: required("stackName"),
+      env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: deploymentRegion() },
+      envName: `workload-${envName}`,
+      gatewayName: required("gatewayName"),
+      applicationId: required("applicationId"), tenantId,
+      agentId, costCentre: required("costCentre"),
+      authorizerType: "CUSTOM_JWT",
+      modelRateLimits: inferenceModelRateLimitsContext("agenticai/inferenceModelRateLimits"),
+      inputGuardrail: {
+        guardrailIdentifier: required("guardrailIdentifier"),
+        guardrailVersion: required("guardrailVersion"),
+        guardrailArn: required("guardrailArn"),
+      },
+      m2mSecretReaderAccountIds: readers,
+      m2mSecretReaderRoleArns: readerRoles,
+      trustedSystemPromptHashes: stringArrayContext("agenticai/trustedSystemPromptHashes"),
+    });
+    break;
+  }
+  case "runtime-router": {
+    const required = (key: string): string => {
+      const value = app.node.tryGetContext(`agenticai/${key}`);
+      if (typeof value !== "string" || !value.trim() || value !== value.trim()) {
+        throw new Error(`runtime-router requires agenticai/${key}.`);
+      }
+      return value;
+    };
+    new RuntimeRouterStack(app, "AgenticAI-RuntimeRouterStack", {
+      env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: deploymentRegion() },
+      runtimeId: required("routerRuntimeId"), runtimeVersion: required("routerRuntimeVersion"),
+      sourceRevision: required("routerSourceRevision"), functionName: required("routerFunctionName"),
+      routingRoleName: required("routerRoutingRoleName"), pipelineCanaryRoleArn: required("routerPipelineCanaryRoleArn"),
+      healthAlarmName: required("routerHealthAlarmName"),
+      baselineLambdaVersion: app.node.tryGetContext("agenticai/routerBaselineLambdaVersion"),
+      baselineRuntimeVersion: app.node.tryGetContext("agenticai/routerBaselineRuntimeVersion"),
+    });
     break;
   }
   case "gap-closure": {
@@ -1705,11 +1974,11 @@ switch (stage) {
   }
   case undefined:
     throw new Error(
-      "Missing required CDK context 'stage'. Pass --context stage=<management|omni-domain|omni-hub-keys|omni-hub|platform|workload|sandbox|d03-platform|d03-workload|d03-workstream-gateway|pipeline|gap-closure>.",
+      "Missing required CDK context 'stage'. Pass --context stage=<management|omni-domain|omni-hub-keys|omni-hub|platform|workload|sandbox|d03-platform|d03-workload|d03-workstream-gateway|pipeline|workload-inference|runtime-router|gap-closure>.",
     );
   default:
     throw new Error(
-      `Unknown stage '${stage}'. Valid stages: management | omni-domain | omni-hub-keys | omni-hub | platform | workload | sandbox | d03-platform | d03-workload | d03-workstream-gateway | pipeline | gap-closure.`,
+      `Unknown stage '${stage}'. Valid stages: management | omni-domain | omni-hub-keys | omni-hub | platform | workload | sandbox | d03-platform | d03-workload | d03-workstream-gateway | pipeline | workload-inference | runtime-router | gap-closure.`,
     );
 }
 

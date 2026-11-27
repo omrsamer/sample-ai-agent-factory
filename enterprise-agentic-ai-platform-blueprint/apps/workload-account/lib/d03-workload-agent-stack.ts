@@ -50,6 +50,10 @@ import {
 } from 'aws-cdk-lib/custom-resources';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
+import {
+  d03BedrockCallerRoleName,
+  d03RuntimeRoleName,
+} from "../../d03-authorization";
 import { resolveAgentCoreSupportedAvailabilityZoneIds } from '@agenticai/agentic-vpc';
 
 export interface D03WorkloadAgentStackProps extends StackProps {
@@ -274,7 +278,7 @@ export class D03WorkloadAgentStack extends Stack {
     const envName = props.envName ?? 'nonprod';
     const allowLocalRootAssume = (props.allowLocalRootAssume ?? false) && envName !== 'prod';
     this.agentRuntimeRole = new Role(this, 'AgentRuntimeRole', {
-      roleName: `AgenticAI-D03-${props.tenantId}-${props.agentId}-runtime`,
+      roleName: d03RuntimeRoleName(props.tenantId, props.agentId),
       assumedBy: new ServicePrincipal('bedrock-agentcore.amazonaws.com'),
       description: `Workload runtime role for ${props.tenantId}/${props.agentId}. Assumes platform BedrockCallerRole cross-account.`,
       maxSessionDuration: Duration.hours(1),
@@ -300,7 +304,7 @@ export class D03WorkloadAgentStack extends Stack {
     // by a stable `RoleSessionName` convention
     // (`workload-<acctId>-<tenantId>-<agentId>`, documented in README section 9)
     // which DOES survive role chaining.
-    const platformCallerRoleArn = `arn:aws:iam::${props.platformAccountId}:role/AgenticAI-D03-BedrockCaller`;
+    const platformCallerRoleArn = `arn:aws:iam::${props.platformAccountId}:role/${d03BedrockCallerRoleName(props.tenantId, props.agentId)}`;
     this.agentRuntimeRole.addToPolicy(
       new PolicyStatement({
         sid: 'AssumePlatformBedrockCaller',

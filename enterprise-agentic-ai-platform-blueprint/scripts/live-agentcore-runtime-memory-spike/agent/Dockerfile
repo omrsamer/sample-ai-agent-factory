@@ -15,8 +15,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-# AWS-maintained AL2023 Python base, pinned to the live-scanned ARM64 digest.
-FROM public.ecr.aws/lambda/python:3.13@sha256:c78a03b745f2c27b349377ae979d88b96bc68b457668705cd24a32b5f433c9cf
+# AWS-maintained AL2023 Python base; scan the final rebuilt ARM64 image.
+FROM public.ecr.aws/lambda/python:3.13@sha256:50ce57123df27aa4eee37bea58b85707833ae16fdcd0a75d9641375d6b96ad52
+
+# Include the vendor RPM fixes in ALAS2023-2026-3430.
+RUN dnf upgrade -y --releasever 2023.12.20261112 && dnf clean all
 
 # Fail fast, no bytecode churn, unbuffered logs.
 ENV PYTHONDONTWRITEBYTECODE=1 \

@@ -115,7 +115,13 @@ export class PlatformBaselineGuardrail extends Construct {
           { type: 'AWS_ACCESS_KEY', action: 'BLOCK' },
           { type: 'AWS_SECRET_KEY', action: 'BLOCK' },
           { type: 'PASSWORD', action: 'BLOCK' },
-        ],
+        ].map((entity) => ({
+          ...entity,
+          inputAction: entity.action,
+          outputAction: entity.action,
+          inputEnabled: true,
+          outputEnabled: true,
+        })),
         regexesConfig: [
           {
             name: 'AU_TFN',
@@ -135,7 +141,13 @@ export class PlatformBaselineGuardrail extends Construct {
             pattern: '\\b\\d{3}-\\d{3}\\s+\\d{6,10}\\b',
             action: 'ANONYMIZE',
           },
-        ],
+        ].map((regex) => ({
+          ...regex,
+          inputAction: regex.action,
+          outputAction: regex.action,
+          inputEnabled: true,
+          outputEnabled: true,
+        })),
       },
 
       // ---- Word filters ----

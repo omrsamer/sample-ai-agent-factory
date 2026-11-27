@@ -33,7 +33,7 @@ list_files() {
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git ls-files -z --cached --others --exclude-standard
   else
-    find . -type f \
+    find . -type d \
       \( -path './.git' -o -name node_modules -o -name '.venv' \
          -o -name '__pycache__' -o -name '.pytest_cache' -o -name dist \
          -o -name 'cdk.out*' \) -prune -o -type f -print0

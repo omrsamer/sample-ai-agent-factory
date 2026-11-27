@@ -97,6 +97,8 @@ export interface BuildScpSetOptions {
    * the Null-only gate and emits a synth-time warning.
    */
   readonly approvedGuardrailIds?: readonly string[];
+  /** Exact approved role entities and the complete protected authority chain. */
+  readonly protectedAuthorityManifest?: unknown;
   /**
    * Workstream accounts that host pipeline-created
    * `AgenticAI-D03-*-GatewayAdmin` roles. Required to emit SCP-09.
@@ -126,8 +128,8 @@ export interface BuildScpSetOptions {
    */
   readonly enableDeveloperPlatformTagDeny?: boolean;
   /**
-   * Override the default RegistryAdmin role name used by SCP-11. Default
-   * `AgenticAI-RegistryAdmin`. Test fixtures only.
+   * Removed role-name exception option. Supplying it is rejected; enroll
+   * exact registry identities in the protected authority manifest.
    */
   readonly registryAdminRoleName?: string;
   /**
@@ -144,7 +146,7 @@ export interface BuildScpSetOptions {
   readonly approvedAgentCoreVpceIds?: readonly string[];
   /** Exact Bedrock Runtime VPC endpoint ids for SCP-04 (same rule as SCP-03). */
   readonly approvedBedrockVpceIds?: readonly string[];
-  /** Platform pipeline role-name patterns exempted by SCP-11 (default: CDK cfn-exec role). */
+  /** Removed SCP-11 role-name option; supplying it is rejected. */
   readonly registryPipelineRoleNamePatterns?: readonly string[];
   /**
    * When `true`, SCP-13 (CloudWatch Omni telemetry lockdown, ADR-15) is
@@ -153,9 +155,9 @@ export interface BuildScpSetOptions {
    * because it spends one of the nine SCP slots a target can hold.
    */
   readonly enableOmniTelemetryLockdown?: boolean;
-  /** Pipeline role-name patterns exempted by SCP-13 (default: CDK cfn-exec role, any account). */
+  /** Removed SCP-13 role-name option; supplying it is rejected. */
   readonly omniPipelineRoleNamePatterns?: readonly string[];
-  /** Exact break-glass role names exempted by SCP-13 (default none). */
+  /** Removed SCP-13 name option; enroll exact telemetry identities instead. */
   readonly omniBreakGlassRoleNames?: readonly string[];
 }
 
@@ -164,9 +166,15 @@ export function buildScpSet(
 ): readonly ScpDefinition[] {
   const set: ScpDefinition[] = [
     scp01ModelAllowlist(opts.allowedModelArns),
-    scp02EnforceGuardrail({ approvedGuardrailIds: opts.approvedGuardrailIds }),
+    scp02EnforceGuardrail({
+      approvedGuardrailIds: opts.approvedGuardrailIds,
+      protectedAuthorityManifest: opts.protectedAuthorityManifest,
+    }),
   ];
-  if (opts.approvedAgentCoreVpceIds && opts.approvedAgentCoreVpceIds.length > 0) {
+  if (
+    opts.approvedAgentCoreVpceIds &&
+    opts.approvedAgentCoreVpceIds.length > 0
+  ) {
     set.push(scp03EnforceAgentCoreVpce(opts.approvedAgentCoreVpceIds));
   } else {
     // eslint-disable-next-line no-console
@@ -185,10 +193,16 @@ export function buildScpSet(
     );
   }
   set.push(
-    scp05DenyGuardrailModification(opts.platformGuardrailAdminRoleArn),
+    scp05DenyGuardrailModification(
+      opts.platformGuardrailAdminRoleArn,
+      opts.protectedAuthorityManifest,
+    ),
     scp06RestrictRegions(opts.approvedRegions),
   );
-  if (opts.approvedAgentCoreVpceIds && opts.approvedAgentCoreVpceIds.length > 0) {
+  if (
+    opts.approvedAgentCoreVpceIds &&
+    opts.approvedAgentCoreVpceIds.length > 0
+  ) {
     // SCP-07 (Runtimes must be VPC-attached) belongs to the same VPC-mode
     // posture as SCP-03: the reference Runtime runs networkMode PUBLIC, and
     // SCP-07 would deny the pipeline's own Create/UpdateAgentRuntime.
@@ -209,6 +223,7 @@ export function buildScpSet(
     set.push(
       scp09GatewayMutationLockdown({
         workloadAccountIds: opts.gatewayAdminWorkloadAccountIds,
+        protectedAuthorityManifest: opts.protectedAuthorityManifest,
       }),
     );
   } else {
@@ -243,14 +258,12 @@ export function buildScpSet(
         platformAccountId: opts.platformAccountId,
         registryAdminRoleName: opts.registryAdminRoleName,
         pipelineRoleNamePatterns: opts.registryPipelineRoleNamePatterns,
+        protectedAuthorityManifest: opts.protectedAuthorityManifest,
       }),
     );
   } else if (opts.enableRegistryLockdown && !opts.platformAccountId) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      "SCP-11: enableRegistryLockdown=true but platformAccountId is missing. " +
-        "Skipping Registry-mutation lockdown — workstream principals will not be " +
-        "blocked from mutating the AgentCore Registry. [TODO-PLATFORM-ACCOUNT-ID]",
+    throw new Error(
+      "SCP-11: enableRegistryLockdown=true requires platformAccountId and protectedAuthorityManifest.",
     );
   }
 
@@ -267,6 +280,7 @@ export function buildScpSet(
       scp13OmniTelemetryLockdown({
         pipelineRoleNamePatterns: opts.omniPipelineRoleNamePatterns,
         breakGlassRoleNames: opts.omniBreakGlassRoleNames,
+        protectedAuthorityManifest: opts.protectedAuthorityManifest,
       }),
     );
   }

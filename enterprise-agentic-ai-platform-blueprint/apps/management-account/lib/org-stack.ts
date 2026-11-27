@@ -9,10 +9,13 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: MIT-0
  */
-import { Stack, StackProps } from 'aws-cdk-lib';
-import { Construct } from 'constructs';
+import { Stack, StackProps } from "aws-cdk-lib";
+import { Construct } from "constructs";
 
-import { OrganizationConstruct, type OrganizationalUnitKey } from '@agenticai/organizations';
+import {
+  OrganizationConstruct,
+  type OrganizationalUnitKey,
+} from "@agenticai/organizations";
 
 export interface OrgStackProps extends StackProps {
   /**
@@ -27,6 +30,10 @@ export interface OrgStackProps extends StackProps {
    * (sandbox-first). Set true after the Phase 1 soak tests pass.
    */
   readonly attachToWorkloadsOu?: boolean;
+  /** Exact workload accounts authorized to host GatewayAdmin roles (SCP-09). */
+  readonly gatewayAdminWorkloadAccountIds?: readonly string[];
+  /** Approved protected authority manifest for all member-account exemptions. */
+  readonly protectedAuthorityManifest?: unknown;
 
   /** Import existing Organization (e.g. when Control Tower owns it). */
   readonly importExistingOrganization?: boolean;
@@ -39,7 +46,9 @@ export interface OrgStackProps extends StackProps {
    * agenticaiWorkloads, sandbox) when the root already holds an OU of a
    * default name, such as Control Tower's `Security` OU.
    */
-  readonly organizationalUnitNames?: Partial<Record<OrganizationalUnitKey, string>>;
+  readonly organizationalUnitNames?: Partial<
+    Record<OrganizationalUnitKey, string>
+  >;
 
   /** Approved guardrail ARNs for SCP-02's positive allow-list. */
   readonly approvedGuardrailIds?: readonly string[];
@@ -62,9 +71,11 @@ export class OrgStack extends Stack {
   constructor(scope: Construct, id: string, props: OrgStackProps) {
     super(scope, id, props);
 
-    this.organization = new OrganizationConstruct(this, 'Organization', {
+    this.organization = new OrganizationConstruct(this, "Organization", {
       platformGuardrailAdminRoleArn: props.platformGuardrailAdminRoleArn,
       attachToWorkloadsOu: props.attachToWorkloadsOu ?? false,
+      gatewayAdminWorkloadAccountIds: props.gatewayAdminWorkloadAccountIds,
+      protectedAuthorityManifest: props.protectedAuthorityManifest,
       importExistingOrganization: props.importExistingOrganization,
       existingRootId: props.existingRootId,
       organizationalUnitNames: props.organizationalUnitNames,

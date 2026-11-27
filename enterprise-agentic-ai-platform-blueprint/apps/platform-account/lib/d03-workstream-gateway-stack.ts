@@ -318,7 +318,7 @@ export class D03WorkstreamGatewayStack extends Stack {
           0,
           64,
         ),
-      runtime: Runtime.NODEJS_20_X,
+      runtime: Runtime.NODEJS_22_X,
       handler: "index.handler",
       timeout: Duration.minutes(1),
       memorySize: 256,
@@ -567,6 +567,8 @@ export class D03WorkstreamGatewayStack extends Stack {
       authorizerType,
       ...(authorizerConfiguration ? { authorizerConfiguration } : {}),
       tags: {
+        ...(this.node.tryGetContext("agenticai/workloadRoleBoundaryName")
+          ? { "deployment-scope": "fresh-security-remediation" } : {}),
         deviation: "D-03",
         "application-id": props.applicationId ?? props.tenantId,
         "tenant-id": props.tenantId,
@@ -668,7 +670,7 @@ export class D03WorkstreamGatewayStack extends Stack {
       // (When crExecRoleArnOverride is supplied, this branch is skipped
       // entirely — a pre-created role has already propagated.)
       const propGateOnEvent = new LambdaFunction(this, "CrPropGateOnEvent", {
-        runtime: Runtime.NODEJS_20_X,
+        runtime: Runtime.NODEJS_22_X,
         handler: "index.onEvent",
         timeout: Duration.seconds(30),
         code: Code.fromInline(IAM_PROP_GATE_HANDLER),
@@ -678,7 +680,7 @@ export class D03WorkstreamGatewayStack extends Stack {
         this,
         "CrPropGateIsComplete",
         {
-          runtime: Runtime.NODEJS_20_X,
+          runtime: Runtime.NODEJS_22_X,
           handler: "index.isComplete",
           timeout: Duration.seconds(30),
           code: Code.fromInline(IAM_PROP_GATE_HANDLER),
@@ -948,7 +950,7 @@ export class D03WorkstreamGatewayStack extends Stack {
         this,
         "PolicyEngineRolePropagationOnEvent",
         {
-          runtime: Runtime.NODEJS_20_X,
+          runtime: Runtime.NODEJS_22_X,
           handler: "index.onEvent",
           timeout: Duration.seconds(30),
           code: Code.fromInline(IAM_PROP_GATE_HANDLER),
@@ -961,7 +963,7 @@ export class D03WorkstreamGatewayStack extends Stack {
         this,
         "PolicyEngineRolePropagationIsComplete",
         {
-          runtime: Runtime.NODEJS_20_X,
+          runtime: Runtime.NODEJS_22_X,
           handler: "index.isComplete",
           timeout: Duration.seconds(30),
           code: Code.fromInline(IAM_PROP_GATE_HANDLER),
@@ -999,7 +1001,7 @@ export class D03WorkstreamGatewayStack extends Stack {
         this,
         "PolicyEngineGatewayStateOnEvent",
         {
-          runtime: Runtime.NODEJS_20_X,
+          runtime: Runtime.NODEJS_22_X,
           handler: "index.onEvent",
           timeout: Duration.seconds(30),
           code: Code.fromInline(POLICY_ENGINE_GATEWAY_STATE_HANDLER),
@@ -1011,7 +1013,7 @@ export class D03WorkstreamGatewayStack extends Stack {
         this,
         "PolicyEngineGatewayStateIsComplete",
         {
-          runtime: Runtime.NODEJS_20_X,
+          runtime: Runtime.NODEJS_22_X,
           handler: "index.isComplete",
           timeout: Duration.seconds(30),
           code: Code.fromInline(POLICY_ENGINE_GATEWAY_STATE_HANDLER),
@@ -1266,7 +1268,7 @@ export class D03WorkstreamGatewayStack extends Stack {
       this,
       "TargetDeleteBarrierOnEvent",
       {
-        runtime: Runtime.NODEJS_20_X,
+        runtime: Runtime.NODEJS_22_X,
         handler: "index.onEvent",
         timeout: Duration.seconds(30),
         code: Code.fromInline(TARGET_DELETION_BARRIER_HANDLER),
@@ -1278,7 +1280,7 @@ export class D03WorkstreamGatewayStack extends Stack {
       this,
       "TargetDeleteBarrierIsComplete",
       {
-        runtime: Runtime.NODEJS_20_X,
+        runtime: Runtime.NODEJS_22_X,
         handler: "index.isComplete",
         timeout: Duration.seconds(30),
         code: Code.fromInline(TARGET_DELETION_BARRIER_HANDLER),
