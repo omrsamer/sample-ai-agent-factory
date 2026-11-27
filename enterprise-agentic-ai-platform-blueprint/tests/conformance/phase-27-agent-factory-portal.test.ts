@@ -401,8 +401,9 @@ describe("Phase 27 — edge web ACL", () => {
 });
 
 describe("Phase 27 — stage routing is opt-in", () => {
-  it("handles only the three portal stages", () => {
+  it("handles only the portal stages", () => {
     expect([...AGENT_FACTORY_PORTAL_STAGES]).toEqual([
+      "agent-factory-portal-agent-registry",
       "agent-factory-portal-edge",
       "agent-factory-portal",
       "agent-factory-portal-fleet-reader",

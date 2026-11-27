@@ -129,7 +129,8 @@ def test_registered_agent_merges_record_and_runtime(settings):
     entry = agent_mapper.registered_agent(agent_record("PENDING_APPROVAL"), runtime, cell)
     agent = entry.agent
     assert agent.id == "recAgent0001"
-    assert agent.name == "Travel agent"
+    assert agent.name == "travel-agent"
+    assert agent.record_name == "agent-ws1-travel-agent-nonprod"
     assert agent.lifecycle_state == "pending_approval"
     assert agent.registration == "registered"
     assert agent.purpose == "Plans trips for employees."

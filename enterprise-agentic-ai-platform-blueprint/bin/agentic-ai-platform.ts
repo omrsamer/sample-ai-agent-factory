@@ -1973,6 +1973,7 @@ switch (stage) {
     });
     break;
   }
+  case "agent-factory-portal-agent-registry":
   case "agent-factory-portal-edge":
   case "agent-factory-portal":
   case "agent-factory-portal-fleet-reader": {
@@ -1983,11 +1984,11 @@ switch (stage) {
   }
   case undefined:
     throw new Error(
-      "Missing required CDK context 'stage'. Pass --context stage=<management|omni-domain|omni-hub-keys|omni-hub|platform|workload|sandbox|d03-platform|d03-workload|d03-workstream-gateway|pipeline|workload-inference|runtime-router|gap-closure|agent-factory-portal-edge|agent-factory-portal|agent-factory-portal-fleet-reader>.",
+      "Missing required CDK context 'stage'. Pass --context stage=<management|omni-domain|omni-hub-keys|omni-hub|platform|workload|sandbox|d03-platform|d03-workload|d03-workstream-gateway|pipeline|workload-inference|runtime-router|gap-closure|agent-factory-portal-agent-registry|agent-factory-portal-edge|agent-factory-portal|agent-factory-portal-fleet-reader>.",
     );
   default:
     throw new Error(
-      `Unknown stage '${stage}'. Valid stages: management | omni-domain | omni-hub-keys | omni-hub | platform | workload | sandbox | d03-platform | d03-workload | d03-workstream-gateway | pipeline | workload-inference | runtime-router | gap-closure | agent-factory-portal-edge | agent-factory-portal | agent-factory-portal-fleet-reader.`,
+      `Unknown stage '${stage}'. Valid stages: management | omni-domain | omni-hub-keys | omni-hub | platform | workload | sandbox | d03-platform | d03-workload | d03-workstream-gateway | pipeline | workload-inference | runtime-router | gap-closure | agent-factory-portal-agent-registry | agent-factory-portal-edge | agent-factory-portal | agent-factory-portal-fleet-reader.`,
     );
 }
 

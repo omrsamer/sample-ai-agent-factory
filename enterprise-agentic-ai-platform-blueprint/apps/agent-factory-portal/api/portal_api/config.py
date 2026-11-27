@@ -98,11 +98,19 @@ class Settings:
     model_allowlist: tuple[ModelEntry, ...]
     allowed_origins: tuple[str, ...] = ()
     cache_ttl_seconds: int = 30
+    # Optional: a separate registry (manual approval) that holds the agent governance records.
+    # Unset means one registry holds both tool and agent records.
+    agent_registry_id: str | None = None
     # Optional in the read API: only the registration history route needs the audit table.
     audit_table: str | None = None
     # Optional in the read API: lets /users/me say which tenants the caller can register for.
     group_tenant_map: Mapping[str, tuple[str, ...]] | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def effective_agent_registry_id(self) -> str:
+        """The registry that holds agent governance records."""
+        return self.agent_registry_id or self.registry_id
 
     def cell_for(self, tenant_id: str | None, agent_id: str | None, environment: str | None) -> Cell | None:
         for cell in self.cells:
@@ -276,6 +284,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         model_allowlist=models,
         allowed_origins=tuple(origins),
         cache_ttl_seconds=ttl,
+        agent_registry_id=_optional(
+            _SLUG, (env.get("PORTAL_AGENT_REGISTRY_ID") or "").strip(), "PORTAL_AGENT_REGISTRY_ID"
+        ),
         audit_table=_optional(_TABLE_NAME, env.get("PORTAL_AUDIT_TABLE", "").strip(), "PORTAL_AUDIT_TABLE"),
         group_tenant_map=(
             _parse_tenant_map(_json(env, "PORTAL_GROUP_TENANT_MAP"), role_map)
@@ -298,6 +309,7 @@ _CONFIG_KEYS = (
     "PORTAL_ALLOWED_ORIGINS",
     "PORTAL_CACHE_TTL_SECONDS",
     "PORTAL_AUDIT_TABLE",
+    "PORTAL_AGENT_REGISTRY_ID",
     "PORTAL_GROUP_TENANT_MAP",
     "PORTAL_ACTION_ROLE",
 )

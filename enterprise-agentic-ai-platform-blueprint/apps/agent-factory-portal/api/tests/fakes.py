@@ -22,10 +22,13 @@ def client_error(code: str, operation: str = "Operation") -> ClientError:
 
 
 class FakePages:
-    def __init__(self, pages: list[dict[str, Any]]) -> None:
+    def __init__(self, pages: list[dict[str, Any]], seen: list[str] | None = None) -> None:
         self.pages = pages
+        self.seen = seen
 
-    def paginate(self, **_: Any) -> list[dict[str, Any]]:
+    def paginate(self, **kwargs: Any) -> list[dict[str, Any]]:
+        if self.seen is not None and "registryId" in kwargs:
+            self.seen.append(kwargs["registryId"])
         return self.pages
 
 
@@ -33,6 +36,7 @@ class FakeRegistry:
     def __init__(self) -> None:
         self.records: dict[str, dict[str, Any]] = {}
         self.calls: list[str] = []
+        self.registry_ids: list[str] = []  # registryId of every read
         self.fail: dict[str, str] = {}  # operation -> error code to raise once
         self._ids = itertools.count(1)
         self.clock = dt.datetime(2026, 1, 15, 12, 0, tzinfo=dt.UTC)
@@ -69,6 +73,7 @@ class FakeRegistry:
 
     def get_registry_record(self, registryId: str, recordId: str) -> dict[str, Any]:  # noqa: N803
         self._enter("get_registry_record")
+        self.registry_ids.append(registryId)
         record = self._record(recordId, "GetRegistryRecord")
         snapshot = {**record, "ResponseMetadata": {}}
         if record["status"] in ("CREATING", "UPDATING"):
@@ -78,7 +83,7 @@ class FakeRegistry:
     def get_paginator(self, operation: str) -> FakePages:
         self._enter(operation)
         summaries = [{k: v for k, v in r.items() if k != "descriptors"} for r in self.records.values()]
-        return FakePages([{"registryRecords": summaries}])
+        return FakePages([{"registryRecords": summaries}], self.registry_ids)
 
     # --- registrar writes ------------------------------------------------------
 

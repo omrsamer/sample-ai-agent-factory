@@ -34,7 +34,7 @@ caller with a mapped role.
 | --- | --- |
 | `/health` | Liveness only. No authentication, no data, no configuration |
 | `/users/me` | Validated token claims and `PORTAL_GROUP_ROLE_MAP` |
-| `/agents`, `/agents/{id}` | AWS Agent Registry records with the `agenticai.agent-governance/1.0` document, merged with Amazon Bedrock AgentCore runtimes found in cell accounts. A runtime that no record references is returned with `lifecycle_state` and `registration` set to `discovered` |
+| `/agents`, `/agents/{id}` | AWS Agent Registry records with the `agenticai.agent-governance/1.0` document, merged with Amazon Bedrock AgentCore runtimes found in cell accounts. A runtime that no record references is returned with `lifecycle_state` and `registration` set to `discovered`. A registered agent's `name` is its agent id; the registry record name is in `record_name` |
 | `/agents/{id}/runtime` | Runtime status from the cell account |
 | `/agents/{id}/deployments` | Runtime versions of the agent's runtime |
 | `/agents/{id}/traces` | CloudWatch Logs Insights over the `aws/spans` log group of the cell account, one row per trace |
@@ -133,7 +133,8 @@ mapped role wins. No claims is `401`; no mapped group is `403`.
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `PORTAL_ENV` | yes | `nonprod` or `prod` |
-| `PORTAL_REGISTRY_ID` | yes | Id of the platform Agent Registry |
+| `PORTAL_REGISTRY_ID` | yes | Id of the platform Agent Registry (tool records; also agent records unless the next variable is set) |
+| `PORTAL_AGENT_REGISTRY_ID` | no | Id of a separate registry, in the same Region, that holds the agent governance records. Use it when the platform registry auto-approves, so that agent records wait for a person |
 | `PORTAL_REGISTRY_REGION` | yes | Region of the registry. Also used for the other platform-account reads (pipelines, guardrails) |
 | `PORTAL_CELLS` | yes | JSON list of `{ tenantId, agentId, applicationId?, environment, accountId, region, readerRoleArn, externalId?, alarmNamePrefix?, pipelineName?, accountAlias? }` |
 | `PORTAL_IDENTITY_PROVIDER` | yes | `cognito` or `entra` |
@@ -152,7 +153,7 @@ The action functions read a smaller set, all required unless noted:
 | Variable | Meaning |
 | --- | --- |
 | `PORTAL_ACTION_ROLE` | `registrar` or `approver`; must match the handler |
-| `PORTAL_ENV`, `PORTAL_REGISTRY_ID`, `PORTAL_REGISTRY_REGION` | As above. The audit table is read in the registry's Region |
+| `PORTAL_ENV`, `PORTAL_REGISTRY_ID`, `PORTAL_REGISTRY_REGION` | As above, except that `PORTAL_REGISTRY_ID` here is the registry that holds the agent records (the agent registry when there are two). The audit table is read in the registry's Region |
 | `PORTAL_IDENTITY_PROVIDER`, `PORTAL_GROUP_ROLE_MAP` | As above |
 | `PORTAL_GROUP_TENANT_MAP` | JSON object, group or app role name to a list of tenant ids. `"*"` is allowed only for a group mapped to `platform` |
 | `PORTAL_AUDIT_TABLE` | Audit table name |

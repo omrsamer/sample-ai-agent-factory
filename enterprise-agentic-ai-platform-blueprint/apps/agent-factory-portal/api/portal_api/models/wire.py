@@ -97,6 +97,7 @@ class Agent(BaseModel):
     created_by: str | None = None
     # portal additions
     registration: Literal["registered", "discovered"] = "registered"
+    record_name: str | None = None  # the registry record's name, for a registered agent
     registry_status: str | None = None
     environment: str | None = None
     account_id: str | None = None

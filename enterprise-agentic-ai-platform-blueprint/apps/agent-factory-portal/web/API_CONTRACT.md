@@ -162,7 +162,8 @@ Query: `lifecycle_state?: LifecycleState` (server-side filter; omitted for "all"
 ```ts
 interface Agent {
   id: string;
-  name: string;
+  name: string;                       // display name; for a registered agent, its agent id
+  record_name?: string | null;        // registry record name; shown under "Record" when present
   purpose?: string;
   sponsor_oid?: string | null;        // not displayed
   sponsor_email?: string | null;      // owner; the part before "@" is displayed

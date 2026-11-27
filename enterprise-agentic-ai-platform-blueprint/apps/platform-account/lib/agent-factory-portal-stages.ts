@@ -25,12 +25,14 @@ import {
   portalStackName,
 } from "@agenticai/agent-factory-portal";
 import {
+  AgentFactoryPortalAgentRegistryStack,
   AgentFactoryPortalEdgeStack,
   AgentFactoryPortalStack,
 } from "./agent-factory-portal-stack";
 import { AgentFactoryPortalFleetReaderStack } from "../../workload-account/lib/agent-factory-portal-fleet-reader-stack";
 
 export const AGENT_FACTORY_PORTAL_STAGES = [
+  "agent-factory-portal-agent-registry",
   "agent-factory-portal-edge",
   "agent-factory-portal",
   "agent-factory-portal-fleet-reader",
@@ -105,17 +107,22 @@ function governedActionsContext(
   return { groupTenantMap };
 }
 
-function registryContext(app: App, region: string): { id: string; arn: string } | undefined {
-  const id = context(app, "agenticai/portalRegistryId");
-  const arn = context(app, "agenticai/portalRegistryArn");
+function registryContext(
+  app: App,
+  region: string,
+  idKey = "agenticai/portalRegistryId",
+  arnKey = "agenticai/portalRegistryArn",
+): { id: string; arn: string } | undefined {
+  const id = context(app, idKey);
+  const arn = context(app, arnKey);
   if (id === undefined && arn === undefined) return undefined;
   if (typeof id !== "string" || !/^[A-Za-z0-9]{16}$/.test(id)) {
-    throw new Error("Context agenticai/portalRegistryId must be a 16-character Registry id.");
+    throw new Error(`Context ${idKey} must be a 16-character Registry id.`);
   }
   const expected = new RegExp(`^arn:aws[\\w-]*:agent-registry:${region}:\\d{12}:registry/${id}$`);
   if (typeof arn !== "string" || !expected.test(arn)) {
     throw new Error(
-      "Context agenticai/portalRegistryArn must be the ARN of the Registry named by agenticai/portalRegistryId, in the portal Region.",
+      `Context ${arnKey} must be the ARN of the Registry named by ${idKey}, in the portal Region.`,
     );
   }
   return { id, arn };
@@ -206,6 +213,23 @@ export function addAgentFactoryPortalStage(
   deploymentRegion: string,
 ): boolean {
   switch (stage) {
+    case "agent-factory-portal-agent-registry": {
+      const environment = requireEnvironment(app, stage);
+      const account = requireAccount(app, "agenticai/portalAccountId", stage);
+      const retain = context(app, "agenticai/portalRetainData");
+      const stack = new AgentFactoryPortalAgentRegistryStack(
+        app,
+        `AgenticAI-AgentFactoryPortal-AgentRegistry-${environment}`,
+        {
+          env: { account, region: deploymentRegion },
+          environment,
+          retain: retain === undefined ? undefined : retain === true || retain === "true",
+          description: `Agent Factory Portal (${environment}) agent governance Registry (manual approval).`,
+        },
+      );
+      for (const [key, value] of Object.entries(portalTags(environment))) Tags.of(stack).add(key, value);
+      return true;
+    }
     case "agent-factory-portal-edge": {
       const environment = requireEnvironment(app, stage);
       const account = requireAccount(app, "agenticai/portalAccountId", stage);
@@ -299,6 +323,12 @@ export function addAgentFactoryPortalStage(
         logsKeyArn: keyArnContext(app, "agenticai/portalLogsKeyArn", deploymentRegion),
         governedActions: governedActionsContext(app),
         registry: registryContext(app, deploymentRegion),
+        agentRegistry: registryContext(
+          app,
+          deploymentRegion,
+          "agenticai/portalAgentRegistryId",
+          "agenticai/portalAgentRegistryArn",
+        ),
         description: `Agent Factory Portal (${environment}): sign-in, read-only API and web hosting.`,
       });
       applyTags(stack, environment);

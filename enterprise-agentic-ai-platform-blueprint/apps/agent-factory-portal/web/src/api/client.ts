@@ -187,7 +187,10 @@ export type IdentityStatus = 'none' | 'pending' | 'provisioned' | 'failed';
 /** `GET /agents` (array) and `GET /agents/{id}`. */
 export interface Agent {
   id: string;
+  /** Display name. For a registered agent this is its agent id. */
   name: string;
+  /** Name of the agent's record in the registry. Null or absent for a discovered agent. */
+  record_name?: string | null;
   purpose?: string;
   sponsor_oid?: string | null;
   sponsor_email?: string | null;

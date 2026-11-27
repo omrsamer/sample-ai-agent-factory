@@ -69,3 +69,22 @@ reason as the discovered agents.
   fixtures only.
 - The agent record step running inside the Workload pipeline.
 - Teardown of the portal stacks (they are left running for review).
+
+## Addendum: governed registration and approval
+
+Recorded later on 2026-11-27, same accounts and Region.
+
+| What | How | Result |
+| --- | --- | --- |
+| Agent Registry stage | `cdk deploy` with operator credentials | Registry created with no auto-approval rule |
+| A second, throwaway portal with governed actions and its own temporary Registry | Created and updated through the role holding only the `portal` execution document | Complete |
+| `tests/integration/test_agent_factory_portal_actions.py` | Run against the throwaway portal, then against the long-running portal | 6 of 6 both times |
+| Effective-policy simulation of the three deployed roles | `iam:SimulatePrincipalPolicy` | Registrar: create, update, submit, delete and read allowed, status decision denied. Approver: status decision and read allowed, every record change denied. Read API: read only. Audit table: append for both functions, read for the approver and the read API, update, delete and scan denied for all. |
+| Registration, submission, approval and the self-approval refusal through the web application | Headless browser against the throwaway portal, three signed-in people | The developer registered and submitted; the approver found the record with its submitter and approved it; the history showed both people; a platform user was offered no decision on a record they had submitted. The only writes issued were the three registration calls. |
+| Teardown of the throwaway portal | First delete failed on a late log delivery into the access-log bucket; `scripts/agent_factory_portal_teardown.py` emptied that bucket and the second delete completed | No residue |
+| Web ACL after the fix | A request from a source outside the allow list, sent from a temporary function | 403 on every path, including client-side routes |
+| Both live modules against the long-running portal (governed actions on, separate agent Registry) | `tests/integration/test_agent_factory_portal.py` and `..._actions.py` | 20 of 20 |
+
+Each refusal in the action checks has a positive twin in the same run: a read-only persona and a developer of another tenant are refused where a developer of the tenant succeeds; a developer cannot approve where an approver can; the submitter cannot approve their own record, even with the platform role, where a different approver can; an approved record cannot have a governed reference changed where a change of its description succeeds.
+
+Still not covered: Microsoft Entra ID sign-in, workforce SAML federation, the agent record step running inside the Workload pipeline, SCP-11 with the approver role in the protected authority manifest (no SCP is attached to the accounts used), and simultaneous actions on one record.

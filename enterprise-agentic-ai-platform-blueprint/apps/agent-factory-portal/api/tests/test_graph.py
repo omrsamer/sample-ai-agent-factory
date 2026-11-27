@@ -103,7 +103,7 @@ def test_grants_are_derived_in_both_directions(settings):
     assert graph_mapper.agent_mcp_grants(orphan, index) == []
     gateway_side = graph_mapper.mcp_grants("ws1-tools-abcdefghij", [registered, orphan])
     assert [(g.principal_id, g.principal_display, g.principal_type, g.role) for g in gateway_side] == [
-        ("recAgent0001", "Travel agent", "ServicePrincipal", "Invoker")
+        ("recAgent0001", "travel-agent", "ServicePrincipal", "Invoker")
     ]
 
 

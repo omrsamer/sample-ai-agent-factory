@@ -469,6 +469,70 @@ def test_agents_merge_registry_records_and_discovered_runtimes(call):
     assert call("/agents/unknown-agent")[0:2] == (404, {"detail": "Agent not found"})
 
 
+def test_agent_name_is_the_agent_id_and_the_record_name_is_kept(call):
+    registered = {a["id"]: a for a in call("/agents")[1]}["recAgent0001"]
+    assert (registered["name"], registered["record_name"]) == ("travel-agent", "agent-ws1-travel-agent-nonprod")
+    assert call("/agents/recAgent0001")[1]["name"] == "travel-agent"
+    graph = call("/governance-graph")[1]
+    assert next(n for n in graph["nodes"] if n["id"] == "agent:recAgent0001")["label"] == "travel-agent"
+
+
+def test_separate_agent_registry(call, backend, monkeypatch):
+    """With PORTAL_AGENT_REGISTRY_ID set, agent records come from it and tool records from PORTAL_REGISTRY_ID."""
+    service, _ = backend
+    stray_agent = agent_record(record_id="recStray0001", agentId="stray-agent", runtimeArn=None, gatewayArn=None)
+    by_registry = {
+        "REGISTRYID000001": [tool_record("tool-echo"), stray_agent],
+        "AGENTREGISTRY001": [agent_record(), tool_record("tool-stray")],
+    }
+    seen: list[str] = []
+
+    def list_records(client, registry_id):
+        seen.append(registry_id)
+        return by_registry[registry_id]
+
+    monkeypatch.setattr(registry, "list_records", list_records)
+
+    # Unset: one registry holds both kinds of record, exactly as before.
+    assert [t["tool_id"] for t in call("/catalog/tools")[1]] == ["tool-echo"]
+    assert {a["id"] for a in call("/agents")[1]} == {
+        "recStray0001",
+        "travel_agent-AbCdEf1234",
+        "orphan_agent-ZyXwVu9876",
+    }
+    assert set(seen) == {"REGISTRYID000001"}
+
+    monkeypatch.setenv("PORTAL_AGENT_REGISTRY_ID", "AGENTREGISTRY001")
+    service.settings = get_settings()
+    service.cache.clear()
+    seen.clear()
+    agents = {a["id"]: a for a in call("/agents")[1]}
+    assert set(agents) == {"recAgent0001", "orphan_agent-ZyXwVu9876"}  # the stray agent record is not read
+    assert agents["recAgent0001"]["registration"] == "registered"
+    assert [t["tool_id"] for t in call("/catalog/tools")[1]] == ["tool-echo"]  # not tool-stray
+    tools = call("/mcp-servers/ws1-tools-abcdefghij")[1]["available_tools"]
+    assert (tools[0]["name"], tools[0]["registered"]) == ("tool-echo", True)
+    graph = call("/governance-graph")[1]
+    assert "group:travel-owners" in {n["id"] for n in graph["nodes"]}
+    assert call("/principals/travel-owners")[0] == 200
+    granted = sorted(g["principal_id"] for g in call("/mcp-servers/ws1-tools-abcdefghij/grants")[1])
+    assert granted == ["orphan_agent-ZyXwVu9876", "recAgent0001"]
+    assert [r["record_id"] for r in call("/registrations")[1]] == ["recAgent0001"]
+    assert set(seen) == {"REGISTRYID000001", "AGENTREGISTRY001"}
+    assert seen.count("REGISTRYID000001") == 1  # the tool records are cached across these calls
+
+
+def test_agent_registry_id_is_validated(call, monkeypatch):
+    monkeypatch.setenv("PORTAL_AGENT_REGISTRY_ID", "not a registry id")
+    status, body, _ = call("/agents")
+    assert (status, body) == (
+        500,
+        {"detail": "Portal configuration error: PORTAL_AGENT_REGISTRY_ID is missing or malformed"},
+    )
+    monkeypatch.setenv("PORTAL_AGENT_REGISTRY_ID", "")
+    assert call("/agents")[0] == 200
+
+
 def test_agent_runtime_deployments_and_grants(call):
     assert call("/agents/recAgent0001/runtime")[1]["status"] == "ready"
     deployments = call("/agents/recAgent0001/deployments")[1]

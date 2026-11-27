@@ -1,8 +1,9 @@
+| Platform control, further governed actions | Tool subscription requests, release approval with evidence beside it, policy change proposals as pull requests, on-demand replay of a positive call and its adversarial twin in nonproduction, incident containment through the cell's kill switch |
 # Agent Factory Portal
 
 The Agent Factory Portal is the product surface of the Agent Factory: the place where the personas of the operating model (README section 1.3) see and use the platform's capabilities. It is opt-in. Nothing else in the blueprint depends on it, and a deployment without it behaves exactly as before.
 
-This document covers the first milestone, which is read-only: assurance and operations views plus the governance catalog. Later milestones add governed actions and the developer experience surfaces; they are listed under "Roadmap" and are not part of the tested envelope until they are validated live.
+The portal is read-only by default: assurance and operations views plus the governance catalog. Governed registration and approval of agent records is a second opt-in on top of it. Later milestones are listed under "Roadmap" and are not part of the tested envelope until they are validated live.
 
 ## Why it exists
 
@@ -68,6 +69,15 @@ Sign-in groups map to portal roles. The role decides what a person may see; the 
 
 A signed-in user who belongs to no mapped group is refused.
 
+With governed actions on, roles also carry authorities, and tenants come from `agenticai/portalGroupTenantMap`:
+
+| Portal role | Registrar (create, change, submit, delete) | Approver (approve, reject) | Tenants |
+| --- | --- | --- | --- |
+| `platform` | yes | yes | every tenant |
+| `developer` | yes | no | tenants of the user's groups |
+| `approver`, `security` | no | yes | tenants of the user's groups |
+| `sre`, `finops`, `readonly` | no | no | none |
+
 ## Sign-in options
 
 **Amazon Cognito (default).** The stack creates a user pool with no self sign-up, required TOTP MFA and the authorization code flow with PKCE. For workforce sign-in, create a SAML application for the portal in AWS IAM Identity Center and pass its metadata URL as `agenticai/portalSamlMetadataUrl`; users then sign in through Identity Center and the user pool holds no passwords. Send the user's group names in a SAML attribute (default name `groups`) and map those names to portal roles with `agenticai/portalGroupRoleMap`.
@@ -118,6 +128,38 @@ Build the two application bundles first (see `apps/agent-factory-portal/README.m
 
 Keep real account ids, the external id and the cell list outside source control, as with the rest of the `agenticai/*` context.
 
+### Governed registration and approval (opt-in)
+
+Registration and approval record decisions about agents. They deploy nothing: deployment still happens only through the Workload pipeline of the owning cell.
+
+Agent records live in their own Registry. The Platform Registry approves automatically, because the Platform pipeline is the authority for tool records; an agent record is decided by a person, so its Registry has no auto-approval rule and a submitted record waits in `PENDING_APPROVAL`. Creating a Registry is a protected authority, so operators deploy it in its own stage and the portal stack only receives its id and ARN (the same custody rule as the Omni hub keys):
+
+```bash
+# Operators, once per environment:
+npx cdk deploy --context stage=agent-factory-portal-agent-registry \
+  --context agenticai/portalEnvironment=nonprod \
+  --context agenticai/portalAccountId=<PLATFORM_ACCOUNT>
+
+# Then the portal stage with:
+  --context agenticai/portalGovernedActions=true \
+  --context agenticai/portalAgentRegistryId=<PortalAgentRegistryId> \
+  --context agenticai/portalAgentRegistryArn=<PortalAgentRegistryArn> \
+  --context 'agenticai/portalGroupTenantMap={"product-teams":["<TENANT>"],"human-approvers":["<TENANT>"]}'
+```
+
+The Workload pipeline publishes each deployed agent's record to the same Registry with `pipelines/publish_agent_record.py` (the Registry id is under `/agenticai/registry/agents/v1/<env>/id`); a record published that way has no portal submitter, so any approver may decide it.
+
+What the opt-in adds, and what it never does:
+
+| Added | Guarantee |
+| --- | --- |
+| Registrar function, role `AgenticAI-RegistryRegistrar-<env>` | Creates, changes, submits and deletes agent records in the agent Registry. Cannot decide an approval and cannot touch the Platform Registry. |
+| Approver function, role `AgenticAI-RegistryApprover-<env>` | Approves or rejects a submitted record. Cannot create or change one. The person who submitted a record cannot decide it, whatever their role. |
+| Audit trail (DynamoDB, point-in-time recovery) | Every decision, allowed or refused, with who and why. The functions can append; none can change or delete an entry. |
+| Rules of the registration core | An approved record cannot have its runtime, gateway, tool subscriptions, risk class or data classification changed; that needs a new registration. Any other change returns the record to draft for a new review. |
+
+Where SCP-11 is attached, add the approver role to the protected authority manifest (purpose: registry), or its status decisions are denied by the organization.
+
 ### Context reference
 
 | Key | Stage | Meaning |
@@ -135,6 +177,10 @@ Keep real account ids, the external id and the cell list outside source control,
 | `agenticai/portalModelAllowlist`, `agenticai/portalGuardrailTag` | portal | Catalog inputs |
 | `agenticai/portalApiCodePath`, `agenticai/portalWebDistPath` | portal | Override the bundle locations |
 | `agenticai/portalLogsKeyArn`, `agenticai/portalEdgeLogsKeyArn` | portal, edge | Operator-provisioned customer managed key for the log groups (optional). The stacks never create or tag a key. |
+| `agenticai/portalGovernedActions` | portal | `true` adds registration and approval (default: off, read-only) |
+| `agenticai/portalAgentRegistryId`, `agenticai/portalAgentRegistryArn` | portal | The agent Registry (outputs of the agent-registry stage); required with governed actions |
+| `agenticai/portalGroupTenantMap` | portal | Group or app-role name to the tenant ids its members may act for (JSON) |
+| `agenticai/portalRegistryId`, `agenticai/portalRegistryArn` | portal | Use a given Platform Registry instead of the environment's default |
 | `agenticai/portalRetainData` | portal | Retain the user pool and buckets on deletion (default: prod only) |
 | `agenticai/portalCellAccountId`, `agenticai/portalExternalId`, `agenticai/portalSpansLogGroupNames` | fleet reader | Cell account, shared external id, span log groups |
 
@@ -153,7 +199,17 @@ Keep real account ids, the external id and the cell list outside source control,
 
 ## Removal
 
-Delete the three stacks in reverse order (portal, fleet readers, edge). With the default non-production settings the user pool, buckets and log groups are removed with the stack. `scripts/residue_inventory.py` reports anything left.
+Delete the stacks in reverse order: portal, fleet readers, edge, and last the agent Registry if its records are no longer needed. Use `scripts/agent_factory_portal_teardown.py` for the portal stack: its access-log bucket keeps receiving log deliveries for a while after the stack has emptied it, so a plain stack delete can fail on that bucket, and the log groups of the stack's provider functions are not stack resources. The script captures what the stack owns before deleting, retries after emptying exactly those buckets, and removes exactly those log groups.
+
+```bash
+python3 scripts/agent_factory_portal_teardown.py --stack-name AgenticAI-AgentFactoryPortal-<env> \
+  --expected-account <PLATFORM_ACCOUNT> --region <REGION>            # prints the plan
+python3 scripts/agent_factory_portal_teardown.py ... --execute        # after reviewing it
+```
+
+`scripts/residue_inventory.py --global` lists what remains, including the distribution, the web ACL and its IP sets.
+
+Changing the allow list updates the web ACL in place. The edge stack and the portal stack must not be replaced in one step: a web ACL cannot be deleted while a distribution uses it.
 
 ## Support envelope
 

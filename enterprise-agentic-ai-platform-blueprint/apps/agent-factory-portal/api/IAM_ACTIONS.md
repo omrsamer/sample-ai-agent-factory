@@ -27,14 +27,20 @@ Region for every platform-account call is `PORTAL_REGISTRY_REGION`.
 | Action | Resource it can be narrowed to | Needed by |
 | --- | --- | --- |
 | `sts:AssumeRole` | The `readerRoleArn` of each entry in `PORTAL_CELLS` (exact role ARNs, no wildcard) | Every endpoint that reads a cell: `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/fleet/health` |
-| `agent-registry:ListRegistryRecords` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>` | `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/catalog/tools`, `/registrations`, `/registrations/{record_id}` |
-| `agent-registry:GetRegistryRecord` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>/record/*` | Same as `ListRegistryRecords` (the list operation does not return descriptors) |
+| `agent-registry:ListRegistryRecords` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>` and, when `PORTAL_AGENT_REGISTRY_ID` is set, `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_AGENT_REGISTRY_ID>` | `/agents*`, `/mcp-servers*`, `/governance-graph`, `/principals/{id}`, `/observability/metrics`, `/catalog/tools`, `/registrations`, `/registrations/{record_id}` |
+| `agent-registry:GetRegistryRecord` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>/record/*` and, when `PORTAL_AGENT_REGISTRY_ID` is set, `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_AGENT_REGISTRY_ID>/record/*` | Same as `ListRegistryRecords` (the list operation does not return descriptors) |
 | `codepipeline:ListPipelineExecutions` | `arn:aws:codepipeline:REGION:PLATFORM:<pipelineName>` for each `pipelineName` in `PORTAL_CELLS` | `/agents/{id}/evals/runs` |
 | `codepipeline:ListActionExecutions` | Same pipeline ARNs | `/agents/{id}/evals/runs` (EvaluationGate action result) |
 | `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | `/registrations/{record_id}`, `/registrations/{record_id}/history` |
 | `bedrock:ListGuardrails` | `*` (list operation) | `/guardrails`, `/guardrails/{id}` |
 | `bedrock:ListTagsForResource` | `arn:aws:bedrock:REGION:PLATFORM:guardrail/*` | `/guardrails`, `/guardrails/{id}`. Called only when `PORTAL_GUARDRAIL_TAG_KEY` is set (tag filter); not needed when it is empty |
 | `bedrock:GetGuardrail` | `arn:aws:bedrock:REGION:PLATFORM:guardrail/*` | `/guardrails/{id}` |
+
+With `PORTAL_AGENT_REGISTRY_ID` set, the read role needs the two registry
+read actions on both registries: tool records (`/catalog/tools`, the tool join
+on gateways) are read from `PORTAL_REGISTRY_ID`, and agent governance records
+(`/agents*`, `/registrations*`, the governance graph and everything derived
+from them) from `PORTAL_AGENT_REGISTRY_ID`. Without it, one registry holds both.
 
 The function also needs its own log delivery permissions (the AWS managed
 basic execution policy or an equivalent scoped to its log group). That is
@@ -83,7 +89,8 @@ Notes for the policy author:
 
 ## 3. Registrar role (platform account)
 
-Function `registrar_handler.handler`, `PORTAL_ACTION_ROLE=registrar`.
+Function `registrar_handler.handler`, `PORTAL_ACTION_ROLE=registrar`. Its `PORTAL_REGISTRY_ID` is the
+registry that holds the agent records (the agent registry when there are two).
 
 | Action | Resource it can be narrowed to | Needed by |
 | --- | --- | --- |
@@ -100,7 +107,8 @@ harmless but not needed.
 
 ## 4. Approver role (platform account)
 
-Function `approver_handler.handler`, `PORTAL_ACTION_ROLE=approver`.
+Function `approver_handler.handler`, `PORTAL_ACTION_ROLE=approver`. Its `PORTAL_REGISTRY_ID` is the
+registry that holds the agent records.
 
 | Action | Resource it can be narrowed to | Needed by |
 | --- | --- | --- |

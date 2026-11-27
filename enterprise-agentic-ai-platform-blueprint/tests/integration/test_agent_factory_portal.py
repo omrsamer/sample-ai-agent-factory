@@ -249,7 +249,9 @@ def test_web_application_serves_its_shell_config_and_security_headers():
         config = json.loads(response.read())
         headers = {k.lower(): v for k, v in response.headers.items()}
     assert config["apiBaseUrl"].rstrip("/") == API
-    assert config["features"]["readOnly"] is True
+    features = config["features"]
+    assert isinstance(features["readOnly"], bool) and isinstance(features["governedActions"], bool)
+    assert features["readOnly"] is not features["governedActions"], "read-only exactly when governed actions are off"
     assert headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in headers["content-security-policy"]
     assert headers["strict-transport-security"].startswith("max-age=")

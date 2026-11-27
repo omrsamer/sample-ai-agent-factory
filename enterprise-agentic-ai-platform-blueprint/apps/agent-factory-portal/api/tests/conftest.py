@@ -157,8 +157,8 @@ def agent_document(**overrides: Any) -> dict[str, Any]:
 def agent_record(status: str = "APPROVED", record_id: str = "recAgent0001", **overrides: Any) -> dict[str, Any]:
     return {
         "recordId": record_id,
-        "name": "travel-agent",
-        "displayName": "Travel agent",
+        "name": "agent-ws1-travel-agent-nonprod",
+        "displayName": "agent-ws1-travel-agent-nonprod",
         "description": "Travel agent record",
         "recordType": "CUSTOM",
         "descriptors": {"custom": {"data": json.dumps(agent_document(**overrides))}},

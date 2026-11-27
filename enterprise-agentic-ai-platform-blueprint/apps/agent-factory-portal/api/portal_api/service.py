@@ -118,12 +118,31 @@ class PortalService:
     def _cached(self, key: Any, loader: Any) -> Any:
         return self.cache.get_or_load(key, self.settings.cache_ttl_seconds, loader)
 
-    def records(self) -> list[dict[str, Any]]:
-        def load() -> list[dict[str, Any]]:
-            client = self.clients.platform("agent-registry-control", self.settings.registry_region)
-            return registry.list_records(client, self.settings.registry_id)
+    def _registry_client(self) -> Any:
+        return self.clients.platform("agent-registry-control", self.settings.registry_region)
 
-        return self._cached("registry-records", load)
+    def records(self) -> list[dict[str, Any]]:
+        """Records of the platform registry (``PORTAL_REGISTRY_ID``): the tool records."""
+
+        def load() -> list[dict[str, Any]]:
+            return registry.list_records(self._registry_client(), self.settings.registry_id)
+
+        return self._cached(("registry-records", self.settings.registry_id), load)
+
+    def agent_registry_records(self) -> list[dict[str, Any]]:
+        """Records of the registry that holds agent governance records.
+
+        That is ``PORTAL_AGENT_REGISTRY_ID`` when set. Otherwise one registry holds both
+        kinds of record and this is the same (cached) list as ``records()``.
+        """
+        registry_id = self.settings.effective_agent_registry_id
+        if registry_id == self.settings.registry_id:
+            return self.records()
+
+        def load() -> list[dict[str, Any]]:
+            return registry.list_records(self._registry_client(), registry_id)
+
+        return self._cached(("registry-records", registry_id), load)
 
     def _scopes(self) -> dict[tuple[Any, ...], list[Cell]]:
         scopes: dict[tuple[Any, ...], list[Cell]] = {}
@@ -135,8 +154,8 @@ class PortalService:
         return self._cached("inventory", self._load_inventory)
 
     def _load_inventory(self) -> Inventory:
-        records = self.records()
-        tool_index = registry_mapper.tool_index(records)
+        tool_index = registry_mapper.tool_index(self.records())
+        agent_records = registry_mapper.agent_records(self.agent_registry_records())
         scopes = self._scopes()
 
         def discover(cells: list[Cell]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -164,7 +183,7 @@ class PortalService:
                 inventory.gateways.append(mcp_mapper.gateway_entry(bundle, matched or cells[0], tool_index))
 
         referenced: set[str] = set()
-        for record in registry_mapper.agent_records(records):
+        for record in agent_records:
             governance = registry_mapper.agent_governance(record)
             runtime = runtimes.get(governance.runtime_arn or "")
             if runtime:
@@ -533,9 +552,8 @@ class PortalService:
 
     def registrations(self, status: str | None = None, tenant_id: str | None = None) -> list[Registration]:
         """Agent governance records, read fresh so the list reflects an action that just completed."""
-        client = self.clients.platform("agent-registry-control", self.settings.registry_region)
         result = []
-        for record in registry.list_records(client, self.settings.registry_id):
+        for record in registry.list_records(self._registry_client(), self.settings.effective_agent_registry_id):
             document = registration_helpers.agent_document(record)
             if document is None:
                 continue
@@ -549,9 +567,10 @@ class PortalService:
 
     def registration(self, record_id: str, caller_subject: str) -> RegistrationDetail:
         """One agent governance record, with who created, submitted and decided it."""
-        client = self.clients.platform("agent-registry-control", self.settings.registry_region)
         try:
-            record = client.get_registry_record(registryId=self.settings.registry_id, recordId=record_id)
+            record = self._registry_client().get_registry_record(
+                registryId=self.settings.effective_agent_registry_id, recordId=record_id
+            )
         except ClientError as exc:
             if error_code(exc) == "ResourceNotFoundException":
                 raise NotFound("Registration not found") from exc

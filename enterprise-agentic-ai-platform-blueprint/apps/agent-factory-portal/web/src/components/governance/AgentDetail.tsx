@@ -177,7 +177,12 @@ function OverviewTab({ agent, tenantName }: { agent: Agent; tenantName: string |
               <Field label="Runtime id"><span className="font-mono text-xs break-all">{agent.id}</span></Field>
             </>
           ) : (
-            <Field label="Registry id"><span className="font-mono text-xs break-all">{agent.id}</span></Field>
+            <>
+              <Field label="Registry id"><span className="font-mono text-xs break-all">{agent.id}</span></Field>
+              {agent.record_name && (
+                <Field label="Registry record name"><span className="font-mono text-xs break-all">{agent.record_name}</span></Field>
+              )}
+            </>
           )}
           <Field label="Created by">{agent.created_by ?? '—'}</Field>
           <Field label="Created">{formatDate(agent.created_at)}</Field>

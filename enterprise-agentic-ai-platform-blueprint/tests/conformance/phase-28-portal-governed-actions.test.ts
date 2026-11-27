@@ -36,6 +36,8 @@ const REGION = "eu-west-1";
 const WEB_ACL = `arn:aws:wafv2:us-east-1:${PLATFORM}:global/webacl/portal/11111111-2222-4333-8444-555555555555`;
 const REGISTRY_ID = "abcdEFGH1234ijkl";
 const REGISTRY_ARN = `arn:aws:agent-registry:${REGION}:${PLATFORM}:registry/${REGISTRY_ID}`;
+const AGENT_REGISTRY_ID = "mnopQRST5678uvwx";
+const AGENT_REGISTRY_ARN = `arn:aws:agent-registry:${REGION}:${PLATFORM}:registry/${AGENT_REGISTRY_ID}`;
 
 const assets = fs.mkdtempSync(path.join(os.tmpdir(), "portal-actions-conformance-"));
 const apiCode = path.join(assets, "api");
@@ -65,6 +67,7 @@ function portal(governed: boolean): AgentFactoryPortalStack {
     webDistPath: webDist,
     registry: { id: REGISTRY_ID, arn: REGISTRY_ARN },
     governedActions: governed ? { groupTenantMap: { "product-teams": ["ws1"] } } : undefined,
+    agentRegistry: governed ? { id: AGENT_REGISTRY_ID, arn: AGENT_REGISTRY_ARN } : undefined,
   });
 }
 
@@ -131,9 +134,39 @@ describe("Phase 28 — separation of duties in IAM", () => {
       .flatMap((p) => p.Properties.PolicyDocument.Statement)
       .filter((s) => s.Sid === "RegistryRecords");
     expect(statements).toHaveLength(2);
+    // The action functions write agent records to the agent Registry only,
+    // never to the Platform Registry that holds the tool records.
     for (const statement of statements) {
-      expect(statement.Resource).toEqual([REGISTRY_ARN, `${REGISTRY_ARN}/record/*`]);
+      expect(statement.Resource).toEqual([AGENT_REGISTRY_ARN, `${AGENT_REGISTRY_ARN}/record/*`]);
     }
+  });
+
+  it("the read API reads both Registries and the action functions never touch the Platform Registry", () => {
+    const read = Object.values(template.findResources("AWS::IAM::ManagedPolicy") as Record<string, Policy>)
+      .flatMap((p) => p.Properties.PolicyDocument.Statement)
+      .find((s) => s.Sid === "PortalReadRegistry")!;
+    expect(read.Resource).toEqual([
+      REGISTRY_ARN,
+      `${REGISTRY_ARN}/record/*`,
+      AGENT_REGISTRY_ARN,
+      `${AGENT_REGISTRY_ARN}/record/*`,
+    ]);
+  });
+
+  it("refuses governed actions without the agent Registry", () => {
+    expect(
+      () =>
+        new AgentFactoryPortalStack(new App(), "NoAgentRegistry", {
+          env: { account: PLATFORM, region: REGION },
+          environment: "nonprod",
+          identityProvider: "cognito",
+          webAclArn: WEB_ACL,
+          cells: [],
+          apiCodePath: apiCode,
+          webDistPath: webDist,
+          governedActions: { groupTenantMap: {} },
+        }),
+    ).toThrow(/governed actions need the agent Registry/);
   });
 
   it("keeps the audit trail recoverable", () => {
@@ -262,10 +295,31 @@ describe("Phase 28 — opt-in", () => {
         "agenticai/portalGroupTenantMap": '{"product-teams":["ws1"]}',
         "agenticai/portalRegistryId": REGISTRY_ID,
         "agenticai/portalRegistryArn": REGISTRY_ARN,
+        "agenticai/portalAgentRegistryId": AGENT_REGISTRY_ID,
+        "agenticai/portalAgentRegistryArn": AGENT_REGISTRY_ARN,
       },
     });
     expect(addAgentFactoryPortalStage(app, "agent-factory-portal", REGION)).toBe(true);
     const stack = app.node.findChild("AgenticAI-AgentFactoryPortal-nonprod") as Stack;
     Template.fromStack(stack).resourceCountIs("AWS::DynamoDB::Table", 1);
+  });
+});
+
+describe("Phase 28 — agent Registry stage (operator-deployed)", () => {
+  it("creates a Registry with no auto-approval rule and publishes its id and ARN", () => {
+    const app = new App({
+      context: { "agenticai/portalEnvironment": "nonprod", "agenticai/portalAccountId": PLATFORM },
+    });
+    expect(addAgentFactoryPortalStage(app, "agent-factory-portal-agent-registry", REGION)).toBe(true);
+    const template = Template.fromStack(
+      app.node.findChild("AgenticAI-AgentFactoryPortal-AgentRegistry-nonprod") as Stack,
+    );
+    const registries = template.findResources("AWS::AgentRegistry::Registry");
+    expect(Object.keys(registries)).toHaveLength(1);
+    const properties = (Object.values(registries)[0] as { Properties: Record<string, unknown> }).Properties;
+    expect(properties.Name).toBe("agenticai-agents-nonprod-v1");
+    expect(properties.ApprovalConfiguration).toBeUndefined();
+    template.hasResourceProperties("AWS::SSM::Parameter", { Name: "/agenticai/registry/agents/v1/nonprod/id" });
+    template.hasResourceProperties("AWS::SSM::Parameter", { Name: "/agenticai/registry/agents/v1/nonprod/arn" });
   });
 });

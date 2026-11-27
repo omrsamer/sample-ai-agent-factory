@@ -90,6 +90,12 @@ export interface PortalApiProps {
   readonly groupRoleMap: Readonly<Record<string, PortalRole>>;
   readonly registryId: string;
   readonly registryArn: string;
+  /**
+   * Registry holding agent governance records, when it is not the Platform
+   * Registry (see PortalAgentRegistry). The read API then reads agent records
+   * there and tool records from the Platform Registry.
+   */
+  readonly agentRegistry?: { readonly id: string; readonly arn: string };
   readonly cells: readonly PortalCell[];
   /** Browser origins allowed to call the API. */
   readonly allowedOrigins: readonly string[];
@@ -195,7 +201,13 @@ export class PortalApi extends Construct {
         sid: "PortalReadRegistry",
         effect: Effect.ALLOW,
         actions: [...PORTAL_API_REGISTRY_ACTIONS],
-        resources: [props.registryArn, `${props.registryArn}/record/*`],
+        resources: [
+          props.registryArn,
+          `${props.registryArn}/record/*`,
+          ...(props.agentRegistry
+            ? [props.agentRegistry.arn, `${props.agentRegistry.arn}/record/*`]
+            : []),
+        ],
       }),
     );
     policy.addStatements(
@@ -294,6 +306,7 @@ export class PortalApi extends Construct {
         PORTAL_ENV: props.environment,
         PORTAL_REGISTRY_ID: props.registryId,
         PORTAL_REGISTRY_REGION: stack.region,
+        ...(props.agentRegistry ? { PORTAL_AGENT_REGISTRY_ID: props.agentRegistry.id } : {}),
         PORTAL_CELLS: stack.toJsonString(cellsEnv),
         PORTAL_IDENTITY_PROVIDER: props.identityProvider,
         PORTAL_GROUP_ROLE_MAP: JSON.stringify(props.groupRoleMap),

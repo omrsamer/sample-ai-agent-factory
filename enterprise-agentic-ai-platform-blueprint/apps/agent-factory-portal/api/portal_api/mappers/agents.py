@@ -111,10 +111,12 @@ def registered_agent(
     created = iso(record.get("createdAt")) or EPOCH_ISO
     agent = Agent(
         id=str(record["recordId"]),
-        name=text(record.get("displayName"))
+        # The agent's own id is its name; the registry record name is kept in record_name.
+        name=governance.agent_id
+        or text(record.get("displayName"))
         or text(record.get("name"))
-        or governance.agent_id
         or str(record["recordId"]),
+        record_name=text(record.get("name")),
         purpose=governance.business_purpose or text(record.get("description")),
         sponsor_email=governance.contact,
         business_unit=governance.owner_group,

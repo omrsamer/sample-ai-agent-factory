@@ -30,6 +30,7 @@ import { Construct } from "constructs";
 
 import {
   PortalActions,
+  PortalAgentRegistry,
   PortalApi,
   PortalAuditTrail,
   PortalCell,
@@ -107,6 +108,13 @@ export interface AgentFactoryPortalStackProps extends StackProps {
     readonly groupTenantMap: Readonly<Record<string, readonly string[]>>;
   };
   /**
+   * Registry that holds agent governance records, deployed by operators with
+   * the `agent-factory-portal-agent-registry` stage (manual approval).
+   * Required with governed actions: on the Platform Registry a submitted
+   * record is approved automatically and would never reach an approver.
+   */
+  readonly agentRegistry?: { readonly id: string; readonly arn: string };
+  /**
    * Registry the portal reads and, with governed actions, writes agent
    * records to. Defaults to the Platform Registry of the environment
    * (`/agenticai/registry/v1/<env>/{id,arn}`).
@@ -137,6 +145,7 @@ export class AgentFactoryPortalStack extends Stack {
       logsKeyArn,
       governedActions,
       registry,
+      agentRegistry,
       ...stackProps
     } = props;
     super(scope, id, stackProps);
@@ -198,6 +207,12 @@ export class AgentFactoryPortalStack extends Stack {
     const registryArn =
       registry?.arn ??
       StringParameter.valueForStringParameter(this, registrySsmParameter(environment, "arn"));
+    if (governedActions && !agentRegistry) {
+      throw new Error(
+        "AgentFactoryPortalStack: governed actions need the agent Registry (deploy the agent-factory-portal-agent-registry stage and pass its id and ARN). " +
+          "The Platform Registry approves automatically, so a submitted record would never reach an approver.",
+      );
+    }
     const logsKey = logsKeyArn ? Key.fromKeyArn(this, "LogsKey", logsKeyArn) : undefined;
     const audit = governedActions
       ? new PortalAuditTrail(this, "Audit", { environment, retain: retainData })
@@ -219,6 +234,7 @@ export class AgentFactoryPortalStack extends Stack {
       logsKey,
       auditTable: audit?.table,
       groupTenantMap: governedActions?.groupTenantMap,
+      agentRegistry,
     });
 
     if (governedActions && audit) {
@@ -227,8 +243,8 @@ export class AgentFactoryPortalStack extends Stack {
         codePath: apiCodePath,
         httpApi: api.httpApi,
         authorizer: api.authorizer,
-        registryId,
-        registryArn,
+        registryId: agentRegistry!.id,
+        registryArn: agentRegistry!.arn,
         auditTable: audit.table,
         identityProvider,
         groupRoleMap,
@@ -262,5 +278,31 @@ export class AgentFactoryPortalStack extends Stack {
       description: "The only principal each cell's fleet reader role trusts.",
     });
     new CfnOutput(this, "PortalDistributionId", { value: web.distribution.distributionId });
+  }
+}
+
+export interface AgentFactoryPortalAgentRegistryStackProps extends StackProps {
+  readonly environment: PortalEnvironment;
+  readonly retain?: boolean;
+}
+
+/**
+ * The Registry for agent governance records (manual approval). Deployed by
+ * operators, like the Omni hub keys: creating a Registry is a protected
+ * authority, so the portal stack only receives this stack's two outputs.
+ */
+export class AgentFactoryPortalAgentRegistryStack extends Stack {
+  constructor(scope: Construct, id: string, props: AgentFactoryPortalAgentRegistryStackProps) {
+    const { environment, retain, ...stackProps } = props;
+    super(scope, id, stackProps);
+    const registry = new PortalAgentRegistry(this, "AgentRegistry", { environment, retain });
+    new CfnOutput(this, "PortalAgentRegistryId", {
+      value: registry.registryId,
+      description: "Pass to the agent-factory-portal stage as agenticai/portalAgentRegistryId.",
+    });
+    new CfnOutput(this, "PortalAgentRegistryArn", {
+      value: registry.registryArn,
+      description: "Pass to the agent-factory-portal stage as agenticai/portalAgentRegistryArn.",
+    });
   }
 }

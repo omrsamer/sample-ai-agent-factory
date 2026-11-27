@@ -983,6 +983,20 @@ def test_single_registration_errors_and_records_without_a_trail(world, monkeypat
     assert world.call("read", "GET", f"/registrations/{published}", VIEW)[0] == 200
 
 
+def test_registrations_are_read_from_the_agent_registry_when_one_is_configured(world, monkeypatch):
+    record_id = world.new_record("PENDING_APPROVAL")
+    world.registry.registry_ids.clear()
+    assert world.call("read", "GET", "/registrations", VIEW)[0] == 200
+    assert world.call("read", "GET", f"/registrations/{record_id}", VIEW)[0] == 200
+    assert set(world.registry.registry_ids) == {"REGISTRYID000001"}  # unset: the one registry holds both
+
+    monkeypatch.setenv("PORTAL_AGENT_REGISTRY_ID", "AGENTREGISTRY001")
+    world.registry.registry_ids.clear()
+    assert [r["record_id"] for r in world.call("read", "GET", "/registrations", VIEW)[1]] == [record_id]
+    assert world.call("read", "GET", f"/registrations/{record_id}", VIEW)[1]["status"] == "PENDING_APPROVAL"
+    assert set(world.registry.registry_ids) == {"AGENTREGISTRY001"}
+
+
 def test_history_is_newest_first_and_survives_deletion(world):
     record_id = world.new_record("REJECTED")
     code, history = world.call("read", "GET", f"/registrations/{record_id}/history", VIEW)
