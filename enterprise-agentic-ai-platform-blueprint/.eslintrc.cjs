@@ -27,6 +27,9 @@ module.exports = {
     'coverage/',
     'dist/',
     'node_modules/',
+    // The portal applications carry their own toolchains.
+    'apps/agent-factory-portal/web/',
+    'apps/agent-factory-portal/api/',
   ],
   rules: {
     '@typescript-eslint/no-explicit-any': 'off',

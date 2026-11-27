@@ -97,6 +97,8 @@
       "@agenticai/otel-genai-semconv/*": ["packages/otel-genai-semconv/src/*"],
       "@agenticai/agentcore-evaluations": ["packages/agentcore-evaluations/src/index.ts"],
       "@agenticai/agentcore-evaluations/*": ["packages/agentcore-evaluations/src/*"],
+      "@agenticai/agent-factory-portal": ["packages/agent-factory-portal/src/index.ts"],
+      "@agenticai/agent-factory-portal/*": ["packages/agent-factory-portal/src/*"],
       "@agenticai/omni": ["packages/omni/src/index.ts"],
       "@agenticai/omni/*": ["packages/omni/src/*"],
       "@agenticai/catalogue-drift-detector": ["packages/catalogue-drift-detector/src/index.ts"],
@@ -111,5 +113,5 @@
     "blueprints/**/*.ts",
     "tests/**/*.ts"
   ],
-  "exclude": ["node_modules", "cdk.out", "dist", "**/*.d.ts"]
+  "exclude": ["node_modules", "cdk.out", "dist", "**/*.d.ts", "apps/agent-factory-portal/web", "apps/agent-factory-portal/api"]
 }

@@ -84,6 +84,8 @@ const config: Config = {
     '^@agenticai/otel-genai-semconv/(.*)$': '<rootDir>/packages/otel-genai-semconv/src/$1',
     '^@agenticai/agentcore-evaluations$': '<rootDir>/packages/agentcore-evaluations/src/index.ts',
     '^@agenticai/agentcore-evaluations/(.*)$': '<rootDir>/packages/agentcore-evaluations/src/$1',
+    '^@agenticai/agent-factory-portal$': '<rootDir>/packages/agent-factory-portal/src/index.ts',
+    '^@agenticai/agent-factory-portal/(.*)$': '<rootDir>/packages/agent-factory-portal/src/$1',
     '^@agenticai/omni$': '<rootDir>/packages/omni/src/index.ts',
     '^@agenticai/omni/(.*)$': '<rootDir>/packages/omni/src/$1',
     '^@agenticai/catalogue-drift-detector$': '<rootDir>/packages/catalogue-drift-detector/src/index.ts',

@@ -47,6 +47,7 @@ import {
   type OmniHubStackProps,
 } from "../apps/platform-account/lib/omni-hub-stack";
 import { OmniHubKeysStack } from "../apps/platform-account/lib/omni-hub-keys-stack";
+import { addAgentFactoryPortalStage } from "../apps/platform-account/lib/agent-factory-portal-stages";
 import { LogArchiveStack } from "../apps/platform-account/lib/log-archive-stack";
 import { AuditStack } from "../apps/platform-account/lib/audit-stack";
 import { GuardrailStack } from "../apps/platform-account/lib/guardrail-stack";
@@ -1972,13 +1973,21 @@ switch (stage) {
     });
     break;
   }
+  case "agent-factory-portal-edge":
+  case "agent-factory-portal":
+  case "agent-factory-portal-fleet-reader": {
+    // Agent Factory Portal (opt-in): edge web ACL, portal, and the read-only
+    // fleet reader role of a Workstream cell. See docs/AGENT_FACTORY_PORTAL.md.
+    addAgentFactoryPortalStage(app, stage, deploymentRegion());
+    break;
+  }
   case undefined:
     throw new Error(
-      "Missing required CDK context 'stage'. Pass --context stage=<management|omni-domain|omni-hub-keys|omni-hub|platform|workload|sandbox|d03-platform|d03-workload|d03-workstream-gateway|pipeline|workload-inference|runtime-router|gap-closure>.",
+      "Missing required CDK context 'stage'. Pass --context stage=<management|omni-domain|omni-hub-keys|omni-hub|platform|workload|sandbox|d03-platform|d03-workload|d03-workstream-gateway|pipeline|workload-inference|runtime-router|gap-closure|agent-factory-portal-edge|agent-factory-portal|agent-factory-portal-fleet-reader>.",
     );
   default:
     throw new Error(
-      `Unknown stage '${stage}'. Valid stages: management | omni-domain | omni-hub-keys | omni-hub | platform | workload | sandbox | d03-platform | d03-workload | d03-workstream-gateway | pipeline | workload-inference | runtime-router | gap-closure.`,
+      `Unknown stage '${stage}'. Valid stages: management | omni-domain | omni-hub-keys | omni-hub | platform | workload | sandbox | d03-platform | d03-workload | d03-workstream-gateway | pipeline | workload-inference | runtime-router | gap-closure | agent-factory-portal-edge | agent-factory-portal | agent-factory-portal-fleet-reader.`,
     );
 }
 
