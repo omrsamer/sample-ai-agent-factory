@@ -63,7 +63,15 @@ MANAGEMENT_STACK_NAME = "AgenticAI-Management-OrgStack"
 # inside the Create request, and no principal can set an `aws:`-prefixed tag
 # through the Organizations API, so the tag identifies one stack's resources.
 CFN_STACK_NAME_TAG = "aws:cloudformation:stack-name"
-ROLES = ("platform", "workstream", "management", "audit", "hub-role-boundary")
+ROLES = (
+    "platform",
+    "workstream",
+    "management",
+    "audit",
+    "hub-role-boundary",
+    "portal",
+    "portal-cell",
+)
 # IAM counts a managed policy's characters without whitespace. Each rendered
 # role becomes one CDK CloudFormation execution policy, so it must fit.
 IAM_MANAGED_POLICY_MAX_CHARS = 6144
@@ -1276,6 +1284,184 @@ def management_policy(
     }
 
 
+# Agent Factory Portal (docs/AGENT_FACTORY_PORTAL.md). The portal stages are
+# opt-in and separate from the Platform pipeline, so they get their own
+# documents instead of widening the `platform` one: `portal` for the Platform
+# account (the us-east-1 edge stack and the portal stack share it; IAM is
+# global and every regional ARN names its Region), `portal-cell` for the
+# read-only fleet reader role in a Workstream cell account.
+PORTAL_STACK_PREFIX = "AgenticAI-AgentFactoryPortal-"
+PORTAL_EDGE_REGION = "us-east-1"
+
+
+def portal_role_arns(account: str) -> list[str]:
+    return [
+        iam_arn(account, f"role/{PORTAL_STACK_PREFIX}*"),
+        iam_arn(account, "role/AgenticAI-PortalApi-*"),
+    ]
+
+
+def portal_iam_statements(account: str, role_arns: list[str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "Sid": "ManagePortalRoles",
+            "Effect": "Allow",
+            "Action": named_role_statement(account)["Action"],
+            "Resource": role_arns,
+        },
+        {
+            "Sid": "ManagePortalPolicies",
+            "Effect": "Allow",
+            "Action": managed_policy_actions(),
+            "Resource": iam_arn(account, f"policy/{PORTAL_STACK_PREFIX}*"),
+        },
+    ]
+
+
+def bootstrap_version_statement(account: str, regions: Sequence[str]) -> dict[str, Any]:
+    """Every CDK stack resolves its bootstrap version parameter at deployment."""
+    return {
+        "Sid": "ReadBootstrapVersion",
+        "Effect": "Allow",
+        "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+        "Resource": [
+            arn("ssm", r, account, "parameter/cdk-bootstrap/*/version") for r in regions
+        ],
+    }
+
+
+def portal_policy(account: str, region: str) -> dict[str, Any]:
+    """Execution policy for the `agent-factory-portal-edge` and `agent-factory-portal` stages."""
+    regions = sorted({region, PORTAL_EDGE_REGION})
+    role_arns = portal_role_arns(account)
+    log_groups = [
+        arn("logs", r, account, f"log-group:{name}")
+        for r in regions
+        for name in (
+            f"{PORTAL_STACK_PREFIX}*",
+            f"/aws/lambda/{PORTAL_STACK_PREFIX}*",
+            "aws-waf-logs-agenticai-portal-*",
+        )
+    ]
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            *portal_iam_statements(account, role_arns),
+            bootstrap_version_statement(account, regions),
+            {
+                "Sid": "PassPortalRolesToLambda",
+                "Effect": "Allow",
+                "Action": "iam:PassRole",
+                "Resource": role_arns,
+                "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}},
+            },
+            read_iam_metadata_statement(),
+            {
+                "Sid": "PortalFunctionsAndLayers",
+                "Effect": "Allow",
+                "Action": "lambda:*",
+                "Resource": [
+                    arn("lambda", region, account, f"function:{PORTAL_STACK_PREFIX}*"),
+                    arn("lambda", region, account, "layer:*"),
+                ],
+            },
+            {
+                "Sid": "PortalBuckets",
+                "Effect": "Allow",
+                "Action": "s3:*",
+                "Resource": [
+                    "arn:aws:s3:::agenticai-agentfactory*",
+                    "arn:aws:s3:::agenticai-agentfactory*/*",
+                ],
+            },
+            {
+                "Sid": "ReadCdkAssets",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:GetBucketLocation", "s3:ListBucket"],
+                "Resource": [
+                    f"arn:aws:s3:::cdk-*-assets-{account}-{region}",
+                    f"arn:aws:s3:::cdk-*-assets-{account}-{region}/*",
+                ],
+            },
+            {
+                "Sid": "PortalLogGroups",
+                "Effect": "Allow",
+                "Action": "logs:*",
+                "Resource": [*log_groups, *(f"{group}:*" for group in log_groups)],
+            },
+            {
+                "Sid": "PortalRegionalServices",
+                "Effect": "Allow",
+                "Action": [
+                    "apigateway:*",
+                    "cognito-idp:*",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeResourcePolicies",
+                    "logs:PutResourcePolicy",
+                    "logs:DeleteResourcePolicy",
+                    "wafv2:*",
+                ],
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:RequestedRegion": regions}},
+            },
+            {
+                # CloudFormation stamps the keys it creates with its reserved
+                # stack-name tag inside the create request, and no principal
+                # can set an `aws:` tag itself, so the role can create a key
+                # only for a portal stack and change only keys such a stack
+                # created. It cannot tag an existing key into its reach.
+                "Sid": "CreatePortalKeysForStack",
+                "Effect": "Allow",
+                "Action": ["kms:CreateKey", "kms:TagResource"],
+                "Resource": "*",
+                "Condition": {
+                    "StringLike": {
+                        f"aws:RequestTag/{CFN_STACK_NAME_TAG}": f"{PORTAL_STACK_PREFIX}*"
+                    },
+                    "StringEquals": {"aws:RequestedRegion": regions},
+                },
+            },
+            {
+                "Sid": "ManageStackOwnedPortalKeys",
+                "Effect": "Allow",
+                "Action": "kms:*",
+                "Resource": [arn("kms", r, account, "key/*") for r in regions],
+                "Condition": {
+                    "StringLike": {
+                        f"aws:ResourceTag/{CFN_STACK_NAME_TAG}": f"{PORTAL_STACK_PREFIX}*"
+                    }
+                },
+            },
+            {
+                "Sid": "PortalDistribution",
+                "Effect": "Allow",
+                "Action": "cloudfront:*",
+                "Resource": "*",
+            },
+            {
+                "Sid": "ReadRegistryParameters",
+                "Effect": "Allow",
+                "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+                "Resource": arn("ssm", region, account, "parameter/agenticai/registry/v1/*"),
+            },
+        ],
+    }
+
+
+def portal_cell_policy(account: str, region: str) -> dict[str, Any]:
+    """Execution policy for the `agent-factory-portal-fleet-reader` stage."""
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            *portal_iam_statements(
+                account, [iam_arn(account, "role/AgenticAI-PortalFleetReader-*")]
+            ),
+            bootstrap_version_statement(account, [region]),
+            read_iam_metadata_statement(),
+        ],
+    }
+
+
 def connection_arn(value: str, account: str) -> str:
     pattern = re.compile(
         rf"^arn:aws:(?:codeconnections|codestar-connections):[a-z0-9-]+:{account}:connection/[A-Za-z0-9-]+$"
@@ -1370,6 +1556,10 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
         return audit_policy(args.account_id, args.region)
     if args.account_role == "hub-role-boundary":
         return hub_role_boundary_policy(args.account_id, args.region)
+    if args.account_role == "portal":
+        return portal_policy(args.account_id, args.region)
+    if args.account_role == "portal-cell":
+        return portal_cell_policy(args.account_id, args.region)
     return platform_policy(
         args.account_id,
         args.region,

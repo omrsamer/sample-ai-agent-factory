@@ -996,3 +996,98 @@ def test_workstream_and_platform_policies_grant_transaction_search_opt_in() -> N
         }
         assert "xray:UpdateTraceSegmentDestination" in actions, role
         assert "xray:GetTraceSegmentDestination" in actions, role
+
+
+# --- Agent Factory Portal documents -------------------------------------------
+
+
+def _render_plain(role: str, account: str = PLATFORM) -> dict:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), role, "--account-id", account, "--region", REGION],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def _by_sid(policy: dict) -> dict[str, dict]:
+    return {statement["Sid"]: statement for statement in policy["Statement"]}
+
+
+def test_portal_policy_is_scoped_to_portal_stacks_roles_and_regions() -> None:
+    policy = _render_plain("portal")
+    statements = _by_sid(policy)
+
+    assert statements["ManagePortalRoles"]["Resource"] == [
+        f"arn:aws:iam::{PLATFORM}:role/AgenticAI-AgentFactoryPortal-*",
+        f"arn:aws:iam::{PLATFORM}:role/AgenticAI-PortalApi-*",
+    ]
+    assert statements["ManagePortalPolicies"]["Resource"] == (
+        f"arn:aws:iam::{PLATFORM}:policy/AgenticAI-AgentFactoryPortal-*"
+    )
+    passed = statements["PassPortalRolesToLambda"]
+    assert passed["Condition"] == {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}
+    assert passed["Resource"] == statements["ManagePortalRoles"]["Resource"]
+
+    regional = statements["PortalRegionalServices"]
+    assert regional["Condition"] == {
+        "StringEquals": {"aws:RequestedRegion": [REGION, "us-east-1"]}
+    }
+    assert "iam:*" not in json.dumps(policy)
+    assert all(
+        not action.startswith(("organizations:", "bedrock-agentcore:", "agent-registry:", "codepipeline:"))
+        for statement in policy["Statement"]
+        for action in (
+            statement["Action"] if isinstance(statement["Action"], list) else [statement["Action"]]
+        )
+    ), "the portal execution role must not be able to change the platform or a cell"
+
+
+def test_portal_policy_creates_and_changes_only_stack_owned_keys() -> None:
+    statements = _by_sid(_render_plain("portal"))
+    create = statements["CreatePortalKeysForStack"]
+    assert sorted(create["Action"]) == ["kms:CreateKey", "kms:TagResource"]
+    assert create["Condition"]["StringLike"] == {
+        "aws:RequestTag/aws:cloudformation:stack-name": "AgenticAI-AgentFactoryPortal-*"
+    }
+    manage = statements["ManageStackOwnedPortalKeys"]
+    assert manage["Condition"] == {
+        "StringLike": {
+            "aws:ResourceTag/aws:cloudformation:stack-name": "AgenticAI-AgentFactoryPortal-*"
+        }
+    }
+    assert all(resource.endswith(":key/*") for resource in manage["Resource"])
+
+
+def test_portal_cell_policy_manages_only_the_fleet_reader_role() -> None:
+    policy = _render_plain("portal-cell", WORKSTREAM)
+    statements = _by_sid(policy)
+    assert set(statements) == {
+        "ManagePortalRoles",
+        "ManagePortalPolicies",
+        "ReadBootstrapVersion",
+        "ReadIamMetadata",
+    }
+    assert statements["ReadBootstrapVersion"]["Resource"] == [
+        f"arn:aws:ssm:{REGION}:{WORKSTREAM}:parameter/cdk-bootstrap/*/version"
+    ]
+    assert statements["ManagePortalRoles"]["Resource"] == [
+        f"arn:aws:iam::{WORKSTREAM}:role/AgenticAI-PortalFleetReader-*"
+    ]
+    actions = {
+        action
+        for statement in policy["Statement"]
+        for action in (
+            statement["Action"] if isinstance(statement["Action"], list) else [statement["Action"]]
+        )
+    }
+    assert all(action.startswith(("iam:", "ssm:Get")) for action in actions)
+    assert "iam:PassRole" not in actions
+
+
+def test_portal_policies_fit_one_iam_managed_policy() -> None:
+    for role in ("portal", "portal-cell"):
+        policy = _render_plain(role)
+        size = len(json.dumps(policy, separators=(",", ":"), sort_keys=True))
+        assert size <= IAM_MANAGED_POLICY_MAX_CHARS, f"{role} is {size} characters"
