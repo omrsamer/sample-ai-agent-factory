@@ -1,0 +1,17 @@
+{
+  "apiBaseUrl": "/api/v1",
+  "authProvider": "cognito",
+  "cognito": {
+    "authority": "https://cognito-idp.<region>.amazonaws.com/<userPoolId>",
+    "clientId": "<appClientId>",
+    "domain": "https://<prefix>.auth.<region>.amazoncognito.com",
+    "scopes": ["openid", "email", "profile"]
+  },
+  "entra": {
+    "tenantId": "<tenantId>",
+    "clientId": "<spaClientId>",
+    "apiScope": "api://<apiAppId>/access_as_user"
+  },
+  "environment": "nonprod",
+  "features": { "readOnly": true }
+}

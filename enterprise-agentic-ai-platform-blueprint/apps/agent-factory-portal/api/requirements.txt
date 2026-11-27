@@ -1,0 +1,25 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# Runtime dependencies bundled into the Lambda package (arm64, Python 3.13).
+# boto3/botocore are pinned and bundled on purpose: the Agent Registry control
+# plane client (agent-registry-control) is newer than the SDK shipped in the
+# Lambda Python runtime.
+fastapi==0.165.0
+starlette==1.10.0
+mangum==0.22.0
+pydantic==2.14.4
+pydantic_core==2.50.5
+annotated-types==0.8.0
+annotated-doc==0.0.7
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+anyio==4.16.0
+idna==3.20
+opentelemetry-api==1.45.2
+boto3==1.43.109
+botocore==1.43.127
+s3transfer==0.19.3
+jmespath==1.1.0
+python-dateutil==2.9.0.post0
+six==1.17.0
+urllib3==2.8.0

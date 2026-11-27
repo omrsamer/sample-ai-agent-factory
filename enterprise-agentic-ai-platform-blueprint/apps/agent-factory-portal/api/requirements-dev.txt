@@ -1,0 +1,7 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+-r requirements.txt
+pytest==9.2.0
+httpx==0.29.0
+ruff==0.17.6
+uvicorn

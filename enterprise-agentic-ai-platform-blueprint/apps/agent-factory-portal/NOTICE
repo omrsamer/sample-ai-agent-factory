@@ -1,0 +1,116 @@
+Agent Factory Portal
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+The Agent Factory Portal is part of the Enterprise Agentic AI Platform Blueprint
+sample. Files written for the portal are licensed under the MIT No Attribution
+license (MIT-0) and carry the header "SPDX-License-Identifier: MIT-0".
+
+================================================================================
+DERIVED WORK: AGENTIC GOVERNANCE PLATFORM
+================================================================================
+
+The web front end in web/ includes files derived from the control-plane
+front end of the Agentic Governance Platform, which is licensed under the
+Apache License, Version 2.0.
+
+  Origin:           Agentic Governance Platform, control-plane front end
+  License:          Apache License, Version 2.0
+  Upstream commit:  d645fffe
+
+This copy has been modified and is maintained independently of the upstream
+project. Screens, routes, API clients and dependencies were removed; the
+authentication, configuration and navigation layers were rewritten; text and
+identifiers were changed. Each derived file carries the header
+
+  SPDX-License-Identifier: Apache-2.0
+  Derived from Agentic Governance Platform (Apache-2.0); modified for the Agent Factory Portal.
+
+and remains under the Apache License, Version 2.0. A copy of that license is in
+web/LICENSE-APACHE-2.0. The upstream project is not affiliated with, and does
+not endorse, this copy.
+
+--------------------------------------------------------------------------------
+Upstream NOTICE
+--------------------------------------------------------------------------------
+
+The attribution notices of the upstream NOTICE file that pertain to the derived
+front end are reproduced below without change. Sections that do not pertain to
+any part of this derived work (the Python back end, agent runtimes, container
+images, the list of AWS services and the statement on AI/ML models) are omitted,
+as section 4(d) of the Apache License permits. Entries for front-end libraries
+this copy no longer uses are kept, because the section is reproduced unchanged.
+
+    Agentic Governance Platform
+    Copyright 2026 Agentic Governance Platform contributors
+
+    Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+    full license text.
+
+    Portions of this software were originally developed by Amazon Web Services,
+    Inc. (https://aws.amazon.com/) and are used under the Apache License 2.0.
+
+    ================================================================================
+    THIRD-PARTY DEPENDENCIES
+    ================================================================================
+
+    This project uses the following third-party libraries. Dev-only tooling (test
+    runners, linters, type definitions) is not listed; neither are transitive
+    dependencies, which carry their own notices in their own distributions.
+
+    --------------------------------------------------------------------------------
+    JavaScript / TypeScript — control-plane frontend
+    --------------------------------------------------------------------------------
+
+    React, React DOM, react-is (https://react.dev/)
+      License: MIT License
+      Copyright (c) Meta Platforms, Inc. and affiliates
+
+    React Router (https://reactrouter.com/)
+      License: MIT License
+      Copyright (c) React Training LLC 2015-2019
+      Copyright (c) Remix Software Inc. 2020-2021
+      Copyright (c) Shopify Inc. 2022-2023
+
+    Recharts (https://recharts.org/)
+      License: MIT License
+      Copyright (c) 2015-present recharts
+
+    React Flow / @xyflow/react (https://reactflow.dev/)
+      License: MIT License
+      Copyright (c) 2019-2025 webkid GmbH
+
+    dagre (https://github.com/dagrejs/dagre)
+      License: MIT License
+      Copyright (c) 2012-2014 Chris Pettitt
+
+    Axios (https://axios-http.com/)
+      License: MIT License
+      Copyright (c) 2014-present Matt Zabriskie & Collaborators
+
+    Microsoft Authentication Library for JavaScript — @azure/msal-browser and
+    @azure/msal-react
+    (https://github.com/AzureAD/microsoft-authentication-library-for-js)
+      License: MIT License
+      Copyright (c) Microsoft Corporation. All rights reserved.
+
+    Tailwind CSS (https://tailwindcss.com/)
+      License: MIT License
+      Copyright (c) Tailwind Labs, Inc.
+      Build-time dependency whose generated CSS is distributed in the frontend
+      bundle.
+
+    Vite (https://vite.dev/)
+      License: MIT License
+      Copyright (c) 2019-present, VoidZero Inc. and Vite contributors
+      Build tool; listed because it produces the distributed frontend bundle.
+
+================================================================================
+THIRD-PARTY LIBRARIES ADDED BY THE PORTAL
+================================================================================
+
+oidc-client-ts (https://github.com/authts/oidc-client-ts)
+  License: Apache License 2.0
+  Copyright: the oidc-client-ts authors; see the package's LICENSE file.
+
+The full list of direct dependencies, with versions and licenses, is in
+THIRD_PARTY.md.

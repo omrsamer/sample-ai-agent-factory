@@ -58,7 +58,7 @@ class FakeRegistry:
         self.calls.append(("create", kwargs))
         self.records["rec000000001"] = {"recordId": "rec000000001", "status": "DRAFT", **kwargs}
         self.pending = self.settle_after
-        return {"recordArn": f"arn:aws:agent-registry:eu-west-1:111122223333:registry/{REGISTRY}/record/rec000000001"}
+        return {"recordArn": f"arn:aws:agent-registry:eu-west-1:111111111111:registry/{REGISTRY}/record/rec000000001"}
 
     def update_registry_record(self, **kwargs):
         self.calls.append(("update", kwargs))
@@ -90,7 +90,7 @@ def existing(doc: dict, record_type: str = "CUSTOM") -> dict:
 
 def test_document_carries_required_and_optional_fields_and_matches_the_schema():
     doc = document(
-        "--runtime-arn", "arn:aws:bedrock-agentcore:eu-west-1:111122223333:runtime/travel_agent-AbC123",
+        "--runtime-arn", "arn:aws:bedrock-agentcore:eu-west-1:111111111111:runtime/travel_agent-AbC123",
         "--subscribed-tool-id", "tool-ping", "--subscribed-tool-id", "tool-echo", "--subscribed-tool-id", "tool-echo",
         "--golden-path-name", "agenticai-task-agent", "--golden-path-version", "1.2.0",
         "--evaluation-verdict", "passed", "--evaluation-run-id", "exec-1",
@@ -106,7 +106,7 @@ def test_document_carries_required_and_optional_fields_and_matches_the_schema():
     "extra, message",
     [
         (["--risk-class", "tiny"], "riskClass must be one of"),
-        (["--runtime-arn", "arn:aws:lambda:eu-west-1:111122223333:function:x"], "runtimeArn does not match"),
+        (["--runtime-arn", "arn:aws:lambda:eu-west-1:111111111111:function:x"], "runtimeArn does not match"),
         (["--record-version", "v1"], "recordVersion does not match"),
         (["--golden-path-name", "only-name"], "go together"),
         (["--policy-engine-mode", "MAYBE"], "policyEngineMode must be one of"),
