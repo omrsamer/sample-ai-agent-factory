@@ -78,6 +78,15 @@ function listContext(app: App, key: string): string[] {
   return text.split(",").map((v) => v.trim()).filter(Boolean);
 }
 
+function keyArnContext(app: App, key: string, region: string): string | undefined {
+  const value = context(app, key);
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !new RegExp(`^arn:aws[\\w-]*:kms:${region}:\\d{12}:key/[0-9a-f-]{36}$`).test(value)) {
+    throw new Error(`Context ${key} must be a KMS key ARN in ${region}.`);
+  }
+  return value;
+}
+
 function portalTags(environment: PortalEnvironment): Record<string, string> {
   return {
     "application-id": "agent-factory-portal",
@@ -183,6 +192,7 @@ export function addAgentFactoryPortalStage(
         environment,
         allowedIpv4Cidrs: exposure === "public" ? [] : v4,
         allowedIpv6Cidrs: exposure === "public" ? [] : v6,
+        logsKeyArn: keyArnContext(app, "agenticai/portalEdgeLogsKeyArn", "us-east-1"),
         description: `Agent Factory Portal (${environment}) edge web ACL.`,
       });
       applyTags(stack, environment);
@@ -252,6 +262,7 @@ export function addAgentFactoryPortalStage(
         modelAllowlist: jsonContext(app, "agenticai/portalModelAllowlist"),
         guardrailTag: jsonContext(app, "agenticai/portalGuardrailTag"),
         retainData: retain === undefined ? undefined : retain === true || retain === "true",
+        logsKeyArn: keyArnContext(app, "agenticai/portalLogsKeyArn", deploymentRegion),
         description: `Agent Factory Portal (${environment}): sign-in, read-only API and web hosting.`,
       });
       applyTags(stack, environment);

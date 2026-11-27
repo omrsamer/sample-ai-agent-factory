@@ -1290,7 +1290,10 @@ def management_policy(
 # account (the us-east-1 edge stack and the portal stack share it; IAM is
 # global and every regional ARN names its Region), `portal-cell` for the
 # read-only fleet reader role in a Workstream cell account.
-PORTAL_STACK_PREFIX = "AgenticAI-AgentFactoryPortal-"
+# CloudFormation truncates the stack name when it generates physical names for
+# roles, functions and log groups, so the prefix stops where the shortest
+# generated name does.
+PORTAL_STACK_PREFIX = "AgenticAI-AgentFactoryPor"
 PORTAL_EDGE_REGION = "us-east-1"
 
 
@@ -1395,6 +1398,13 @@ def portal_policy(account: str, region: str) -> dict[str, Any]:
                 "Action": [
                     "apigateway:*",
                     "cognito-idp:*",
+                    # API Gateway and AWS WAF access logging are log deliveries;
+                    # these actions have no resource type.
+                    "logs:CreateLogDelivery",
+                    "logs:DeleteLogDelivery",
+                    "logs:GetLogDelivery",
+                    "logs:ListLogDeliveries",
+                    "logs:UpdateLogDelivery",
                     "logs:DescribeLogGroups",
                     "logs:DescribeResourcePolicies",
                     "logs:PutResourcePolicy",
@@ -1405,32 +1415,14 @@ def portal_policy(account: str, region: str) -> dict[str, Any]:
                 "Condition": {"StringEquals": {"aws:RequestedRegion": regions}},
             },
             {
-                # CloudFormation stamps the keys it creates with its reserved
-                # stack-name tag inside the create request, and no principal
-                # can set an `aws:` tag itself, so the role can create a key
-                # only for a portal stack and change only keys such a stack
-                # created. It cannot tag an existing key into its reach.
-                "Sid": "CreatePortalKeysForStack",
+                # The portal stacks never create, tag or change a key: an
+                # optional log-encryption key is provisioned by operators and
+                # passed as context, so the role only reads key metadata and
+                # lets CloudWatch Logs associate the key with a log group.
+                "Sid": "DescribeOperatorProvidedKeys",
                 "Effect": "Allow",
-                "Action": ["kms:CreateKey", "kms:TagResource"],
-                "Resource": "*",
-                "Condition": {
-                    "StringLike": {
-                        f"aws:RequestTag/{CFN_STACK_NAME_TAG}": f"{PORTAL_STACK_PREFIX}*"
-                    },
-                    "StringEquals": {"aws:RequestedRegion": regions},
-                },
-            },
-            {
-                "Sid": "ManageStackOwnedPortalKeys",
-                "Effect": "Allow",
-                "Action": "kms:*",
+                "Action": "kms:DescribeKey",
                 "Resource": [arn("kms", r, account, "key/*") for r in regions],
-                "Condition": {
-                    "StringLike": {
-                        f"aws:ResourceTag/{CFN_STACK_NAME_TAG}": f"{PORTAL_STACK_PREFIX}*"
-                    }
-                },
             },
             {
                 "Sid": "PortalDistribution",

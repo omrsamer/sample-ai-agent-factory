@@ -134,6 +134,7 @@ Keep real account ids, the external id and the cell list outside source control,
 | `agenticai/portalCells` | portal | Cells the portal reads (JSON array) |
 | `agenticai/portalModelAllowlist`, `agenticai/portalGuardrailTag` | portal | Catalog inputs |
 | `agenticai/portalApiCodePath`, `agenticai/portalWebDistPath` | portal | Override the bundle locations |
+| `agenticai/portalLogsKeyArn`, `agenticai/portalEdgeLogsKeyArn` | portal, edge | Operator-provisioned customer managed key for the log groups (optional). The stacks never create or tag a key. |
 | `agenticai/portalRetainData` | portal | Retain the user pool and buckets on deletion (default: prod only) |
 | `agenticai/portalCellAccountId`, `agenticai/portalExternalId`, `agenticai/portalSpansLogGroupNames` | fleet reader | Cell account, shared external id, span log groups |
 

@@ -19,7 +19,7 @@ import {
   Role,
   ServicePrincipal,
 } from "aws-cdk-lib/aws-iam";
-import { Key } from "aws-cdk-lib/aws-kms";
+import { IKey } from "aws-cdk-lib/aws-kms";
 import {
   Architecture,
   Code,
@@ -46,7 +46,10 @@ export interface PortalCell {
   readonly environment: PortalEnvironment;
   readonly accountId: string;
   readonly region: string;
-  /** External id configured on the cell's fleet reader role. */
+  /**
+   * External id configured on the cell's fleet reader role. The role is named
+   * for the portal's environment, whatever the cell's own environment is.
+   */
   readonly externalId: string;
   /** Prefix of the CloudWatch alarms that belong to the cell. */
   readonly alarmNamePrefix?: string;
@@ -98,6 +101,12 @@ export interface PortalApiProps {
   /** Tag that marks the Platform's Guardrail profiles. */
   readonly guardrailTag?: { readonly key: string; readonly value: string };
   readonly logRetention?: RetentionDays;
+  /**
+   * Operator-provisioned customer managed key for the portal's log groups.
+   * Its key policy must already allow CloudWatch Logs of this Region. The
+   * stack never creates or changes a key (same custody rule as the Omni hub).
+   */
+  readonly logsKey?: IKey;
 }
 
 /**
@@ -128,35 +137,15 @@ export class PortalApi extends Construct {
       }
     }
 
-    // One customer managed key for the portal's two log groups.
-    const logsKey = new Key(this, "LogsKey", {
-      description: `Agent Factory Portal (${props.environment}) log encryption`,
-      enableKeyRotation: true,
-      removalPolicy: RemovalPolicy.DESTROY,
-    });
-    logsKey.addToResourcePolicy(
-      new PolicyStatement({
-        sid: "AllowCloudWatchLogs",
-        effect: Effect.ALLOW,
-        principals: [new ServicePrincipal(`logs.${stack.region}.amazonaws.com`)],
-        actions: ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
-        resources: ["*"],
-        conditions: {
-          ArnLike: {
-            "kms:EncryptionContext:aws:logs:arn": `arn:${Aws.PARTITION}:logs:${stack.region}:${stack.account}:log-group:*`,
-          },
-        },
-      }),
-    );
     const handlerLogs = new LogGroup(this, "HandlerLogs", {
       retention: props.logRetention ?? RetentionDays.ONE_YEAR,
       removalPolicy: RemovalPolicy.DESTROY,
-      encryptionKey: logsKey,
+      encryptionKey: props.logsKey,
     });
     const accessLogs = new LogGroup(this, "AccessLogs", {
       retention: props.logRetention ?? RetentionDays.ONE_YEAR,
       removalPolicy: RemovalPolicy.DESTROY,
-      encryptionKey: logsKey,
+      encryptionKey: props.logsKey,
     });
 
     this.role = new Role(this, "Role", {
@@ -232,7 +221,7 @@ export class PortalApi extends Construct {
       ...new Set(
         props.cells.map(
           (c) =>
-            `arn:${Aws.PARTITION}:iam::${c.accountId}:role/${portalFleetReaderRoleName(c.environment)}`,
+            `arn:${Aws.PARTITION}:iam::${c.accountId}:role/${portalFleetReaderRoleName(props.environment)}`,
         ),
       ),
     ];
@@ -254,7 +243,7 @@ export class PortalApi extends Construct {
       environment: c.environment,
       accountId: c.accountId,
       region: c.region,
-      readerRoleArn: `arn:${Aws.PARTITION}:iam::${c.accountId}:role/${portalFleetReaderRoleName(c.environment)}`,
+      readerRoleArn: `arn:${Aws.PARTITION}:iam::${c.accountId}:role/${portalFleetReaderRoleName(props.environment)}`,
       externalId: c.externalId,
       alarmNamePrefix: c.alarmNamePrefix,
       pipelineName: c.pipelineName,
@@ -384,16 +373,19 @@ export class PortalApi extends Construct {
       ],
       true,
     );
-    NagSuppressions.addResourceSuppressions(
-      logsKey,
-      [
-        {
-          id: "AwsSolutions-IAM5",
-          reason: "SEC-046: key policy grants CloudWatch Logs data-key operations, constrained to this account's log groups by encryption context.",
-        },
-      ],
-      true,
-    );
+    if (!props.logsKey) {
+      NagSuppressions.addResourceSuppressions(
+        [handlerLogs, accessLogs],
+        [
+          {
+            id: "NIST.800.53.R5-CloudWatchLogGroupEncrypted",
+            reason:
+              "SEC-046: CloudWatch Logs encrypts log data at rest by default. A customer managed key is supplied by operators through agenticai/portalLogsKeyArn; the portal stack does not create or tag keys, so its execution role needs no key administration.",
+          },
+        ],
+        true,
+      );
+    }
     NagSuppressions.addResourceSuppressions(
       healthRoutes,
       [

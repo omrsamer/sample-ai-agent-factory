@@ -4,7 +4,7 @@
  */
 import { Aws, RemovalPolicy, Stack } from "aws-cdk-lib";
 import { Effect, PolicyStatement, ServicePrincipal } from "aws-cdk-lib/aws-iam";
-import { Key } from "aws-cdk-lib/aws-kms";
+import { IKey } from "aws-cdk-lib/aws-kms";
 import { LogGroup, RetentionDays } from "aws-cdk-lib/aws-logs";
 import { CfnIPSet, CfnLoggingConfiguration, CfnWebACL } from "aws-cdk-lib/aws-wafv2";
 import { NagSuppressions } from "cdk-nag";
@@ -23,6 +23,8 @@ export interface PortalEdgeWebAclProps {
   readonly allowedIpv6Cidrs?: readonly string[];
   /** Requests per five minutes from one address before it is blocked. */
   readonly rateLimit?: number;
+  /** Operator-provisioned key (us-east-1) for the web ACL log group. */
+  readonly logsKey?: IKey;
 }
 
 const CIDR_V4 = /^(\d{1,3}\.){3}\d{1,3}\/(\d|[12]\d|3[0-2])$/;
@@ -118,30 +120,11 @@ export class PortalEdgeWebAcl extends Construct {
     // Web ACL logs. AWS WAF requires the log group name to start with
     // `aws-waf-logs-`.
     const stack = Stack.of(this);
-    const logsKey = new Key(this, "LogsKey", {
-      description: `Agent Factory Portal ${props.environment} web ACL log encryption`,
-      enableKeyRotation: true,
-      removalPolicy: RemovalPolicy.DESTROY,
-    });
-    logsKey.addToResourcePolicy(
-      new PolicyStatement({
-        sid: "AllowCloudWatchLogs",
-        effect: Effect.ALLOW,
-        principals: [new ServicePrincipal(`logs.${stack.region}.amazonaws.com`)],
-        actions: ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
-        resources: ["*"],
-        conditions: {
-          ArnLike: {
-            "kms:EncryptionContext:aws:logs:arn": `arn:${Aws.PARTITION}:logs:${stack.region}:${stack.account}:log-group:*`,
-          },
-        },
-      }),
-    );
     const logGroup = new LogGroup(this, "Logs", {
       logGroupName: `aws-waf-logs-agenticai-portal-${props.environment}`,
       retention: RetentionDays.ONE_YEAR,
       removalPolicy: RemovalPolicy.DESTROY,
-      encryptionKey: logsKey,
+      encryptionKey: props.logsKey,
     });
     logGroup.addToResourcePolicy(
       new PolicyStatement({
@@ -164,15 +147,18 @@ export class PortalEdgeWebAcl extends Construct {
       redactedFields: [{ singleHeader: { Name: "authorization" } }, { singleHeader: { Name: "cookie" } }],
     });
     logging.node.addDependency(logGroup);
-    NagSuppressions.addResourceSuppressions(
-      logsKey,
-      [
-        {
-          id: "AwsSolutions-IAM5",
-          reason: "SEC-046: key policy grants CloudWatch Logs data-key operations, constrained to this account's log groups by encryption context.",
-        },
-      ],
-      true,
-    );
+    if (!props.logsKey) {
+      NagSuppressions.addResourceSuppressions(
+        logGroup,
+        [
+          {
+            id: "NIST.800.53.R5-CloudWatchLogGroupEncrypted",
+            reason:
+              "SEC-046: CloudWatch Logs encrypts log data at rest by default. A customer managed key is supplied by operators through agenticai/portalEdgeLogsKeyArn; the edge stack does not create or tag keys.",
+          },
+        ],
+        true,
+      );
+    }
   }
 }

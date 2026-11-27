@@ -7,6 +7,10 @@ import {
   AllowedMethods,
   CachePolicy,
   Distribution,
+  Function as CloudFrontFunction,
+  FunctionCode,
+  FunctionEventType,
+  FunctionRuntime,
   HeadersFrameOption,
   HeadersReferrerPolicy,
   HttpVersion,
@@ -105,6 +109,25 @@ export class PortalWebHosting extends Construct {
       },
     });
 
+    // Client-side routes (paths with no file extension) resolve to the
+    // application shell. This is done at the viewer request, not with custom
+    // error responses: an error response would also replace a web ACL block
+    // (403) with the shell.
+    const spaRewrite = new CloudFrontFunction(this, "SpaRewrite", {
+      comment: `Agent Factory Portal ${props.environment}: route extension-less paths to the application shell`,
+      runtime: FunctionRuntime.JS_2_0,
+      code: FunctionCode.fromInline(
+        [
+          "function handler(event) {",
+          "  var request = event.request;",
+          "  var last = request.uri.substring(request.uri.lastIndexOf('/') + 1);",
+          "  if (last.indexOf('.') === -1) { request.uri = '/index.html'; }",
+          "  return request;",
+          "}",
+        ].join("\n"),
+      ),
+    });
+
     this.distribution = new Distribution(this, "Distribution", {
       comment: `Agent Factory Portal (${props.environment})`,
       defaultRootObject: "index.html",
@@ -122,12 +145,10 @@ export class PortalWebHosting extends Construct {
         cachePolicy: CachePolicy.CACHING_OPTIMIZED,
         responseHeadersPolicy: headers,
         compress: true,
+        functionAssociations: [
+          { function: spaRewrite, eventType: FunctionEventType.VIEWER_REQUEST },
+        ],
       },
-      // Client-side routes resolve to the application shell.
-      errorResponses: [
-        { httpStatus: 403, responseHttpStatus: 200, responsePagePath: "/index.html", ttl: Duration.minutes(1) },
-        { httpStatus: 404, responseHttpStatus: 200, responsePagePath: "/index.html", ttl: Duration.minutes(1) },
-      ],
     });
     this.origin = `https://${this.distribution.distributionDomainName}`;
 

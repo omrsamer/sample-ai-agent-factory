@@ -24,6 +24,7 @@
  * SPDX-License-Identifier: MIT-0
  */
 import { CfnOutput, Stack, type StackProps } from "aws-cdk-lib";
+import { Key } from "aws-cdk-lib/aws-kms";
 import { StringParameter } from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 
@@ -45,11 +46,13 @@ export interface AgentFactoryPortalEdgeStackProps extends StackProps {
   readonly environment: PortalEnvironment;
   readonly allowedIpv4Cidrs: readonly string[];
   readonly allowedIpv6Cidrs?: readonly string[];
+  /** Operator-provisioned key ARN (us-east-1) for the web ACL log group. */
+  readonly logsKeyArn?: string;
 }
 
 export class AgentFactoryPortalEdgeStack extends Stack {
   constructor(scope: Construct, id: string, props: AgentFactoryPortalEdgeStackProps) {
-    const { environment, allowedIpv4Cidrs, allowedIpv6Cidrs, ...stackProps } = props;
+    const { environment, allowedIpv4Cidrs, allowedIpv6Cidrs, logsKeyArn, ...stackProps } = props;
     super(scope, id, stackProps);
     if (this.region !== "us-east-1") {
       throw new Error("AgentFactoryPortalEdgeStack must be deployed to us-east-1.");
@@ -58,6 +61,7 @@ export class AgentFactoryPortalEdgeStack extends Stack {
       environment,
       allowedIpv4Cidrs,
       allowedIpv6Cidrs,
+      logsKey: logsKeyArn ? Key.fromKeyArn(this, "LogsKey", logsKeyArn) : undefined,
     });
     new CfnOutput(this, "PortalWebAclArn", {
       value: acl.webAcl.attrArn,
@@ -90,6 +94,8 @@ export interface AgentFactoryPortalStackProps extends StackProps {
   }[];
   readonly guardrailTag?: { readonly key: string; readonly value: string };
   readonly retainData?: boolean;
+  /** Operator-provisioned key ARN for the portal's log groups. */
+  readonly logsKeyArn?: string;
 }
 
 export class AgentFactoryPortalStack extends Stack {
@@ -110,6 +116,7 @@ export class AgentFactoryPortalStack extends Stack {
       modelAllowlist,
       guardrailTag,
       retainData,
+      logsKeyArn,
       ...stackProps
     } = props;
     super(scope, id, stackProps);
@@ -187,6 +194,7 @@ export class AgentFactoryPortalStack extends Stack {
       allowedOrigins: [web.origin],
       modelAllowlist,
       guardrailTag,
+      logsKey: logsKeyArn ? Key.fromKeyArn(this, "LogsKey", logsKeyArn) : undefined,
     });
 
     web.publish(webDistPath, {

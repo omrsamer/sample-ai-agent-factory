@@ -283,6 +283,14 @@ describe("Phase 27 — portal stack (Platform account)", () => {
       DistributionConfig: Match.objectLike({ WebACLId: WEB_ACL, DefaultRootObject: "index.html" }),
     });
     template.resourceCountIs("AWS::CloudFront::OriginAccessControl", 1);
+    // A web ACL block must stay a 403: no custom error response may turn it
+    // into the application shell. Client-side routes are rewritten at the
+    // viewer request instead.
+    const distribution = Object.values(template.findResources("AWS::CloudFront::Distribution"))[0] as {
+      Properties: { DistributionConfig: { CustomErrorResponses?: unknown[] } };
+    };
+    expect(distribution.Properties.DistributionConfig.CustomErrorResponses ?? []).toEqual([]);
+    template.resourceCountIs("AWS::CloudFront::Function", 1);
     const buckets = template.findResources("AWS::S3::Bucket");
     for (const bucket of Object.values(buckets)) {
       expect((bucket as { Properties: Record<string, unknown> }).Properties.PublicAccessBlockConfiguration).toEqual({

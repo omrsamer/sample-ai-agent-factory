@@ -1020,11 +1020,11 @@ def test_portal_policy_is_scoped_to_portal_stacks_roles_and_regions() -> None:
     statements = _by_sid(policy)
 
     assert statements["ManagePortalRoles"]["Resource"] == [
-        f"arn:aws:iam::{PLATFORM}:role/AgenticAI-AgentFactoryPortal-*",
+        f"arn:aws:iam::{PLATFORM}:role/AgenticAI-AgentFactoryPor*",
         f"arn:aws:iam::{PLATFORM}:role/AgenticAI-PortalApi-*",
     ]
     assert statements["ManagePortalPolicies"]["Resource"] == (
-        f"arn:aws:iam::{PLATFORM}:policy/AgenticAI-AgentFactoryPortal-*"
+        f"arn:aws:iam::{PLATFORM}:policy/AgenticAI-AgentFactoryPor*"
     )
     passed = statements["PassPortalRolesToLambda"]
     assert passed["Condition"] == {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}
@@ -1044,20 +1044,17 @@ def test_portal_policy_is_scoped_to_portal_stacks_roles_and_regions() -> None:
     ), "the portal execution role must not be able to change the platform or a cell"
 
 
-def test_portal_policy_creates_and_changes_only_stack_owned_keys() -> None:
-    statements = _by_sid(_render_plain("portal"))
-    create = statements["CreatePortalKeysForStack"]
-    assert sorted(create["Action"]) == ["kms:CreateKey", "kms:TagResource"]
-    assert create["Condition"]["StringLike"] == {
-        "aws:RequestTag/aws:cloudformation:stack-name": "AgenticAI-AgentFactoryPortal-*"
-    }
-    manage = statements["ManageStackOwnedPortalKeys"]
-    assert manage["Condition"] == {
-        "StringLike": {
-            "aws:ResourceTag/aws:cloudformation:stack-name": "AgenticAI-AgentFactoryPortal-*"
-        }
-    }
-    assert all(resource.endswith(":key/*") for resource in manage["Resource"])
+def test_portal_policy_grants_no_key_creation_tagging_or_change() -> None:
+    policy = _render_plain("portal")
+    kms = sorted(
+        action
+        for statement in policy["Statement"]
+        for action in (
+            statement["Action"] if isinstance(statement["Action"], list) else [statement["Action"]]
+        )
+        if action.startswith("kms:")
+    )
+    assert kms == ["kms:DescribeKey"]
 
 
 def test_portal_cell_policy_manages_only_the_fleet_reader_role() -> None:
