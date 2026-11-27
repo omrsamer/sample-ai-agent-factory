@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-PORTAL_STACK = re.compile(r"^AgenticAI-AgentFactoryPortal-(Edge-|FleetReader-)?(nonprod|prod)$")
+PORTAL_STACK = re.compile(r"^AgenticAI-AgentFactoryPortal-(Edge-|FleetReader-|Containment-|ExternalReader-)?(nonprod|prod)$")
 ACCOUNT = re.compile(r"^\d{12}$")
 
 

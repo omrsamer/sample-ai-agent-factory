@@ -116,7 +116,15 @@ def test_capture_records_only_what_the_stack_owns():
 
 @pytest.mark.parametrize(
     "name",
-    ["AgenticAI-Platform-GuardrailStack", "Nonprod-Registry", "AgenticAI-AgentFactoryPortal-staging", "anything"],
+    [
+        "AgenticAI-Platform-GuardrailStack",
+        "Nonprod-Registry",
+        "AgenticAI-AgentFactoryPortal-staging",
+        # The Registries hold the system of record: removing one is a deliberate operator act, not a teardown step.
+        "AgenticAI-AgentFactoryPortal-AgentRegistry-nonprod",
+        "AgenticAI-AgentFactoryPortal-DiscoveryRegistry",
+        "anything",
+    ],
 )
 def test_it_refuses_a_stack_that_is_not_a_portal_stack(name):
     with pytest.raises(teardown.TeardownError, match="not an Agent Factory Portal stack"):
@@ -130,6 +138,8 @@ def test_it_refuses_a_stack_that_is_not_a_portal_stack(name):
         "AgenticAI-AgentFactoryPortal-prod",
         "AgenticAI-AgentFactoryPortal-Edge-nonprod",
         "AgenticAI-AgentFactoryPortal-FleetReader-prod",
+        "AgenticAI-AgentFactoryPortal-Containment-nonprod",
+        "AgenticAI-AgentFactoryPortal-ExternalReader-prod",
     ],
 )
 def test_portal_stage_stacks_are_accepted(name):
