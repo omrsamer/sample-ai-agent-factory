@@ -223,6 +223,12 @@ export class AgentFactoryPortalStack extends Stack {
           "The Platform Registry approves automatically, so a submitted record would never reach an approver.",
       );
     }
+    if (!governedActions && cells.some((cell) => cell.containment)) {
+      throw new Error(
+        "AgentFactoryPortalStack: a cell enables containment, which needs governed actions (agenticai/portalGovernedActions=true). " +
+          "Containment decisions are recorded in the same audit trail, and the two-person rule is read from it.",
+      );
+    }
     const logsKey = logsKeyArn ? Key.fromKeyArn(this, "LogsKey", logsKeyArn) : undefined;
     const audit = governedActions
       ? new PortalAuditTrail(this, "Audit", { environment, retain: retainData })

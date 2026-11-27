@@ -287,6 +287,21 @@ describe("Phase 29 — containment function (Platform account)", () => {
     expect(nagErrors(stack)).toEqual([]);
   });
 
+  it("refuses a containment cell when governed actions are off: there would be no audit trail", () => {
+    expect(
+      () =>
+        new AgentFactoryPortalStack(new App(), "NoActions", {
+          env: { account: PLATFORM, region: REGION },
+          environment: "nonprod",
+          identityProvider: "cognito",
+          webAclArn: WEB_ACL,
+          cells: [cell({ containment: true })],
+          apiCodePath: apiCode,
+          webDistPath: webDist,
+        }),
+    ).toThrow(/containment, which needs governed actions/);
+  });
+
   it("creates no containment function, role or route when no cell opted in", () => {
     const none = Template.fromStack(portal([cell()]));
     expect(
