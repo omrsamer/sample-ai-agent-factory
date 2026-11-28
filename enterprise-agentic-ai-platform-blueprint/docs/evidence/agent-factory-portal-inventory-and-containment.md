@@ -374,6 +374,12 @@ account and Region and tag any of them.
   repeated contain after its sweeps have run, the limits on reloads of the
   inventory, the bound of 2,000 entries on what a release reads, and the
   48-hour limit on signing keys: unit tests only.
+- One browser run, the first after a deployment, showed the state card of the
+  containment tab still reading "Not contained" for some seconds after a
+  contain that had succeeded, beside a result that said "Contained"; the page
+  reads the state again every 20 seconds and corrected itself. Four later
+  runs did not show it. The card should follow the result the action
+  verified; that change is not in this release.
 - Cost by allocation tag and findings of the account's security services:
   not built in this release.
 
