@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 CONTAINED, NOT_CONTAINED = "contained", "not_contained"
 NOT_ENABLED = "containment is not enabled for this cell"
 _RUNTIME_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{1,20}$")
+_RUNTIME_ARN = re.compile(
+    r"^arn:aws[a-z-]{0,10}:bedrock-agentcore:[a-z0-9-]{1,30}:\d{12}:runtime/[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{1,20}$"
+)
 _LABELS = {
     "policy": "Deny invocation in the Runtime's resource policy",
     "verify": "Read the policy back to confirm the deny statement",
@@ -112,9 +115,11 @@ class ContainmentService:
         """The agent's Runtime ARN, its tenant and the cells of its account and Region.
 
         A registered agent (its id is a registry record id) is resolved from
-        its record. An agent with no registration is addressed by its Runtime
-        id; its tenant is the tenant of its cell account when every cell there
-        agrees, and unknown otherwise.
+        its record; an agent with no registration is addressed by its Runtime
+        id. Either way the tenant is decided by where the Runtime runs
+        (``containment_rules.tenant_for``), never by what the record claims:
+        a record is written by the people it governs, and a draft naming
+        another tenant's Runtime must not put that Runtime in their reach.
         """
         if registrations.RECORD_ID.fullmatch(agent_id):
             try:
@@ -131,7 +136,15 @@ class ContainmentService:
                 raise ActionError(409, "This registration names no Runtime, so there is nothing to contain")
             if body.runtime_arn and body.runtime_arn != runtime_arn:
                 raise ActionError(422, [_field_error("runtime_arn", "runtime_arn is not this agent's Runtime")])
-            return runtime_arn, document.get("tenantId"), self._cells_for(runtime_arn)
+            if not _RUNTIME_ARN.fullmatch(runtime_arn):
+                raise ActionError(409, "This registration does not name a Runtime, so there is nothing to contain")
+            cells = self._cells_for(runtime_arn)
+            tenant = rules.tenant_for(
+                {c.tenant_id for c in cells},
+                record_tenant=document.get("tenantId"),
+                record_approved=record.get("status") == "APPROVED",
+            )
+            return runtime_arn, tenant, cells
 
         if not _RUNTIME_ID.fullmatch(agent_id):
             raise ActionError(404, "Agent not found")
@@ -149,24 +162,24 @@ class ContainmentService:
             account, region = scopes[0]
             runtime_arn = f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{agent_id}"
         cells = self._cells_for(runtime_arn)
-        tenants = {c.tenant_id for c in cells}
-        return runtime_arn, (tenants.pop() if len(tenants) == 1 else None), cells
+        return runtime_arn, rules.tenant_for({c.tenant_id for c in cells}), cells
 
     # --- audit ---------------------------------------------------------------------
 
-    def _events(self, agent_id: str) -> list[AuditEvent]:
+    def _events(self, runtime_arn: str) -> list[AuditEvent]:
         try:
             return audit_reader.query_events(
-                self.dynamodb, self.settings.audit_table, audit_reader.containment_key(agent_id)
+                self.dynamodb, self.settings.audit_table, audit_reader.containment_key(runtime_arn)
             )
         except Exception as exc:  # noqa: BLE001 - no trail, no decision
             logger.error("Audit trail could not be read: %s", error_code(exc))
             raise ActionError(503, "The audit trail could not be read, so no decision was taken") from exc
 
-    def _write(self, agent_id: str, event: AuditEvent) -> bool:
+    def _write(self, runtime_arn: str, event: AuditEvent) -> bool:
+        """Append to the Runtime's containment history. The key is the resolved Runtime, never a caller's id."""
         try:
             audit_writer.put_event(
-                self.dynamodb, self.settings.audit_table, audit_reader.containment_key(agent_id), event
+                self.dynamodb, self.settings.audit_table, audit_reader.containment_key(runtime_arn), event
             )
             return True
         except Exception as exc:  # noqa: BLE001 - the caller decides what a failed write means
@@ -203,11 +216,12 @@ class ContainmentService:
         )
 
     def _deny(
-        self, status: int, action: str, agent_id: str, runtime_arn: str | None, tenant: str | None, reason: str
+        self, status: int, action: str, agent_id: str, runtime_arn: str, tenant: str | None, reason: str
     ) -> ActionError:
+        """A refusal about a Runtime that was resolved: recorded in that Runtime's history."""
         request_id = audit_writer.new_request_id()
         denied = self._event(action, agent_id, runtime_arn, tenant, request_id, "result", "denied", reason)
-        self._write(agent_id, denied)
+        self._write(runtime_arn, denied)
         return ActionError(status, reason, action=action, request_id=request_id)
 
     # --- the action -------------------------------------------------------------------
@@ -226,10 +240,21 @@ class ContainmentService:
                 holds_all_tenants=False,
                 contained_by=None,
             )
-            raise self._deny(403, action, agent_id, None, None, decision.reason)
+            # Not written to the audit table: nothing has been resolved, so the key would be the
+            # caller's own choice, and any signed-in user could fill any agent's history. The
+            # function's log keeps the attempt.
+            request_id = audit_writer.new_request_id()
+            logger.warning(
+                "Containment refused before resolution: action=%s role=%s subject=%s request_id=%s",
+                action,
+                role,
+                self.principal.subject,
+                request_id,
+            )
+            raise ActionError(403, decision.reason, action=action, request_id=request_id)
 
         runtime_arn, tenant, cells = self.resolve(agent_id, body)
-        contained_by = audit_reader.container(self._events(agent_id))
+        contained_by = audit_reader.container(self._events(runtime_arn))
         decision = rules.evaluate(
             action=action,
             role=role,
@@ -249,7 +274,7 @@ class ContainmentService:
 
         request_id = audit_writer.new_request_id()
         intent = self._event(action, agent_id, runtime_arn, tenant, request_id, "intent", "allowed", decision.reason)
-        if not self._write(agent_id, intent):
+        if not self._write(runtime_arn, intent):
             raise ActionError(503, "The audit trail could not be written, so the action was not performed")
 
         try:
@@ -270,7 +295,7 @@ class ContainmentService:
                 status_before=failure.before,
                 status_after=failure.after,
             )
-            self._write(agent_id, failed)
+            self._write(runtime_arn, failed)
             raise ActionError(
                 failure.status,
                 failure.done,
@@ -296,7 +321,7 @@ class ContainmentService:
             sessions_failed=(sessions.failed + sessions.not_attempted) if sessions else None,
             detail=sessions.discovery if sessions else None,
         )
-        result.audit_complete = self._write(agent_id, event)
+        result.audit_complete = self._write(runtime_arn, event)
         return result
 
     def _client(self, cell: Cell, service: str) -> Any:
@@ -418,10 +443,13 @@ class ContainmentService:
 
     def _stop_sessions(self, target: Target) -> SessionsStopped:
         """Stop the Runtime's recent sessions. Best effort: the deny statement is already in place."""
-        nothing = {"spans": 0, "log_streams": 0}
+        use_spans = target.cell.containment_spans
+        nothing = {"spans": 0, "log_streams": 0} if use_spans else {"log_streams": 0}
         try:
             control = self._client(target.cell, "bedrock-agentcore-control")
-            found = containment.discover_sessions(control, self._client(target.cell, "logs"), target.runtime_arn)
+            found = containment.discover_sessions(
+                control, self._client(target.cell, "logs"), target.runtime_arn, use_spans=use_spans
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Runtime sessions could not be listed: %s", error_code(exc))
             return SessionsStopped(discovery=f"sessions could not be listed ({error_code(exc)})", sources=nothing)
@@ -549,8 +577,11 @@ def _sessions_sentence(sessions: SessionsStopped) -> str:
             sentence += f", {sessions.failed} could not be stopped ({', '.join(sessions.stop_errors)})"
         if sessions.not_attempted:
             sentence += f", {sessions.not_attempted} were not attempted before the time limit"
-        spans, streams = sessions.sources.get("spans", 0), sessions.sources.get("log_streams", 0)
-        sentence += f" (found {spans} in traces, {streams} in logs)."
+        streams = sessions.sources.get("log_streams", 0)
+        if "spans" in sessions.sources:
+            sentence += f" (found {sessions.sources['spans']} in traces, {streams} in logs)."
+        else:
+            sentence += f" (found {streams} in logs)."
     if sessions.discovery != "ok":
         sentence += f" Session discovery was incomplete: {sessions.discovery.removeprefix('ok; ')}."
     return sentence

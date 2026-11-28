@@ -64,6 +64,9 @@ class Cell:
     account_alias: str | None = None
     # Opt-in per cell: the role the containment function assumes (with the cell's external id).
     containment_role_arn: str | None = None
+    # Opt-in per cell: also look for session ids in the cell's spans. Off by default, because it
+    # needs a Logs Insights query permission on the containment role, which can read span content.
+    containment_spans: bool = False
     # The cell account's CloudWatch Omni domain, for linking out, and the Region it lives in.
     omni_domain_url: str | None = None
     omni_region: str | None = None
@@ -162,6 +165,15 @@ def _optional(pattern: re.Pattern[str], value: Any, label: str) -> str | None:
     return _match(pattern, value, label)
 
 
+def _flag(value: Any, label: str) -> bool:
+    """An optional boolean. Anything but true, false or absent is a configuration error."""
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ConfigError(f"{label} must be true or false")
+    return value
+
+
 def _parse_cells(raw: Any) -> tuple[Cell, ...]:
     if not isinstance(raw, list):
         raise ConfigError("PORTAL_CELLS must be a JSON list")
@@ -187,11 +199,14 @@ def _parse_cells(raw: Any) -> tuple[Cell, ...]:
             pipeline_name=_optional(_PIPELINE_NAME, item.get("pipelineName"), f"{label}.pipelineName"),
             account_alias=_optional(_SLUG, item.get("accountAlias"), f"{label}.accountAlias"),
             containment_role_arn=_optional(_ROLE_ARN, item.get("containmentRoleArn"), f"{label}.containmentRoleArn"),
+            containment_spans=_flag(item.get("containmentSpans"), f"{label}.containmentSpans"),
             omni_domain_url=_optional(_HTTPS_URL, item.get("omniDomainUrl"), f"{label}.omniDomainUrl"),
             omni_region=_optional(_REGION, item.get("omniRegion"), f"{label}.omniRegion"),
         )
         if cell.containment_role_arn and f":{cell.account_id}:" not in cell.containment_role_arn:
             raise ConfigError(f"{label}.containmentRoleArn is not in the cell account")
+        if cell.containment_spans and not cell.containment_role_arn:
+            raise ConfigError(f"{label}.containmentSpans needs containmentRoleArn")
         if f":{cell.account_id}:" not in cell.reader_role_arn:
             raise ConfigError(f"{label}.readerRoleArn is not in the cell account")
         if cell.key in seen:

@@ -7,18 +7,22 @@
   from the one who contained the agent (two-person rule). The ``platform`` role
   does not bypass it.
 - The caller must hold the agent's tenant. ``platform`` holds every tenant. An
-  agent with no known tenant can be acted on only by ``platform`` and ``security``.
+  agent whose tenant cannot be determined can be acted on only by ``platform``.
+- The tenant is decided by where the Runtime runs (the cells configured for its
+  account and Region), never by what a registration claims (``tenant_for``).
 
 The rules are evaluated in that order and the first that fails decides.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from portal_api.authorities import CONTAIN_ROLES, RELEASE_ROLES
 
-TENANTLESS_ROLES = frozenset({"security", "platform"})
+# Only the role that holds every tenant may act when the tenant cannot be determined.
+TENANTLESS_ROLES = frozenset({"platform"})
 ACTIONS = ("contain", "release")
 
 
@@ -30,6 +34,29 @@ class ContainmentDecision:
 
 def _deny(reason: str) -> ContainmentDecision:
     return ContainmentDecision(False, reason)
+
+
+def tenant_for(
+    cell_tenants: Iterable[str], record_tenant: str | None = None, record_approved: bool = False
+) -> str | None:
+    """The tenant that decides who may act on a Runtime, or ``None`` when it cannot be determined.
+
+    ``cell_tenants`` are the tenants of the cells configured for the Runtime's
+    account and Region. That configuration is the operator's, so it is the
+    authority: a registration is written by the people it governs and cannot
+    move a Runtime into their tenant.
+
+    - One tenant there: that tenant, whatever a registration says.
+    - Several (a shared account): the tenant of the agent's registration, but
+      only when that registration is approved and names one of those tenants.
+    - Otherwise unknown, which only the ``platform`` role may act on.
+    """
+    tenants = set(cell_tenants)
+    if len(tenants) == 1:
+        return next(iter(tenants))
+    if record_approved and record_tenant in tenants:
+        return record_tenant
+    return None
 
 
 def evaluate(
@@ -54,7 +81,7 @@ def evaluate(
     if agent_tenant is None:
         if role not in TENANTLESS_ROLES:
             return _deny(
-                "an agent with no known tenant can be contained only by the platform or security role (CON-05-N)"
+                "an agent whose tenant cannot be determined can be acted on only by the platform role (CON-05-N)"
             )
     elif not holds_all_tenants and agent_tenant not in held_tenants:
         return _deny("the agent belongs to a tenant the principal does not hold (CON-04-N)")

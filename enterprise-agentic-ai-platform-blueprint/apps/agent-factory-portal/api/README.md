@@ -219,32 +219,52 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   pure functions). Release removes exactly that statement and deletes the
   policy only if nothing else remains.
 - **Sessions.** No API lists a Runtime's sessions, so the session ids of the
-  last eight hours (the maximum session lifetime) come from two independent
-  sources, read in parallel and merged without duplicates:
-  the Runtime's spans (`attributes.session.id`; only an instrumented agent has
-  them), and the names of its session log streams, `runtime-logs-<session id>`
-  in `/aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>` for each of the
-  Runtime's endpoints (any agent that writes output has them; no log event is
-  read). Each session is stopped, most recent first, at most 1000 per action
-  and within a time budget. A list that a limit cut never reads as complete:
-  the result is partial and says that more sessions may be running. A session
-  that is unknown or already ended counts as needing no stop. If one source cannot be read the other is used and the response names
-  the one that failed; if neither can, containment still holds and the
-  response and audit event say that the stop was not performed and why.
+  last eight hours (the maximum session lifetime) come from the names of its
+  session log streams, `runtime-logs-<session id>` in
+  `/aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>` for each of the
+  Runtime's endpoints. Any agent that writes output has them, and no log event
+  is read. A cell can opt in to a second source (`containmentSpans` on the
+  cell): the Runtime's spans (`attributes.session.id`), which finds a session
+  of an instrumented agent that wrote no output. It is off by default because
+  it needs a Logs Insights query permission on the cell's containment role,
+  and a role that can run a query can read span content. Each session is
+  stopped, most recent first, at most 1000 per action and within a time
+  budget. A list that a limit cut never reads as complete: the result is
+  partial and says that more sessions may be running. A session that is
+  unknown or already ended counts as needing no stop. With both sources, if
+  one cannot be read the other is used and the response names the one that
+  failed; if no source can be read, containment still holds and the response
+  and audit event say that the stop was not performed and why.
 - **Who.** `portal_api/actions/containment_rules.py` (pure): contain needs
   `security`, `platform` or `sre`; release needs `security` or `platform` and a
   different person from the one who contained it; the caller must hold the
   agent's tenant.
+- **Which tenant.** `tenant_for` in the same module: the tenant is decided by
+  where the Runtime runs (the cells configured for its account and Region),
+  never by what a registration claims. One tenant there: that tenant. Several
+  (a shared account): the tenant of the agent's registration, only when it is
+  approved and names one of them. Otherwise the tenant cannot be determined
+  and only `platform` may act. A draft that names another tenant's Runtime
+  therefore gives nobody authority over it.
 - **Where.** Everything in the cell is done by assuming the cell's
   `containmentRoleArn` with the cell's `externalId`. A cell without one
   cannot be contained (409).
-- **Resolving the agent.** A registered agent's Runtime ARN and tenant are
-  read from its registry record, never taken from the request. An agent with
-  no registration is addressed by its Runtime id.
+- **Resolving the agent.** A registered agent's Runtime ARN is read from its
+  registry record, never taken from the request. An agent with no
+  registration is addressed by its Runtime id.
 - **Audit.** Same table and discipline as registrations, under
-  `pk = CONTAINMENT#<agent id>`: an intent event before anything is changed and
-  a result event that says what was and was not done. A repeated contain is
-  recorded as `unchanged` and does not replace the original container.
+  `pk = CONTAINMENT#<Runtime ARN>`: the history belongs to the Runtime the
+  request resolved to, not to the id the caller used, so the two-person rule
+  holds whichever id a request uses. An intent event is written before
+  anything is changed and a result event says what was and was not done. A
+  repeated contain is recorded as `unchanged` and does not replace the
+  holder; a contain that failed after the statement may have been written
+  still names a holder. A caller without the role is refused before anything
+  is resolved; that refusal goes to the function's log, not to the table,
+  because its key would be the caller's own choice.
+- **Who reads the incident record.** `GET /agents/{id}/containment` returns
+  who contained the agent, why, and the events only to a role that can
+  contain or release. Other roles get the state.
 - **Not atomic.** The policy is read, changed and written without a lock.
   Another tool changing the same policy at the same moment could be overwritten.
 
@@ -322,6 +342,17 @@ claims from the event. `PORTAL_IDENTITY_PROVIDER` selects how they are read:
 `PORTAL_GROUP_ROLE_MAP` maps a group or app role name to one of `platform`,
 `security`, `sre`, `approver`, `finops`, `developer`, `readonly`. The highest
 mapped role wins. No claims is `401`; no mapped group is `403`.
+
+**What the functions trust.** The functions do not verify the token a second
+time: they trust the claims API Gateway passes after its own verification.
+API Gateway is the only caller the functions' resource policies allow, but a
+principal of the Platform account who holds `lambda:InvokeFunction` on a
+function can call it directly with claims of its own making, and so act as
+any persona, including for an approval, a containment or a release. Treat
+that permission on the portal's functions as a protected authority of the
+Platform account (deny it by service control policy or permission boundary
+to everyone but the deployment role), as for the functions' roles and code.
+Verifying the token inside the action functions is on the roadmap.
 
 ## Configuration
 

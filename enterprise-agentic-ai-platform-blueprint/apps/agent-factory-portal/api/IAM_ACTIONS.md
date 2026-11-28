@@ -169,25 +169,41 @@ Trust: the containment function's role only, with the cell's external id.
 | `bedrock-agentcore:DeleteResourcePolicy` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Release, only when the containment statement was the policy's only statement |
 | `bedrock-agentcore:StopRuntimeSession` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Contain (stop the Runtime's recent sessions) |
 | `bedrock-agentcore:ListAgentRuntimeEndpoints` | `arn:aws:bedrock-agentcore:REGION:CELL:runtime/*` | Contain (the Runtime's endpoint names, to find its session log groups). Without it only the DEFAULT endpoint is checked |
-| `logs:StartQuery` | `arn:aws:logs:REGION:CELL:log-group:aws/spans:*` | Contain (find the Runtime's recent session ids in its spans) |
-| `logs:GetQueryResults` | `*` (no resource-level permissions) | Contain (same query) |
 | `logs:DescribeLogStreams` | `arn:aws:logs:REGION:CELL:log-group:/aws/bedrock-agentcore/runtimes/*` | Contain (find the Runtime's recent session ids in the names of its session log streams) |
+| `logs:StartQuery` (only with the spans option) | `arn:aws:logs:REGION:CELL:log-group:aws/spans:*` | Contain, when the cell sets `containmentSpans` (find session ids in the Runtime's spans) |
+| `logs:GetQueryResults` (only with the spans option) | `*` (no resource-level permissions) | Same query |
 
 `bedrock-agentcore:ListSessions` is not used and should not be granted for
 this purpose: it lists the sessions of a Memory resource
 (`/memories/{memoryId}/actor/{actorId}/sessions`), not of a Runtime. No API
-lists a Runtime's sessions, so the session ids come from two independent
-sources: the Runtime's spans (only an instrumented agent has them) and the
-names of its session log streams, `runtime-logs-<session id>` in
-`/aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>` (only an agent that
-writes output has them). If one source cannot be read the other is used and
-the response names the one that failed. If neither can be read, containment
-still works (invocation is denied) and the response says that running
-sessions could not be listed.
+lists a Runtime's sessions, so the session ids come from the names of its
+session log streams, `runtime-logs-<session id>` in
+`/aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>` (an agent that
+writes output has them). If they cannot be read, containment still works
+(invocation is denied) and the response says that running sessions could not
+be listed.
 
-The role reads stream names only. It has no permission to read a log event
-(`logs:GetLogEvents`, `logs:FilterLogEvents`), and the code calls neither. It
-cannot invoke the Runtime or read its configuration.
+By default the role reads stream names only. It has no permission to read a
+log event (`logs:GetLogEvents`, `logs:FilterLogEvents`) and none to run a
+query, and the code calls neither. It cannot invoke the Runtime or read its
+configuration.
+
+**The spans option widens the role.** A cell that sets `containmentSpans`
+also grants `logs:StartQuery` on its spans log group. IAM cannot restrict
+which query is run, so with that option the role can read span content
+(which can include prompts and tool output), not only session ids. Leave it
+off unless a cell runs instrumented agents that write no output.
+
+**What `PutResourcePolicy` means.** IAM cannot restrict the content of the
+policy that is written. The code writes one deny statement and keeps every
+other statement, but the permission itself would let whoever controls the
+containment function write any resource policy on a Runtime of an opted-in
+cell, including one that grants invocation to another account. The controls
+are: the role is assumable only by the containment function's role with the
+cell's external id; that function's code and role are protected authorities
+of the Platform account; and every change is a CloudTrail management event
+in the cell account, which the cell can alarm on (any `PutResourcePolicy` by
+this role whose statement Sid is not `AgenticAIPortalContainment`).
 
 ## 7. Notes on the action set
 

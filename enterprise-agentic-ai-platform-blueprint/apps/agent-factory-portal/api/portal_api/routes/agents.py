@@ -128,7 +128,7 @@ def eval_runs(agent_id: EntityId, _: CurrentPrincipal, service: Service) -> Eval
 
 @router.get("/{agent_id}/containment", response_model=ContainmentView)
 def containment(agent_id: EntityId, principal: CurrentPrincipal, service: Service) -> ContainmentView:
-    return service.containment_view(agent_id, principal.subject)
+    return service.containment_view(agent_id, principal.subject, principal.role)
 
 
 @router.get("/{agent_id}/mcp-grants", response_model=list[AgentMcpGrant])

@@ -39,6 +39,7 @@ CELLS = [
         "externalId": "portal-ext-id",
         "pipelineName": "agenticai-workload-ws1-travel-agent",
         "containmentRoleArn": f"arn:aws:iam::{CELL_ACCOUNT}:role/agenticai-portal-containment",
+        "containmentSpans": True,
     },
     {
         "tenantId": "ws2",

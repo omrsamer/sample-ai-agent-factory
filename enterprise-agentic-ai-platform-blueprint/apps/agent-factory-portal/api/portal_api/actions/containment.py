@@ -212,13 +212,18 @@ def sessions_from_log_streams(client: Any, runtime_id: str, endpoints: list[str]
     return sessions
 
 
-def discover_sessions(control: Any, logs_client: Any, runtime_arn: str) -> Discovery:
-    """The Runtime's sessions of the lookback window, from its spans and from its session log streams.
+def discover_sessions(control: Any, logs_client: Any, runtime_arn: str, use_spans: bool = False) -> Discovery:
+    """The Runtime's sessions of the lookback window.
 
-    No API lists a Runtime's sessions, and neither source is complete on its
-    own: spans exist only for an instrumented agent, log streams only for one
-    that writes output. The two are read independently and merged; discovery
-    fails only when both do.
+    No API lists a Runtime's sessions. They are found in the names of the
+    Runtime's session log streams, which needs no instrumentation in the agent
+    and reads no log event. A cell can opt in to a second source, its spans
+    (``use_spans``): that finds a session of an instrumented agent that wrote
+    no output, at the price of a Logs Insights query permission on the cell's
+    containment role, which can read span content. It is off by default.
+
+    With both sources, each is read independently and the results are merged;
+    discovery fails only when every source that was asked failed.
     """
     end = dt.datetime.now(dt.UTC)
     start = end - dt.timedelta(hours=logs.SESSION_LOOKBACK_HOURS)
@@ -234,7 +239,10 @@ def discover_sessions(control: Any, logs_client: Any, runtime_arn: str) -> Disco
             notes.append(note)
         return sessions_from_log_streams(logs_client, runtime_id, endpoints, start)
 
-    spans, streams = pmap(lambda source: source(), [from_spans, from_streams], max_workers=2)
+    asked = [from_spans, from_streams] if use_spans else [from_streams]
+    found = pmap(lambda source: source(), asked, max_workers=len(asked))
+    spans: Any = found[0] if use_spans else Found()
+    streams: Any = found[-1]
     failures = []
     if isinstance(spans, BaseException):
         failures.append(f"spans could not be queried ({_reason(spans)})")
@@ -242,8 +250,9 @@ def discover_sessions(control: Any, logs_client: Any, runtime_arn: str) -> Disco
     if isinstance(streams, BaseException):
         failures.append(f"log streams could not be listed ({_reason(streams)})")
         streams = []
-    sources = {"spans": len(spans), "log_streams": len(streams)}
-    if len(failures) == 2:
+    # A source that was not asked is not reported: "0 in traces" would read as "looked and found none".
+    sources = {"spans": len(spans), "log_streams": len(streams)} if use_spans else {"log_streams": len(streams)}
+    if len(failures) == len(asked):
         return Discovery([], f"sessions could not be listed ({'; '.join(failures)})", sources, failed=True)
 
     merged: dict[tuple[str, str], Session] = {}

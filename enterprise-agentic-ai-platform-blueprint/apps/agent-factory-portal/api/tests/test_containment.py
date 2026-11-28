@@ -273,6 +273,7 @@ def test_rule_reasons_and_order():
     assert "CON-02-N" in decide(role="sre", action="release").reason
     assert "CON-04-N" in decide(agent_tenant="ws2").reason
     assert "CON-05-N" in decide(role="sre", agent_tenant=None).reason
+    assert "CON-05-N" in decide(role="security", agent_tenant=None).reason
     assert "CON-03-N" in decide(action="release", contained_by="p-1").reason
     assert "CON-01-P" in decide().reason and decide().allowed
     assert "CON-03-P" in decide(action="release", contained_by="p-2").reason
@@ -290,9 +291,28 @@ def test_two_person_rule_is_not_bypassed_by_the_platform_role():
 
 def test_tenant_rules():
     assert decide(role="platform", agent_tenant="anything", held_tenants=(), holds_all_tenants=True).allowed
-    assert decide(role="security", agent_tenant=None, held_tenants=()).allowed
     assert decide(role="platform", agent_tenant=None, holds_all_tenants=True).allowed
     assert not decide(role="security", agent_tenant="ws3", held_tenants=("ws1", "ws2")).allowed
+    # A tenant that cannot be determined is for the role that holds every tenant, and for nobody else:
+    # a security user of one tenant must not reach an agent that may be another tenant's.
+    for role in ("security", "sre"):
+        refused = decide(role=role, agent_tenant=None, held_tenants=("ws1", "ws2"))
+        assert not refused.allowed and "CON-05-N" in refused.reason
+
+
+def test_the_tenant_comes_from_where_the_runtime_runs_not_from_a_registration():
+    tenant_for = rules.tenant_for
+    # One tenant in the Runtime's account: that tenant, whatever a registration claims.
+    assert tenant_for({"ws2"}) == "ws2"
+    assert tenant_for({"ws2"}, record_tenant="ws1", record_approved=True) == "ws2"
+    assert tenant_for({"ws2"}, record_tenant="ws1", record_approved=False) == "ws2"
+    # A shared account: only an approved registration that names one of its tenants decides.
+    assert tenant_for({"ws1", "ws9"}, record_tenant="ws1", record_approved=True) == "ws1"
+    assert tenant_for({"ws1", "ws9"}, record_tenant="ws1", record_approved=False) is None
+    assert tenant_for({"ws1", "ws9"}, record_tenant="ws5", record_approved=True) is None
+    assert tenant_for({"ws1", "ws9"}) is None
+    # No cell at all for that account and Region.
+    assert tenant_for(set(), record_tenant="ws1", record_approved=True) is None
 
 
 def test_rules_fail_closed():
@@ -365,7 +385,8 @@ def test_contain_audit_events(world):
     world.cell.sessions = [session_row(sid("aaa"))]
     assert world.post("contain")[0] == 200
     intent, result = world.dynamo.events()
-    assert intent["pk"] == result["pk"] == f"CONTAINMENT#{world.record_id}"
+    # The history belongs to the Runtime the request resolved to, not to the id the caller used.
+    assert intent["pk"] == result["pk"] == f"CONTAINMENT#{RUNTIME_ARN}"
     assert (intent["phase"], intent["outcome"], intent["action"]) == ("intent", "allowed", "contain")
     assert "CON-01-P" in intent["reason"]
     assert (result["phase"], result["outcome"], result["status_before"], result["status_after"]) == (
@@ -418,19 +439,29 @@ def test_contain_authority_and_tenant(world, claims, expected, reason):
     assert code == expected
     if reason:
         assert reason in body["detail"] and RUNTIME_ARN not in world.cell.policies
-        assert world.trail() == [("contain", "result", "denied")]
         assert world.cell.calls == []
+        if reason == "CON-01-N":
+            # Refused before the agent is resolved: nothing is written, because the key would be
+            # the caller's choice and any signed-in user could fill any agent's history.
+            assert world.trail() == [] and world.registry.calls == []
+        else:
+            assert world.trail() == [("contain", "result", "denied")]
+            assert world.dynamo.events()[0]["pk"] == f"CONTAINMENT#{RUNTIME_ARN}"
 
 
 def test_a_caller_without_the_role_is_refused_before_anything_is_looked_up(world):
     code, body = world.post("contain", agent_id="rec999999999", claims=DEV)
-    assert code == 403 and "CON-01-N" in body["detail"]
+    assert code == 403 and "CON-01-N" in body["detail"] and body.get("request_id")
     assert world.registry.calls == [] and world.cell.calls == []
+    # ... and nothing is written under an id the caller made up, however often it is tried.
+    for _ in range(3):
+        assert world.post("release", agent_id="rec999999999", claims=VIEW)[0] == 403
+    assert world.dynamo.events() == []
 
 
 def test_containment_not_enabled_for_the_cell_is_409(world, monkeypatch):
-    cells = [{k: v for k, v in CELLS[0].items() if k != "containmentRoleArn"}, CELLS[1]]
-    monkeypatch.setenv("PORTAL_CELLS", json.dumps(cells))
+    without = {k: v for k, v in CELLS[0].items() if k not in ("containmentRoleArn", "containmentSpans")}
+    monkeypatch.setenv("PORTAL_CELLS", json.dumps([without, CELLS[1]]))
     code, body = world.post("contain")
     assert (code, body["detail"]) == (409, "containment is not enabled for this cell")
     assert world.cell.calls == [] and world.trail() == [("contain", "result", "denied")]
@@ -464,17 +495,14 @@ def test_runtime_arn_is_needed_when_several_cell_accounts_can_be_contained(world
     monkeypatch.setenv("PORTAL_CELLS", json.dumps([CELLS[0], other, shared]))
     code, body = world.post("contain", agent_id=ORPHAN_ID)
     assert code == 422 and "runtime_arn is required" in body["detail"][0]["msg"]
-    # With the ARN it resolves. Its account now holds two tenants, so the agent has no known tenant:
-    code, body = world.post(
-        "contain", agent_id=ORPHAN_ID, claims=SRE, body={"reason": "r", "runtime_arn": ORPHAN_RUNTIME_ARN}
-    )
-    assert code == 403 and "CON-05-N" in body["detail"]
-    assert (
-        world.post("contain", agent_id=ORPHAN_ID, claims=SEC, body={"reason": "r", "runtime_arn": ORPHAN_RUNTIME_ARN})[
-            0
-        ]
-        == 200
-    )
+    # With the ARN it resolves. Its account now holds two tenants, so the agent's tenant cannot be
+    # determined, and only the role that holds every tenant may act: not sre, and not security either.
+    orphan = {"reason": "r", "runtime_arn": ORPHAN_RUNTIME_ARN}
+    for claims in (SRE, SEC):
+        code, body = world.post("contain", agent_id=ORPHAN_ID, claims=claims, body=orphan)
+        assert code == 403 and "CON-05-N" in body["detail"]
+    assert ORPHAN_RUNTIME_ARN not in world.cell.policies
+    assert world.post("contain", agent_id=ORPHAN_ID, claims=PAT, body=orphan)[0] == 200
     assert ORPHAN_RUNTIME_ARN in world.cell.policies
 
 
@@ -641,7 +669,7 @@ def test_discovered_sessions_are_ordered_most_recent_first_and_capped(world):
 
     world.cell.sessions = [session_row(sid("span-old"), last_seen=at(300)), session_row(sid("both"), last_seen=at(1))]
     world.cell.streams[log_group()] = [session_stream("log-mid", 100), session_stream("both", 200)]
-    found = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN)
+    found = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN, use_spans=True)
     # one entry for the session both sources saw, placed by its most recent sighting
     assert [s.session_id for s in found.sessions] == [sid("both"), sid("log-mid"), sid("span-old")]
     assert (found.note, found.sources, found.failed) == ("ok", {"spans": 2, "log_streams": 2}, False)
@@ -649,12 +677,12 @@ def test_discovered_sessions_are_ordered_most_recent_first_and_capped(world):
     world.cell.stream_page_size = 50
     world.cell.streams[log_group()] = [session_stream(f"n{i:03d}", 1 + i / 100) for i in range(150)]
     world.cell.sessions = [session_row(sid(f"m{i:03d}"), last_seen=at(60)) for i in range(120)]
-    whole = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN)
+    whole = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN, use_spans=True)
     assert len(whole.sessions) == 270 and whole.note == "ok"  # under the limit: nothing is cut, nothing is said
 
     world.cell.streams[log_group()] = [session_stream(f"n{i:03d}", 1 + i / 100) for i in range(800)]
     world.cell.sessions = [session_row(sid(f"m{i:03d}"), last_seen=at(60)) for i in range(400)]
-    capped = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN)
+    capped = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN, use_spans=True)
     assert len(capped.sessions) == logs.MAX_SESSIONS == 1000
     assert capped.sources == {"spans": 400, "log_streams": 800}
     assert capped.sessions[0].session_id == sid("n000")  # the newest are kept
@@ -664,7 +692,7 @@ def test_discovered_sessions_are_ordered_most_recent_first_and_capped(world):
     # A source that returns as many rows as it may return has probably more.
     world.cell.streams[log_group()] = []
     world.cell.sessions = [session_row(sid(f"q{i:04d}"), last_seen=at(60)) for i in range(1000)]
-    full = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN)
+    full = containment.discover_sessions(world.cell, world.cell, RUNTIME_ARN, use_spans=True)
     assert len(full.sessions) == 1000 and "more sessions may be running" in full.note
 
 
@@ -1159,7 +1187,7 @@ def test_containment_view(world, read):
         [],
     )
     assert world.post("contain", claims=SEC)[0] == 200
-    code, view = read(world.record_id)
+    code, view = read(world.record_id, PAT)
     assert (view["state"], view["contained_by"], view["contained_by_label"], view["contained_by_me"]) == (
         "contained",
         "sec-1",
@@ -1170,20 +1198,33 @@ def test_containment_view(world, read):
     assert [(e["action"], e["phase"]) for e in view["events"]] == [("contain", "result"), ("contain", "intent")]
     assert read(world.record_id, SEC)[1]["contained_by_me"] is True
     assert world.post("release", claims=PAT)[0] == 200
-    code, view = read(world.record_id)
+    code, view = read(world.record_id, PAT)
     assert (view["state"], view["contained_by"], view["reason"]) == ("not_contained", None, None)
     assert [e["action"] for e in view["events"]][:2] == ["release", "release"]
+
+
+@pytest.mark.parametrize("claims", [VIEW, DEV, ANN])
+def test_the_incident_record_is_shown_only_to_roles_that_can_contain_or_release(world, read, claims):
+    assert world.post("contain", claims=SEC)[0] == 200
+    view = read(world.record_id, claims)[1]
+    # What everyone may know: that it is contained, since when, and the delays.
+    assert view["state"] == "contained" and view["contained_at"] and view["enabled"] is True
+    assert view["contained_by_me"] is False and view["enforcement_delay_seconds"] == 90
+    # Who contained it, why, and every attempt are an incident record.
+    assert (view["contained_by"], view["contained_by_label"], view["reason"], view["events"]) == (None, None, None, [])
+    for responder in (SEC, PAT, SRE):
+        full = read(world.record_id, responder)[1]
+        assert full["contained_by"] == "sec-1" and full["events"]
 
 
 def test_containment_view_says_when_the_containment_was_partial(world, read):
     world.cell.fail["start_query"] = "AccessDeniedException"
     assert world.post("contain", claims=SEC)[1]["partial"] is True
-    view = read(world.record_id)[1]
+    view = read(world.record_id)[1]  # partial is not part of the incident record: every role sees it
     assert (view["state"], view["partial"], view["enforcement_delay_seconds"]) == ("contained", True, 90)
     assert view["release_delay_seconds"] == 300
-    assert (
-        view["events"][0]["detail"] == "ok; spans could not be queried (query could not start (AccessDeniedException))"
-    )
+    events = read(world.record_id, PAT)[1]["events"]
+    assert events[0]["detail"] == "ok; spans could not be queried (query could not start (AccessDeniedException))"
     assert world.post("release", claims=PAT)[0] == 200
     assert world.post("contain", claims=SEC)[1]["partial"] is False
     assert read(world.record_id)[1]["partial"] is False
@@ -1207,3 +1248,165 @@ def test_the_delays_are_stated_in_words():
     assert delay_words(45) == "about 45 seconds"
     assert delay_words(90) == "about 90 seconds"
     assert delay_words(300) == "about 5 minutes"
+
+
+# --- what an independent review found: each attack, and the request that must still work ---------------
+
+
+def test_the_two_person_rule_follows_the_runtime_not_the_id_used(world):
+    """Contain through the record id, then try to release through the Runtime's own id."""
+    assert world.post("contain", claims=SEC)[0] == 200
+    by_runtime_id = {"reason": "Release under another name.", "runtime_arn": RUNTIME_ARN}
+    code, body = world.post("release", agent_id=RUNTIME_ID, claims=SEC, body=by_runtime_id)
+    assert code == 403 and "CON-03-N" in body["detail"]
+    assert RUNTIME_ARN in world.cell.policies  # still contained
+    # One history for the Runtime, whatever id each request used.
+    assert {e["pk"] for e in world.dynamo.events()} == {f"CONTAINMENT#{RUNTIME_ARN}"}
+    # A different person may release it, under either id.
+    assert world.post("release", agent_id=RUNTIME_ID, claims=PAT, body=by_runtime_id)[0] == 200
+    assert RUNTIME_ARN not in world.cell.policies
+
+
+def test_a_second_record_naming_the_same_runtime_shares_its_history(world):
+    twin = world.registry.seed("agent-ws1-twin-nonprod", json.dumps(agent_document(agentId="twin")), "APPROVED")
+    assert world.post("contain", claims=SEC)[0] == 200
+    code, body = world.post("release", agent_id=twin, claims=SEC)
+    assert code == 403 and "CON-03-N" in body["detail"]
+    assert world.post("release", agent_id=twin, claims=PAT)[0] == 200
+
+
+def test_a_registration_cannot_bring_another_tenants_runtime_into_reach(world):
+    """A draft that claims tenant ws2 for a Runtime that runs in tenant ws1's account."""
+    claimed = world.registry.seed(
+        "agent-ws2-borrowed-nonprod", json.dumps(agent_document(tenantId="ws2", agentId="borrowed")), "DRAFT"
+    )
+    # A responder of ws2 does not hold the Runtime's real tenant, whatever the record says.
+    code, body = world.post("contain", agent_id=claimed, claims=SRE2)
+    assert code == 403 and "CON-04-N" in body["detail"]
+    assert RUNTIME_ARN not in world.cell.policies and world.cell.calls == []
+    # The refusal is in the Runtime's history, with the tenant that decided.
+    (denied,) = world.dynamo.events()
+    assert (denied["pk"], denied["tenant_id"], denied["outcome"]) == (f"CONTAINMENT#{RUNTIME_ARN}", "ws1", "denied")
+    # A responder of the real tenant can act, through that record or through the genuine one.
+    assert world.post("contain", agent_id=claimed, claims=SRE)[0] == 200
+    # And the ws2 responder cannot lift a containment the real tenant placed.
+    assert world.post("release", agent_id=claimed, claims={"sub": "sec-ws2", "cognito:groups": "[sre-team2]"})[0] == 403
+    assert RUNTIME_ARN in world.cell.policies
+
+
+def test_in_a_shared_account_only_an_approved_registration_names_the_tenant(world, monkeypatch):
+    shared = {**CELLS[0], "tenantId": "ws9", "agentId": "second-agent"}
+    monkeypatch.setenv("PORTAL_CELLS", json.dumps([CELLS[0], CELLS[1], shared]))
+    # The seeded record is APPROVED for ws1, one of the account's tenants: ws1 decides.
+    assert world.post("contain", claims=SRE)[0] == 200
+    assert world.post("release", claims=PAT)[0] == 200
+    # A draft cannot name the tenant: the tenant is then undetermined and only platform may act.
+    draft = world.registry.seed("agent-ws1-draft-nonprod", json.dumps(agent_document(agentId="draft")), "DRAFT")
+    for claims in (SRE, SEC):
+        code, body = world.post("contain", agent_id=draft, claims=claims)
+        assert code == 403 and "CON-05-N" in body["detail"]
+    # An approved record that names a tenant the account does not host does not decide either.
+    foreign = world.registry.seed(
+        "agent-ws2-foreign-nonprod", json.dumps(agent_document(tenantId="ws2", agentId="foreign")), "APPROVED"
+    )
+    code, body = world.post("contain", agent_id=foreign, claims=SRE2)
+    assert code == 403 and "CON-05-N" in body["detail"]
+    assert RUNTIME_ARN not in world.cell.policies
+    assert world.post("contain", agent_id=draft, claims=PAT)[0] == 200
+
+
+def test_a_contain_that_could_not_be_verified_still_has_a_holder(world):
+    """The statement is written, the read-back fails: the same person must not be able to release."""
+    original, calls = world.cell.get_resource_policy, {"n": 0}
+
+    def fails_on_the_read_back(resourceArn: str) -> dict:  # noqa: N803
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise client_error("ThrottlingException", "GetResourcePolicy")
+        return original(resourceArn)
+
+    world.monkeypatch.setattr(world.cell, "get_resource_policy", fails_on_the_read_back)
+    code, body = world.post("contain", claims=SEC)
+    assert code == 502 and RUNTIME_ARN in world.cell.policies  # written, not verified
+    assert world.trail()[-1] == ("contain", "result", "failed")
+    # A retry finds the statement and changes nothing; the first person is the holder all the same.
+    assert world.post("contain", claims=SEC)[1]["outcome"] == "unchanged"
+    code, body = world.post("release", claims=SEC)
+    assert code == 403 and "CON-03-N" in body["detail"]
+    assert world.post("release", claims=PAT)[0] == 200
+
+
+def test_who_holds_a_containment():
+    from portal_api.aws.audit import container
+    from portal_api.models.portal import AuditEvent
+
+    def event(n: int, who: str, action: str, outcome: str, phase: str = "result", **extra: str) -> AuditEvent:
+        return AuditEvent(
+            event_id=f"e{n}",
+            request_id=extra.pop("request_id", f"r{n}"),
+            at=f"2026-01-15T12:00:{n:02d}Z",
+            phase=phase,
+            action=action,
+            outcome=outcome,
+            reason="r",
+            actor_subject=who,
+            actor_label=who,
+            actor_role="security",
+            **extra,
+        )
+
+    def holder(*oldest_first: AuditEvent) -> str | None:
+        found = container(list(reversed(oldest_first)))
+        return found.actor_subject if found else None
+
+    assert holder() is None
+    assert holder(event(1, "ann", "contain", "allowed")) == "ann"
+    assert holder(event(1, "ann", "contain", "allowed"), event(2, "bob", "release", "allowed")) is None
+    # A repeated contain never replaces the holder ...
+    assert holder(event(1, "ann", "contain", "allowed"), event(2, "bob", "contain", "unchanged")) == "ann"
+    # ... but with nobody on record, the first person to assert the containment holds it.
+    assert holder(event(1, "bob", "contain", "unchanged"), event(2, "cy", "contain", "unchanged")) == "bob"
+    assert (
+        holder(
+            event(1, "ann", "contain", "allowed"),
+            event(2, "bob", "release", "allowed"),
+            event(3, "cy", "contain", "unchanged"),
+        )
+        == "cy"
+    )
+    # A contain that failed after the statement may have been written has a holder; one that wrote nothing has none.
+    assert holder(event(1, "ann", "contain", "failed", status_after="unknown")) == "ann"
+    assert holder(event(1, "ann", "contain", "failed", status_after="not_contained")) is None
+    # Refusals never count, and an intent with no result counts as its result would have.
+    assert holder(event(1, "ann", "contain", "allowed"), event(2, "ann", "release", "denied")) == "ann"
+    assert holder(event(1, "ann", "contain", "allowed", phase="intent")) == "ann"
+    assert (
+        holder(
+            event(1, "ann", "contain", "allowed", phase="intent", request_id="same"),
+            event(2, "ann", "contain", "failed", request_id="same", status_after="not_contained"),
+        )
+        is None
+    )
+
+
+def test_spans_are_not_searched_unless_the_cell_opted_in(world, monkeypatch):
+    without = {k: v for k, v in CELLS[0].items() if k != "containmentSpans"}
+    monkeypatch.setenv("PORTAL_CELLS", json.dumps([without, CELLS[1]]))
+    world.cell.sessions = [session_row(sid("only-in-spans"))]
+    world.cell.streams[log_group()] = [session_stream("in-logs")]
+    code, body = world.post("contain")
+    assert code == 200 and body["partial"] is False
+    # No Logs Insights call at all: the cell's role does not need, and does not get, a query permission.
+    assert "start_query" not in world.cell.calls and "get_query_results" not in world.cell.calls
+    assert body["sessions"]["sources"] == {"log_streams": 1} and body["sessions"]["discovery"] == "ok"
+    assert world.cell.stopped == [(sid("in-logs"), "DEFAULT")]
+    assert "(found 1 in logs)" in body["steps"][2]["detail"] and "traces" not in body["steps"][2]["detail"]
+
+
+def test_the_spans_option_needs_a_containment_role():
+    cells = [{**{k: v for k, v in CELLS[0].items() if k != "containmentRoleArn"}}, CELLS[1]]
+    with pytest.raises(ConfigError, match="containmentSpans needs containmentRoleArn"):
+        load_action_settings({**BASE_ENV, "PORTAL_ACTION_ROLE": "containment", "PORTAL_CELLS": json.dumps(cells)})
+    not_a_flag = [{**CELLS[0], "containmentSpans": "yes"}, CELLS[1]]
+    with pytest.raises(ConfigError, match="containmentSpans must be true or false"):
+        load_action_settings({**BASE_ENV, "PORTAL_ACTION_ROLE": "containment", "PORTAL_CELLS": json.dumps(not_a_flag)})

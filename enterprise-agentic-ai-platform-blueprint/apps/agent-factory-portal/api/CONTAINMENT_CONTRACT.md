@@ -18,11 +18,21 @@ All paths are under `/api/v1`. Requests carry `Authorization: Bearer <token>`.
   The `platform` role does not bypass this. Show Release as unavailable when
   `contained_by_me` is true.
 - **Tenant.** `platform` holds every tenant. Others hold the tenants of their
-  groups. An agent with no known tenant can be acted on only by `platform`
-  and `security`.
-- **Tenant of an agent that has no registration.** It is the tenant of the
-  cell account its Runtime runs in when every configured cell there has the
-  same tenant, and unknown otherwise.
+  groups. An agent whose tenant cannot be determined can be acted on only by
+  `platform`.
+- **Which tenant decides.** The tenant of the place the Runtime runs in, not
+  the tenant a registration claims: a registration is written by the people
+  it governs. When every cell configured for the Runtime's account and Region
+  has the same tenant, that is the tenant, for a registered and an
+  unregistered agent alike. In an account shared by several tenants it is
+  the tenant of the agent's registration, but only when that registration is
+  approved and names one of those tenants; otherwise it cannot be determined.
+  So a draft that names another tenant's Runtime gives nobody any authority
+  over that Runtime.
+- **One history per Runtime.** The two-person rule and the history follow
+  the Runtime, whatever id a request used (a registration's id, or the
+  Runtime's own id). A person who contained an agent under one id cannot
+  release it under another.
 - `GET /users/me` returns `can_contain` and `can_release` (booleans, from the
   caller's role). `can_release` does not account for the two-person rule: use
   `contained_by_me` on the containment view for that. The function enforces
@@ -42,11 +52,12 @@ In the agent's cell, with that cell's containment role:
    limit cuts the list, `sessions.discovery` says that more sessions may be
    running and the result is `partial`; containing again continues, because a
    session that was already stopped needs no second stop. No API lists a
-   Runtime's sessions, so
-   they are found in two places: the Runtime's traces (an instrumented agent)
-   and the names of its session log streams (any agent that writes output).
-   `sessions.sources` says how many each gave, for example "found 3 sessions
-   (2 in traces, 3 in logs)". It is informational.
+   Runtime's sessions, so they are found in the names of its session log
+   streams (any agent that writes output; no log event is read). A cell can
+   opt in to a second source, the Runtime's traces, which finds a session of
+   an instrumented agent that wrote no output. `sessions.sources` says how
+   many each source gave. It is informational, and it names only the sources
+   that were asked: without the opt-in there is no `spans` entry.
 
 **Enforcement is not instant, and the two directions differ.** The service
 applies a policy change host by host (measured on a live Runtime under steady
@@ -109,11 +120,13 @@ interface ContainmentStep {
 }
 
 interface SessionsStopped {
-  // "ok": both sources were read. "ok; <what was incomplete>": one source could not be read, or only the
-  // DEFAULT endpoint could be checked. "sessions could not be listed (<why>)": neither source could be read.
+  // "ok": every source that was asked was read. "ok; <what was incomplete>": a source could not be read, a
+  // limit cut the list, or only the DEFAULT endpoint could be checked. "sessions could not be listed
+  // (<why>)": no source could be read.
   discovery: string;
-  sources: { spans: number; log_streams: number };  // where sessions were found, before de-duplication
-  found: number;       // distinct sessions, after merging the two sources
+  // Where sessions were found, before de-duplication. `spans` is present only when the cell opted in to it.
+  sources: { log_streams: number; spans?: number };
+  found: number;       // distinct sessions, after merging the sources
   stopped: number;
   not_active: number;  // unknown or already ended: no stop was needed
   failed: number;      // could not be stopped
@@ -157,9 +170,17 @@ field on `GET /agents` can lag by the cache lifetime, 30 seconds by default).
 no reader (the normal case for an agent the organization registry detected in
 an account that is not a cell); `detail` then says which, for example "There
 is no reader in this agent's account, so its containment state cannot be
-read." `enabled` is false for such an agent, so offer no action. `contained_by`, `contained_at` and `reason` are set while the
-agent is contained through the portal; a Runtime contained by other means
-shows `contained` with those fields null.
+read." `enabled` is false for such an agent, so offer no action. `contained_at`
+is set while the agent is contained through the portal; a Runtime contained by
+other means shows `contained` with it null.
+
+**The incident record is for responders.** Who contained the agent, why, and
+the history of attempts (`contained_by`, `contained_by_label`, `reason`,
+`events`) are returned only to a caller whose role can contain or release
+(`security`, `platform`, `sre`). Every other mapped role gets them as null and
+an empty list, and still gets `state`, `enabled`, `contained_at`, `partial`,
+`contained_by_me` and the two delays. Show "Contained since <time>" to those
+roles and no history table.
 
 Status codes: 200; 401; 403 (no mapped group); 404 (no such agent); 422 (malformed id).
 
@@ -198,20 +219,26 @@ Notes for the UI:
   sentence in `detail`, and `sessions` has the counts. Show the steps. The
   agent is contained regardless: the deny statement blocks further
   invocations, including on sessions that are still running.
-- **Finding no session is normal.** An agent that emits no traces and writes
-  no output has nothing to find; `found` is 0 and the step is `done`.
+- **Finding no session is normal.** An agent that writes no output (and, with
+  the traces option, emits no traces) has nothing to find; `found` is 0 and
+  the step is `done`.
 - **There are no intermediate states.** The actions are synchronous; `state`
   is never "containing" or "releasing". A request can take up to about 25
   seconds when many sessions are stopped.
 - **A 502 always says what state the agent is in.** After a 502, re-read
   `GET /agents/{id}/containment` and show its `state`.
-- 403, 409 and 502 answers carry `request_id` and are in the audit trail.
+- 403, 409 and 502 answers carry `request_id`. A refusal about a Runtime
+  that was resolved (tenant, two-person rule, containment not enabled) and
+  every failure are in that Runtime's history. A caller without the role is
+  refused before anything is looked up: that refusal is in the function's log
+  with its `request_id`, not in the history, because nothing was resolved and
+  the key would be the caller's own choice.
 - After a successful action, refresh `GET /agents/{id}/containment`.
 - A caller without the role gets 403 whether or not the agent exists.
 
 Rule identifiers in `detail`: `CON-01-N` (role for contain), `CON-02-N` (role
 for release), `CON-03-N` (two-person rule), `CON-04-N` (tenant not held),
-`CON-05-N` (agent with no known tenant).
+`CON-05-N` (the agent's tenant cannot be determined; `platform` only).
 
 ## Routing
 

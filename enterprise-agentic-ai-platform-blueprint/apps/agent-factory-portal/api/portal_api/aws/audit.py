@@ -43,26 +43,50 @@ def name_key(record_name: str) -> str:
     return f"RECORD#NAME#{record_name}"
 
 
-def containment_key(agent_id: str) -> str:
-    return f"CONTAINMENT#{agent_id}"
+def containment_key(runtime_arn: str) -> str:
+    """The partition of a Runtime's containment history.
+
+    Keyed by the Runtime the request resolved to, never by the id the caller
+    used: a Runtime can be addressed by a registry record id and by its own
+    id, and a history split across those would let the person who contained
+    it release it under the other name.
+    """
+    return f"CONTAINMENT#{runtime_arn}"
 
 
 def container(events: list[AuditEvent]) -> AuditEvent | None:
-    """The event that names who contained the agent, or ``None`` when the trail shows it released.
+    """The event that names who holds the containment of a Runtime, or ``None`` when nobody does.
 
-    ``events`` is newest first. Only an action that changed something counts: a
-    repeated contain (outcome ``unchanged``) never replaces the original
-    container, so the two-person rule cannot be dodged by containing again. As
-    for submissions, an intent whose result is missing still counts.
+    ``events`` is newest first. The holder is the person a release must not come from.
+
+    - A contain that was allowed names the holder, until a release is allowed after it.
+    - A repeated contain (outcome ``unchanged``) never replaces an earlier holder, so the
+      two-person rule cannot be dodged by containing again. When no holder is on record (the
+      Runtime was contained by other means, or by a request whose result was lost), the first
+      person to assert the containment becomes the holder.
+    - A contain that failed after the statement may have been written (``status_after`` other
+      than ``not_contained``) names a holder too: the statement can be in place.
+    - An intent whose result is missing counts as its result would have.
     """
     results = {e.request_id: e for e in events if e.phase == "result"}
+    asserted: AuditEvent | None = None  # the oldest "unchanged" contain since the last release
     for event in events:
-        if event.action not in ("contain", "release") or event.outcome != "allowed":
+        if event.action not in ("contain", "release"):
             continue
-        if event.phase == "intent" and event.request_id in results:
-            continue  # its result event decides
-        return event if event.action == "contain" else None
-    return None
+        if event.phase == "intent":
+            if event.request_id in results or event.outcome != "allowed":
+                continue  # its result event decides
+        elif event.action == "contain" and event.outcome == "unchanged":
+            asserted = event  # an earlier holder, if there is one, stays the holder
+            continue
+        elif event.action == "contain" and event.outcome == "failed":
+            if event.status_after in (None, "not_contained"):
+                continue  # nothing was written
+            return event
+        elif event.outcome != "allowed":
+            continue
+        return asserted if event.action == "release" else event
+    return asserted
 
 
 def from_item(item: dict[str, Any]) -> AuditEvent:

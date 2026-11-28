@@ -15,7 +15,7 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
-from portal_api import containment_timing, risk
+from portal_api import authorities, containment_timing, risk
 from portal_api import registrations as registration_helpers
 from portal_api.aws import agentcore, cloudwatch, guardrails, logs, omni, pipelines, registry
 from portal_api.aws import audit as audit_reader
@@ -405,8 +405,14 @@ class PortalService:
     def agent_mcp_grants(self, agent_id: str) -> list[AgentMcpGrant]:
         return graph_mapper.agent_mcp_grants(self.agent(agent_id), self.inventory().gateway_index())
 
-    def containment_view(self, agent_id: str, caller_subject: str) -> ContainmentView:
-        """Whether the agent's Runtime is contained (read fresh through the cell reader), by whom, and the events."""
+    def containment_view(self, agent_id: str, caller_subject: str, caller_role: str = "") -> ContainmentView:
+        """Whether the agent's Runtime is contained (read fresh through the cell reader), by whom, and the events.
+
+        Who contained it, why, and the history of attempts are an incident
+        record: they are returned only to a caller whose role can contain or
+        release. Every other mapped role gets the state, when it was
+        contained, and whether the caller is the one who cannot release it.
+        """
         entry = self.agent(agent_id)
         cell = entry.access_cell
         view = ContainmentView(
@@ -433,21 +439,25 @@ class PortalService:
             view.state = "unknown" if state is None else ("contained" if state else "not_contained")
             if state is None:
                 view.detail = "The Runtime's resource policy could not be read."
-        if self.settings.audit_table:
+        if self.settings.audit_table and entry.runtime_arn:
             dynamodb = self.clients.platform("dynamodb", self.settings.registry_region)
-            view.events = audit_reader.query_events(
-                dynamodb, self.settings.audit_table, audit_reader.containment_key(entry.agent.id)
+            # The history belongs to the Runtime, whatever id the agent is listed under.
+            events = audit_reader.query_events(
+                dynamodb, self.settings.audit_table, audit_reader.containment_key(entry.runtime_arn)
             )
-            holder = audit_reader.container(view.events)
+            incident_reader = caller_role in (authorities.CONTAIN_ROLES | authorities.RELEASE_ROLES)
+            holder = audit_reader.container(events)
             if holder is not None and view.state != "not_contained":
-                view.contained_by, view.contained_by_label = holder.actor_subject, holder.actor_label
-                view.contained_at, view.reason = holder.at, holder.reason
+                view.contained_at = holder.at
                 view.contained_by_me = holder.actor_subject == caller_subject
-                result = next(
-                    (e for e in view.events if e.request_id == holder.request_id and e.phase == "result"), None
-                )
+                result = next((e for e in events if e.request_id == holder.request_id and e.phase == "result"), None)
                 # Partial: sessions were left running, or their discovery was not clean.
                 view.partial = result is None or bool(result.sessions_failed) or result.detail not in (None, "ok")
+                if incident_reader:
+                    view.contained_by, view.contained_by_label = holder.actor_subject, holder.actor_label
+                    view.reason = holder.reason
+            if incident_reader:
+                view.events = events
         return view
 
     # --- traces and metrics --------------------------------------------------
