@@ -108,8 +108,9 @@ class FakeLogs:
 def test_capture_records_only_what_the_stack_owns():
     plan = teardown.capture(FakeCloudFormation(), STACK)
     assert plan.buckets == ["portal-access-logs", "portal-content"]
-    assert plan.functions == ["portal-api-fn", "portal-provider-fn"]
-    assert plan.log_groups == ["/aws/lambda/portal-api-fn", "/aws/lambda/portal-provider-fn"]
+    # A function that an earlier attempt already deleted is kept: its service log group outlives it.
+    assert plan.functions == ["already-gone", "portal-api-fn", "portal-provider-fn"]
+    assert plan.log_groups == ["/aws/lambda/already-gone", "/aws/lambda/portal-api-fn", "/aws/lambda/portal-provider-fn"]
     assert any("pool-1" in line for line in plan.retained)
     assert not any("some-role" in line for line in plan.lines())
 
@@ -152,7 +153,7 @@ def test_a_clean_delete_empties_nothing_and_removes_the_service_log_groups():
     teardown.execute(plan, cloudformation, s3, logs, sleep=lambda _s: None, report=lambda _m: None)
     assert len(cloudformation.deletes) == 1
     assert s3.emptied == []
-    assert logs.deleted == ["/aws/lambda/portal-api-fn", "/aws/lambda/portal-provider-fn"]
+    assert logs.deleted == ["/aws/lambda/already-gone", "/aws/lambda/portal-api-fn", "/aws/lambda/portal-provider-fn"]
 
 
 def test_a_failed_delete_empties_the_captured_buckets_and_retries_with_the_same_role():
@@ -181,7 +182,7 @@ def test_missing_buckets_and_log_groups_are_tolerated():
     logs = FakeLogs(missing=("/aws/lambda/portal-api-fn",))
     plan = teardown.capture(cloudformation, STACK)
     teardown.execute(plan, cloudformation, s3, logs, sleep=lambda _s: None, report=lambda _m: None)
-    assert logs.deleted == ["/aws/lambda/portal-provider-fn"]
+    assert logs.deleted == ["/aws/lambda/already-gone", "/aws/lambda/portal-provider-fn"]
 
 
 def test_a_stack_stuck_in_progress_times_out():
@@ -190,3 +191,87 @@ def test_a_stack_stuck_in_progress_times_out():
     plan = teardown.capture(cloudformation, STACK)
     with pytest.raises(teardown.TeardownError, match="still DELETE_IN_PROGRESS"):
         teardown.execute(plan, cloudformation, FakeS3(), FakeLogs(), sleep=lambda _s: None, timeout=30, report=lambda _m: None)
+
+
+MAPPING = {
+    "ResourceType": "AWS::Lambda::EventSourceMapping",
+    "LogicalResourceId": "SweeperFunctionSqsEventSource",
+    "PhysicalResourceId": "11111111-2222-4333-8444-555555555555",
+    "ResourceStatus": "DELETE_FAILED",
+}
+
+
+class StackWithMapping(FakeCloudFormation):
+    """A stack whose event source mapping is reported as not deleted until it is left out."""
+
+    def __init__(self, status: str = "CREATE_COMPLETE"):
+        super().__init__()
+        self.status = status
+
+    def get_paginator(self, name):
+        assert name == "list_stack_resources"
+        return Paginator([{"StackResourceSummaries": [*RESOURCES, MAPPING]}])
+
+    def delete_stack(self, **kwargs):
+        self.deletes.append(kwargs)
+        left_out = kwargs.get("RetainResources") == [MAPPING["LogicalResourceId"]]
+        self.status = "DELETE_COMPLETE" if left_out else "DELETE_FAILED"
+
+
+class FakeFunctions:
+    def __init__(self, existing: tuple[str, ...] = (), denied: bool = False):
+        self.existing = set(existing)
+        self.denied = denied
+        self.asked: list[str] = []
+
+    def get_event_source_mapping(self, UUID):  # noqa: N803
+        self.asked.append(UUID)
+        if self.denied:
+            raise RuntimeError("AccessDeniedException")
+        if UUID not in self.existing:
+            raise RuntimeError("An error occurred (ResourceNotFoundException)")
+        return {"UUID": UUID, "State": "Enabled"}
+
+
+def test_a_mapping_that_is_gone_but_reported_as_failed_is_left_out_of_the_next_attempt():
+    cloudformation, functions = StackWithMapping(), FakeFunctions()
+    plan = teardown.capture(cloudformation, STACK)
+    said: list[str] = []
+    teardown.execute(
+        plan, cloudformation, FakeS3(), FakeLogs(), role_arn="arn:aws:iam::111111111111:role/scoped",
+        sleep=lambda _s: None, report=said.append, functions=functions,
+    )
+    # The first attempt names nothing: CloudFormation accepts the list only for a failed delete.
+    assert "RetainResources" not in cloudformation.deletes[0]
+    assert cloudformation.deletes[1]["RetainResources"] == [MAPPING["LogicalResourceId"]]
+    assert all(call["RoleARN"].endswith("role/scoped") for call in cloudformation.deletes)
+    assert len(cloudformation.deletes) == 2
+    assert functions.asked == [MAPPING["PhysicalResourceId"]]
+    assert any("no longer exist" in line for line in said)
+
+
+@pytest.mark.parametrize("functions", [FakeFunctions(existing=(MAPPING["PhysicalResourceId"],)), FakeFunctions(denied=True)])
+def test_a_mapping_that_still_exists_or_cannot_be_read_is_never_left_out(functions):
+    cloudformation = StackWithMapping()
+    plan = teardown.capture(cloudformation, STACK)
+    with pytest.raises(teardown.TeardownError, match="could not be deleted"):
+        teardown.execute(
+            plan, cloudformation, FakeS3(), FakeLogs(), attempts=3, sleep=lambda _s: None, report=lambda _m: None, functions=functions
+        )
+    assert all("RetainResources" not in call for call in cloudformation.deletes)
+
+
+def test_a_stack_already_left_in_a_failed_delete_is_checked_before_the_first_attempt():
+    cloudformation, functions = StackWithMapping(status="DELETE_FAILED"), FakeFunctions()
+    plan = teardown.capture(cloudformation, STACK)
+    teardown.execute(plan, cloudformation, FakeS3(), FakeLogs(), sleep=lambda _s: None, report=lambda _m: None, functions=functions)
+    assert len(cloudformation.deletes) == 1
+    assert cloudformation.deletes[0]["RetainResources"] == [MAPPING["LogicalResourceId"]]
+
+
+def test_without_a_lambda_client_nothing_is_ever_left_out():
+    cloudformation = StackWithMapping()
+    plan = teardown.capture(cloudformation, STACK)
+    with pytest.raises(teardown.TeardownError):
+        teardown.execute(plan, cloudformation, FakeS3(), FakeLogs(), attempts=2, sleep=lambda _s: None, report=lambda _m: None)
+    assert all("RetainResources" not in call for call in cloudformation.deletes)

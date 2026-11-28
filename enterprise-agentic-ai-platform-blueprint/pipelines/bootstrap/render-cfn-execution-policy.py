@@ -1480,7 +1480,6 @@ def portal_policy(account: str, region: str) -> dict[str, Any]:
                     "lambda:CreateEventSourceMapping",
                     "lambda:UpdateEventSourceMapping",
                     "lambda:DeleteEventSourceMapping",
-                    "lambda:GetEventSourceMapping",
                 ],
                 "Resource": "*",
                 "Condition": {
@@ -1497,6 +1496,18 @@ def portal_policy(account: str, region: str) -> dict[str, Any]:
                 "Effect": "Allow",
                 "Action": ["lambda:TagResource", "lambda:UntagResource", "lambda:ListTags"],
                 "Resource": arn("lambda", region, account, "event-source-mapping:*"),
+            },
+            {
+                # CloudFormation reads a mapping back after deleting it, and
+                # the delete finishes only when that read answers "not found".
+                # For a mapping that no longer exists Lambda authorizes the
+                # read against "*" (measured: a statement on the mapping ARN
+                # pattern, and one conditioned on the function, were both
+                # refused), so this read-only action is not scoped.
+                "Sid": "ReadEventSourceMappings",
+                "Effect": "Allow",
+                "Action": "lambda:GetEventSourceMapping",
+                "Resource": "*",
             },
             {
                 "Sid": "PortalDistribution",

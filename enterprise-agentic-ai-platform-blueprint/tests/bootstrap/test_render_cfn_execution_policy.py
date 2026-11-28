@@ -1086,12 +1086,22 @@ def test_portal_policy_manages_the_sweep_queue_without_touching_its_messages() -
             "lambda:FunctionArn": f"arn:aws:lambda:{REGION}:{PLATFORM}:function:AgenticAI-AgentFactoryPor*"
         }
     }
-    assert all(action.endswith("EventSourceMapping") for action in mapping["Action"])
+    assert sorted(mapping["Action"]) == [
+        "lambda:CreateEventSourceMapping",
+        "lambda:DeleteEventSourceMapping",
+        "lambda:UpdateEventSourceMapping",
+    ]
     # Tags of a mapping, and nothing else of Lambda, on every mapping: found by deploying, where
     # CloudFormation's tagging of the new mapping was refused.
     tags = statements["PortalSweeperEventSourceTags"]
     assert tags["Resource"] == f"arn:aws:lambda:{REGION}:{PLATFORM}:event-source-mapping:*"
     assert sorted(tags["Action"]) == ["lambda:ListTags", "lambda:TagResource", "lambda:UntagResource"]
+    # Also found by deploying, twice: on a delete CloudFormation reads the mapping back, and for
+    # a mapping that is gone Lambda authorizes that read against "*". Scoped to the function, or
+    # to the mapping ARN pattern, the read was refused and the stack ended in DELETE_FAILED.
+    read = statements["ReadEventSourceMappings"]
+    assert read["Action"] == "lambda:GetEventSourceMapping"
+    assert read["Resource"] == "*" and "Condition" not in read
 
 
 def test_portal_cell_policy_manages_only_the_fleet_reader_role() -> None:

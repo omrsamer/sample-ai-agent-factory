@@ -13,6 +13,12 @@ delete empties exactly those buckets and retries. It then removes exactly the
 service log groups of the captured functions. It touches nothing it did not
 capture from the named stack.
 
+One more case: an event source mapping whose delete was reported as failed
+although the mapping is gone (a deployment role that could delete it and
+could not read it back). Such a resource is checked with the caller's own
+credentials and, when it no longer exists, left out of the next attempt so
+that the stack can finish. A mapping that still exists is never left out.
+
     # print the plan, change nothing (default)
     python3 scripts/agent_factory_portal_teardown.py --stack-name AgenticAI-AgentFactoryPortal-nonprod \\
         --expected-account <12-digit id> --region eu-west-1
@@ -69,13 +75,17 @@ def capture(cloudformation: Any, stack_name: str) -> Plan:
     for page in paginator.paginate(StackName=stack_name):
         for resource in page["StackResourceSummaries"]:
             physical = resource.get("PhysicalResourceId")
-            if not physical or resource.get("ResourceStatus") == "DELETE_COMPLETE":
+            if not physical:
                 continue
             kind = resource["ResourceType"]
-            if kind == "AWS::S3::Bucket":
-                plan.buckets.append(physical)
-            elif kind == "AWS::Lambda::Function":
+            if kind == "AWS::Lambda::Function":
+                # Also a function that an earlier, failed attempt already deleted: the log group
+                # the service made for it outlives it, and a second run must still remove it.
                 plan.functions.append(physical)
+            elif resource.get("ResourceStatus") == "DELETE_COMPLETE":
+                continue
+            elif kind == "AWS::S3::Bucket":
+                plan.buckets.append(physical)
             elif kind in ("AWS::Cognito::UserPool", "AWS::DynamoDB::Table"):
                 plan.retained.append(f"{kind} {physical} (only when the stack was deployed to retain data)")
     plan.buckets.sort()
@@ -104,6 +114,23 @@ def empty_bucket(s3: Any, bucket: str) -> int:
             s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
             removed += len(batch)
     return removed
+
+
+def gone_event_source_mappings(cloudformation: Any, functions: Any, stack_name: str) -> list[str]:
+    """Logical ids of the stack's event source mappings whose delete failed and that no longer exist."""
+    gone: list[str] = []
+    for page in cloudformation.get_paginator("list_stack_resources").paginate(StackName=stack_name):
+        for resource in page["StackResourceSummaries"]:
+            if resource["ResourceType"] != "AWS::Lambda::EventSourceMapping":
+                continue
+            if resource.get("ResourceStatus") != "DELETE_FAILED" or not resource.get("PhysicalResourceId"):
+                continue
+            try:
+                functions.get_event_source_mapping(UUID=resource["PhysicalResourceId"])
+            except Exception as error:  # noqa: BLE001 - only "not found" means it is gone
+                if "ResourceNotFound" in str(error):
+                    gone.append(resource["LogicalResourceId"])
+    return sorted(gone)
 
 
 def stack_status(cloudformation: Any, stack_name: str) -> str:
@@ -145,14 +172,22 @@ def execute(
     sleep: Callable[[float], None] = time.sleep,
     timeout: float = 1800.0,
     report: Callable[[str], None] = print,
+    functions: Any = None,
 ) -> None:
-    kwargs = {"StackName": plan.stack_name, **({"RoleARN": role_arn} if role_arn else {})}
+    kwargs: dict[str, Any] = {"StackName": plan.stack_name, **({"RoleARN": role_arn} if role_arn else {})}
+    # Whether the stack is already in DELETE_FAILED decides if CloudFormation accepts a list of
+    # resources to leave out, so look before the first attempt as well.
+    failed_before = plan.status == "DELETE_FAILED"
     for attempt in range(1, attempts + 1):
-        cloudformation.delete_stack(**kwargs)
+        gone = gone_event_source_mappings(cloudformation, functions, plan.stack_name) if functions and failed_before else []
+        if gone:
+            report(f"  leaving out {len(gone)} event source mapping(s) that no longer exist: {', '.join(gone)}")
+        cloudformation.delete_stack(**kwargs, **({"RetainResources": gone} if gone else {}))
         status = wait_for_delete(cloudformation, plan.stack_name, sleep=sleep, timeout=timeout)
         if status == "DELETE_COMPLETE":
             report(f"stack deleted (attempt {attempt})")
             break
+        failed_before = True
         report(f"delete attempt {attempt} failed; emptying the stack's own buckets")
         for bucket in plan.buckets:
             removed = empty_bucket(s3, bucket)
@@ -197,7 +232,14 @@ def main(argv: list[str] | None = None) -> int:
         print("dry run: nothing was changed (pass --execute after reviewing the plan)")
         return 0
     try:
-        execute(plan, cloudformation, session.client("s3"), session.client("logs"), role_arn=args.role_arn)
+        execute(
+            plan,
+            cloudformation,
+            session.client("s3"),
+            session.client("logs"),
+            role_arn=args.role_arn,
+            functions=session.client("lambda"),
+        )
     except TeardownError as error:
         print(f"teardown failed: {error}", file=sys.stderr)
         return 1
