@@ -135,12 +135,34 @@ def sweeps_to_schedule(first_needed: bool) -> tuple[int, ...]:
 # --- the contain a sweep belongs to, as the history holds it -----------------------------------
 
 
+_NUMBERS = re.compile(r"[1-3](,[1-3]){0,2}", re.ASCII)
+
+
+def encode_numbers(numbers: Iterable[int]) -> str | None:
+    """The sweep numbers a contain scheduled, as its result event holds them: "2,3". ``None`` for none."""
+    return ",".join(str(number) for number in sorted(set(numbers))) or None
+
+
+def decode_numbers(value: Any) -> frozenset[int]:
+    """The sweep numbers a result event lists. Anything that is not such a list lists none."""
+    if not isinstance(value, str) or not _NUMBERS.fullmatch(value):
+        return frozenset()
+    return frozenset(int(number) for number in value.split(","))
+
+
 @dataclass(frozen=True)
 class Scheduler:
     """The contain a sweep message names, found in the Runtime's containment history."""
 
     position: int  # where its newest event is among the events that were given (newest first)
     began: dt.datetime  # the time of its oldest event among them: its intent, when that was read
+    # The sweep numbers its result says it scheduled. ``None`` when the history holds no such
+    # list: the contain has left no result (yet), or its result was written before results held one.
+    numbers: frozenset[int] | None = None
+    has_result: bool = False
+    # The id the contain was addressed with, as its own events carry it: a registry record id or
+    # the Runtime id. The sweep's event carries the same, whatever a message says.
+    agent_id: str | None = None
 
 
 def scheduler(events: Sequence[Any], request_id: str) -> Scheduler | None:
@@ -173,7 +195,40 @@ def scheduler(events: Sequence[Any], request_id: str) -> Scheduler | None:
     times = [at for _, event in own if (at := parse_instant(event.at)) is not None]
     if not times:
         return None
-    return Scheduler(position=own[0][0], began=min(times))
+    numbers = None
+    if result is not None and result.sweeps_scheduled_numbers is not None:
+        numbers = decode_numbers(result.sweeps_scheduled_numbers)
+    return Scheduler(
+        position=own[0][0],
+        began=min(times),
+        numbers=numbers,
+        has_result=result is not None,
+        agent_id=next((event.agent_id for _, event in own if event.agent_id), None),
+    )
+
+
+def admits(contain: Scheduler, number: int) -> bool | None:
+    """Whether the contain scheduled sweep ``number``. ``None`` when its history does not say yet.
+
+    A contain's result lists the sweeps it scheduled, and only those are
+    admitted: a first sweep for a contain that needed none would run at
+    once and count as one of its sweeps, so that the view would show a
+    sweep as done that has not run.
+
+    Without a result the list is not known. The second and third sweep are
+    scheduled by every contain, so they are admitted. The first is not
+    (``None``): its contain may still be writing its result, and the
+    sweeper waits for it. A result that never comes was lost, and a first
+    sweep is then not admitted.
+
+    A result written before results held the list admits every number, as
+    the sweeper did when that contain was made.
+    """
+    if contain.numbers is not None:
+        return number in contain.numbers
+    if contain.has_result:
+        return True
+    return None if number == SWEEP_NUMBERS[0] else True
 
 
 def _is_contain(event: Any, request_id: str) -> bool:

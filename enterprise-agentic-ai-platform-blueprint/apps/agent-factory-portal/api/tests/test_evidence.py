@@ -36,7 +36,7 @@ from portal_api.models.wire import (
     RiskReason,
 )
 from portal_api.reviews import Attestation
-from tests import test_api
+from tests import test_api, tokens
 from tests.conftest import (
     BASE_ENV,
     CELL_ACCOUNT,
@@ -232,12 +232,14 @@ def test_a_full_document_for_a_registered_agent():
             audit_event("contain", "2026-05-01T08:00:00.000001Z", phase="intent", agent_id="recAgent0001"),
         ],
     )
+    latest = attestation("2026-05-20T10:00:00.000001Z", "2027-05-20")
     document = build(
         decisions=decisions,
         attestations=[
-            attestation("2026-05-20T10:00:00.000001Z", "2027-05-20"),
+            latest,
             attestation("2026-01-20T10:00:00.000001Z", "2026-07-20", who="Earlier Reviewer", kind="approval"),
         ],
+        latest_attestation=latest,
         containment=contained,
         gateways=[gateway_policies()],
         release=release_run(),
@@ -537,18 +539,29 @@ def test_without_an_attestation_the_registrations_own_date_is_the_effective_one(
 
 
 def test_the_source_says_whether_the_date_comes_from_a_review_an_approval_or_the_registration():
-    approved = build(attestations=[attestation("2026-05-20T10:00:00.000001Z", "2027-05-20", kind="approval")]).reviews
+    approval = attestation("2026-05-20T10:00:00.000001Z", "2027-05-20", kind="approval")
+    approved = build(attestations=[approval], latest_attestation=approval).reviews
     assert (approved.effective_review_by, approved.source) == ("2027-05-20", "approval")
     assert [a.kind for a in approved.attestations] == ["approval"]
     # A later review after an approval: the review decides, and both are listed oldest first.
-    both = build(
-        attestations=[
-            attestation("2026-06-01T10:00:00.000001Z", "2027-06-01"),
-            attestation("2026-05-20T10:00:00.000001Z", "2027-05-20", kind="approval"),
-        ]
-    ).reviews
+    review = attestation("2026-06-01T10:00:00.000001Z", "2027-06-01")
+    both = build(attestations=[review, approval], latest_attestation=review).reviews
     assert (both.effective_review_by, both.source) == ("2027-06-01", "attestation")
     assert [a.kind for a in both.attestations] == ["approval", "review"]
+
+
+def test_the_review_date_is_the_inventorys_whatever_the_document_lists():
+    """The date, its source and ``overdue`` describe the moment the agent and risk sections describe."""
+    approval = attestation("2026-05-20T10:00:00.000001Z", "2027-05-20", kind="approval")
+    review = attestation("2026-06-01T10:00:00.000001Z", "2027-06-01")
+    # A review is among the events read for the document, and the inventory was assessed before it.
+    lagging = build(attestations=[review, approval], latest_attestation=approval).reviews
+    assert (lagging.effective_review_by, lagging.source) == ("2027-05-20", "approval")
+    assert [a.next_review_by for a in lagging.attestations] == ["2027-05-20", "2027-06-01"]
+    # The inventory holds none (they could not be read): the registration's own date, as the agent list shows.
+    unread = build(attestations=[review, approval]).reviews
+    assert (unread.effective_review_by, unread.source) == ("2099-12-31", "registration")
+    assert len(unread.attestations) == 2
 
 
 def test_a_configured_account_alias_is_used_instead_of_the_masked_account():
@@ -737,7 +750,15 @@ def test_decisions_reviews_and_containment_events_come_from_the_audit_trail(back
     put("RECORD#NAME#agent-ws1-travel-agent-nonprod", "create", "2026-01-10T09:00:00.000001Z", record_id=None)
     put("RECORD#recAgent0001", "submit", "2026-01-11T09:00:00.000001Z")
     put("RECORD#recAgent0001", "approve", "2026-01-12T09:00:00.000001Z")
-    put("RECORD#recAgent0001", "review", "2026-01-13T09:00:00.000002Z", next_review_by="2027-01-13")
+    # A review's result event names its attestation: the same request id, and the time it was attested.
+    put(
+        "RECORD#recAgent0001",
+        "review",
+        "2026-01-13T09:00:00.000002Z",
+        next_review_by="2027-01-13",
+        request_id="req-review",
+        attested_at="2026-01-13T09:00:00.000001Z",
+    )
     put("RECORD#recOther00001", "approve", "2026-01-12T09:00:00.000001Z", record_id="recOther00001")
     put(audit_reader.containment_key(RUNTIME_ARN), "contain", "2026-01-14T09:00:00.000001Z", agent_id="recAgent0001")
     # An event filed under the agent's id, as before the history followed the Runtime, is not read.
@@ -760,7 +781,10 @@ def test_decisions_reviews_and_containment_events_come_from_the_audit_trail(back
     assert [e["action"] for e in body["decisions"]] == ["create", "submit", "approve", "review"]
     assert body["decisions"][-1]["next_review_by"] == "2027-01-13"
     assert body["reviews"]["effective_review_by"] == "2027-01-13" and body["reviews"]["source"] == "attestation"
-    assert [a["reviewed_by_label"] for a in body["reviews"]["attestations"]] == ["Ann Approver"]
+    # Listed once, although both the record's history and the inventory name it.
+    assert [(a["reviewed_by_label"], a["at"]) for a in body["reviews"]["attestations"]] == [
+        ("Ann Approver", "2026-01-13T09:00:00.000001Z")
+    ]
     assert [e["action"] for e in body["containment"]["events"]] == ["contain"]
     # The policy is not contained (the fake Runtime has no policy), so nobody is named as holding it.
     assert body["containment"]["state"] == "not_contained" and body["containment"]["contained_by"] is None
@@ -890,7 +914,6 @@ ENVIRONMENT = {
     "API_KEY": "key-value-do-not-leak-either",
 }
 EXTERNAL_ID = "portal-ext-id"
-TOKEN = "eyJhbGciOiJSUzI1NiJ9.caller-token-payload.signature-marker"  # noqa: S105 - a marker, not a credential
 
 
 @pytest.fixture
@@ -949,8 +972,10 @@ def test_the_document_holds_no_environment_value_no_external_id_and_no_token(liv
     service, control = live_shaped
     app = create_app()
     app.dependency_overrides[deps.get_service] = lambda: service
+    # The caller's own token, which the read API verifies and which must not end up in the document.
+    token = tokens.for_claims(PLATFORM_CLAIMS)
     request = event(
-        "/agents/recAgent0001/evidence", "GET", PLATFORM_CLAIMS, headers={"authorization": f"Bearer {TOKEN}"}
+        "/agents/recAgent0001/evidence", "GET", PLATFORM_CLAIMS, headers={"authorization": f"Bearer {token}"}
     )
     response = Mangum(app, lifespan="off")(request, None)
     assert response["statusCode"] == 200
@@ -968,7 +993,8 @@ def test_the_document_holds_no_environment_value_no_external_id_and_no_token(liv
     for name, value in ENVIRONMENT.items():
         assert value not in haystack, f"the value of {name} is in the evidence"
     assert EXTERNAL_ID not in haystack
-    assert TOKEN not in haystack and "Bearer" not in haystack and TOKEN.split(".")[1] not in haystack
+    assert token not in haystack and "Bearer" not in haystack
+    assert not [part for part in token.split(".") if part in haystack]
     # Nor the roles the portal assumes, nor the text of a policy.
     assert "agenticai-portal-reader" not in haystack and "agenticai-portal-containment" not in haystack
     assert "permit(" not in haystack
@@ -1052,7 +1078,7 @@ def test_a_decision_after_the_cached_assessment_is_reflected_in_every_section(ba
     # The registration is approved, reviewed and retired. The inventory in the cache is from before.
     reads = registry_holds(monkeypatch, tool_record("tool-echo"), agent_record("DEPRECATED"))
     decided(table, "approve", "APPROVED")
-    decided(table, "review", "APPROVED", next_review_by="2027-06-01")
+    decided(table, "review", "APPROVED", next_review_by="2027-06-01", request_id="req-review")
     audit_writer.put_attestation(
         table,
         TABLE,

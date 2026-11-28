@@ -621,7 +621,7 @@ def test_the_keys_are_fetched_from_the_issuer_once_for_many_requests(registratio
     assert issuer_keys.fetched == [JWKS_URL]  # where Amazon Cognito publishes a user pool's keys
 
 
-def test_the_three_action_functions_verify_and_the_read_api_does_not(registration, containment):
+def test_the_three_action_functions_and_the_read_api_all_verify_the_token_themselves(registration, containment):
     garbage = "Bearer not-a-token"
     assert send(registration, *CREATE, authorization=garbage, body=BODY)[0] == 401
     assert (
@@ -629,20 +629,22 @@ def test_the_three_action_functions_verify_and_the_read_api_does_not(registratio
     )
     path = f"/agents/{containment.record_id}/containment/contain"
     assert send(containment, "containment", "POST", path, authorization=garbage, body={"reason": "x"})[0] == 401
-    # The read API stays on the API Gateway authorizer: it takes the caller from the event and
-    # does not look at the header.
+    # The read API does the same: the claims in the event beside a token it cannot verify count for nothing.
     registration.monkeypatch.delenv("PORTAL_ACTION_ROLE", raising=False)
     request = event("/registrations", "GET", VIEW, headers={"authorization": garbage})
-    assert registration.handlers["read"](request, None)["statusCode"] == 200
+    assert registration.handlers["read"](request, None)["statusCode"] == 401
+    assert registration.handlers["read"](event("/registrations", "GET", VIEW), None)["statusCode"] == 200
+    # One function says who the caller is, for all four.
     script = (
         "import sys, handler\n"
-        "outside = ('jwt', 'cryptography')\n"
-        "loaded = [m for m in sys.modules if m.split('.')[0] in outside or m.endswith('identity.verify')]\n"
-        "assert not loaded, loaded\n"
+        "assert 'portal_api.identity.verify' in sys.modules\n"
+        "assert not [m for m in sys.modules if m.startswith('portal_api.actions')]\n"
         "print('ok')\n"
     )
     result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True, text=True, check=False)  # noqa: S603
     assert result.returncode == 0 and result.stdout.strip() == "ok", result.stderr
+    assert actions_app.action_principal.__module__ == "portal_api.actions.app"
+    assert "principal_from_request(request, settings)" in Path(actions_app.__file__).read_text()
 
 
 def test_a_verified_boolean_claim_is_read_as_one(registration):
@@ -865,9 +867,11 @@ def test_the_documents_state_what_is_checked_and_what_is_not_covered():
         "`PORTAL_JWT_AUDIENCE`",
         "`PORTAL_JWT_TOKEN_USE`",
         "`PORTAL_JWKS_URL`",
-        # What it does not cover, said plainly.
+        # Every function that has a caller verifies the token; what that does not cover, said plainly.
+        "**No function takes the caller from the invocation event.**",
+        "The read API verifies the caller's bearer token itself",
         "which is not signed",
-        "The read API** still trusts the claims API Gateway passes",
+        "**Invoking a function directly.**",
         "A token is accepted until it expires",
         # Who a person is, and what a record shows beside it.
         "The subject is the identity",
@@ -880,6 +884,7 @@ def test_the_documents_state_what_is_checked_and_what_is_not_covered():
     ):
         assert said in readme, said
     assert "an identifier the person cannot change" not in readme
+    assert "still trusts the claims" not in readme and "takes the caller from the claims" not in readme
     assert (verify.MAX_KEY_AGE_SECONDS, verify.RETRY_EMPTY_SECONDS) == (48 * 60 * 60, 5)
     contract = " ".join((ROOT / "ACTIONS_CONTRACT.md").read_text().split())
     assert "Never the display name" in contract and "The functions verify the token themselves" in contract

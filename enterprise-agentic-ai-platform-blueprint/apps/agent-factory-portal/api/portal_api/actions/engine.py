@@ -12,6 +12,12 @@ For one action on one record:
    otherwise fill another tenant's history, which is never shortened).
 2. The record's status is checked. A status that does not permit the action is written to the
    audit trail as denied and answered with 409.
+
+   A refusal of either kind is written once for each person, rule and state of the record
+   (its status and the document it holds), and so is an answer that nothing was changed.
+   Repeated, it is logged. A person who has a part in a record could otherwise lengthen its
+   history with every request, and the decisions that read the history back to the record's
+   last submit would fail closed (``ActionEngine.deny``).
 3. An ``intent`` event is written. If that write fails, nothing is done and the answer is 503.
 4. The registry call is made.
 5. A ``result`` event is written: ``allowed`` with the new status, or ``failed`` with the error
@@ -26,9 +32,11 @@ step 4 is the write of the attestation itself.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
+import re
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,6 +66,33 @@ SUBMITTER_NOT_FOUND = (
 )
 
 
+# A rule's id as the refusals carry it, for example REG-11-N or REV-06-N.
+_RULE_ID = re.compile(r"\b[A-Z]{2,5}-[0-9]{2}-[A-Z]\b", re.ASCII)
+FIRST, REPEATED, NOT_KNOWN = "first", "repeated", "not_known"
+
+
+def rule_of(reason: str) -> str:
+    """What a refusal is filed under when it is recorded once: its rule.
+
+    The rule's id when the reason carries one, so that two refusals by the
+    same rule count as one whatever else their sentences say (a time, a
+    status). A reason with no id is the portal's own fixed sentence, and a
+    hash of it stands for the rule.
+    """
+    found = _RULE_ID.search(reason)
+    return found.group(0) if found else hashlib.sha256(reason.encode()).hexdigest()[:20]
+
+
+def record_state(status: Any, document_sha256: str | None) -> str:
+    """The state of a record that "once" is counted in: its status and the document it holds.
+
+    Both are read from the registry, never from the request: an update is
+    refused for the document the record holds, not for the one the caller
+    proposes, or every new proposal would be a new state.
+    """
+    return f"{status}:{document_sha256 or ''}"
+
+
 class ActionError(Exception):
     """An action was refused or failed; carries the HTTP status and a safe message."""
 
@@ -79,6 +114,9 @@ class Target:
     status_before: str | None = None
     document_sha256: str | None = None
     next_review_by: str | None = None  # a review attestation only
+    # The record as the registry holds it when the action is decided (``record_state``). Empty
+    # for a create, which has no record yet. A refusal is recorded once per person in one state.
+    state: str = ""
 
     @property
     def partition(self) -> str:
@@ -127,9 +165,32 @@ class ActionEngine:
             logger.error("Audit write failed (%s %s %s): %s", event.action, event.phase, event.outcome, error_code(exc))
             return False
 
-    def deny(
-        self, target: Target, status: int, reason: str, *, since: Iterable[AuditEvent] | None = None
-    ) -> ActionError:
+    def _once(self, target: Target, rule: str, request_id: str) -> str:
+        """Whether this is the first time this person meets this rule on the record as it stands.
+
+        ``FIRST``: it is, and it is now marked, so the event that follows is
+        the one on record. ``REPEATED``: it was marked before. ``NOT_KNOWN``:
+        the mark could not be written. Nothing is written into the history
+        then either: without the mark a repeated request would add an event
+        each time.
+        """
+        try:
+            first = audit_writer.mark_once(
+                self.dynamodb,
+                self.settings.audit_table,
+                target.partition,
+                target.state,
+                self.principal.subject,
+                target.action,
+                rule,
+                request_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - logged; the caller's answer does not depend on it
+            logger.error("Audit mark failed (%s %s): %s", target.action, rule, error_code(exc))
+            return NOT_KNOWN
+        return FIRST if first else REPEATED
+
+    def deny(self, target: Target, status: int, reason: str) -> ActionError:
         """Record a denied decision and return the error to raise.
 
         This is the only place a refusal is written, and it writes only for
@@ -137,37 +198,35 @@ class ActionEngine:
         refusal of anyone else is logged (``refuse_unrecorded``), whatever
         the flow that asked for it to be recorded.
 
-        ``since``, when a flow has read them, are the record's events since
-        the one the refusal depends on. The same refusal of the same person
-        is then written once and logged after that, so that repeating a
-        request does not add an event each time.
+        Such a caller's refusal is written once for each person, rule and
+        state of the record, and logged after that (``_once``). Otherwise an
+        approver of the record's own tenant could repeat a refused approval
+        two thousand times in little more than a minute, and approve, reject
+        and review, which read the history back to the record's last
+        submit, would fail closed until it is submitted again.
         """
         if not authority.has_part(self.principal, self.settings, target.action, target.tenant_id):
             return self.refuse_unrecorded(target, status, reason)
-        if since is not None and any(
-            event.phase == "result"
-            and event.outcome == "denied"
-            and event.action == target.action
-            and event.actor_subject == self.principal.subject
-            and event.reason == reason[:1000]
-            for event in since
-        ):
-            return self.refuse_unrecorded(target, status, reason)
         request_id = audit_writer.new_request_id()
+        if self._once(target, rule_of(reason), request_id) != FIRST:
+            return self.refuse_unrecorded(target, status, reason, request_id=request_id)
         self._write(target, self._event(target, request_id, "result", "denied", reason))
         return ActionError(status, reason, action=target.action, request_id=request_id)
 
-    def refuse_unrecorded(self, target: Target, status: int, reason: str) -> ActionError:
+    def refuse_unrecorded(
+        self, target: Target, status: int, reason: str, *, request_id: str | None = None
+    ) -> ActionError:
         """A refusal that is logged, not written to the audit trail, and the error to raise.
 
-        For a refusal that comes before any record is resolved, and for one
-        of a caller who has no part in the record. The first would be keyed
-        by an id or a name the caller chose; the second would let any
-        signed-in user fill the history of another tenant's record. The
-        function's log keeps the attempt, and the answer carries the same
-        ``request_id``.
+        For a refusal that comes before any record is resolved, for one of
+        a caller who has no part in the record, and for one that is on
+        record already. The first would be keyed by an id or a name the
+        caller chose; the second would let any signed-in user fill the
+        history of another tenant's record; the third would add an event
+        with every repeat. The function's log keeps the attempt, and the
+        answer carries the same ``request_id``.
         """
-        request_id = audit_writer.new_request_id()
+        request_id = request_id or audit_writer.new_request_id()
         logger.warning(
             "Refusal logged, not written to the audit trail: action=%s role=%s subject=%s record=%s "
             "request_id=%s reason=%s",
@@ -181,11 +240,30 @@ class ActionEngine:
         return ActionError(status, reason, action=target.action, request_id=request_id)
 
     def unchanged(self, target: Target, reason: str, registration: Registration | None) -> ActionResult:
-        """Record that an allowed action found nothing to change, and answer without a registry call."""
+        """Record that an allowed action found nothing to change, and answer without a registry call.
+
+        Recorded once for each person and state of the record, like a
+        refusal (``_once``): the answer is the same every time, and a
+        retirement asked for again and again would otherwise add an event
+        each time. Repeated, it is logged, and the trail is complete as it
+        stands.
+        """
         request_id = audit_writer.new_request_id()
-        complete = self._write(
-            target, self._event(target, request_id, "result", "unchanged", reason, target.status_before)
-        )
+        seen = self._once(target, "unchanged", request_id)
+        if seen == FIRST:
+            complete = self._write(
+                target, self._event(target, request_id, "result", "unchanged", reason, target.status_before)
+            )
+        else:
+            logger.warning(
+                "Unchanged answer logged, not written to the audit trail again: action=%s subject=%s record=%s "
+                "request_id=%s",
+                target.action,
+                self.principal.subject,
+                target.record_id or "-",
+                request_id,
+            )
+            complete = seen == REPEATED
         return ActionResult(
             action=target.action,
             outcome="unchanged",

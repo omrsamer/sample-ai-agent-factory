@@ -69,9 +69,18 @@ def body_of(sweep: int = 2, request_id: str = REQUEST_ID) -> str:
     return sweeps.encode(message(sweep=sweep, request_id=request_id))
 
 
-def put(world: SweepWorld, event: AuditEvent, key: str = KEY) -> None:
-    """Put one event straight into the table, as it would be stored."""
-    item = {"pk": {"S": key}, "sk": {"S": f"EVENT#{event.at}#{event.event_id}"}}
+def put(world: SweepWorld, event: AuditEvent, key: str = KEY, prefix: str | None = None) -> None:
+    """Put one event straight into the table, as it would be stored.
+
+    Into the range the functions write it into: a sweep, a refusal and a
+    contain or release that changed nothing among the events that cannot
+    change who holds a containment, every other among those that can.
+    ``prefix`` says otherwise.
+    """
+    if prefix is None:
+        other = event.action == "sweep" or event.outcome in ("denied", "unchanged")
+        prefix = audit_reader.OTHER_PREFIX if other else audit_reader.EVENT_PREFIX
+    item = {"pk": {"S": key}, "sk": {"S": audit_reader.event_sort_key(event, prefix)}}
     item.update({name: {"S": str(value)} for name, value in event.model_dump().items() if value not in (None, "")})
     world.dynamo.items[(key, item["sk"]["S"])] = item
 
@@ -127,7 +136,13 @@ def test_which_contain_can_have_scheduled_a_sweep():
     result = contain_event("result", at=4.0, sweeps_scheduled=2, sessions_found=0)
     # Newest first, as a history is read. The contain began with its intent.
     found = sweeps.scheduler([result, intent], "c-1")
-    assert found == sweeps.Scheduler(position=0, began=dt.datetime(2026, 6, 1, 12, 0, 0, tzinfo=dt.UTC))
+    began = dt.datetime(2026, 6, 1, 12, 0, 0, tzinfo=dt.UTC)
+    # A result with no list of its sweeps is one from before results held one.
+    assert found == sweeps.Scheduler(position=0, began=began, numbers=None, has_result=True, agent_id=None)
+    listed = contain_event("result", at=4.0, sweeps_scheduled=2, sweeps_scheduled_numbers="2,3", agent_id="rec1")
+    assert sweeps.scheduler([listed, contain_event("intent", agent_id="rec1")], "c-1") == sweeps.Scheduler(
+        position=0, began=began, numbers=frozenset({2, 3}), has_result=True, agent_id="rec1"
+    )
     # Below newer events it is found where it is.
     newer = contain_event("result", "denied", request_id="c-2", at=9.0)
     assert sweeps.scheduler([newer, result, intent], "c-1").position == 1
@@ -135,7 +150,7 @@ def test_which_contain_can_have_scheduled_a_sweep():
     assert sweeps.scheduler([contain_event("result", "unchanged", sweeps_scheduled=3), intent], "c-1") is not None
     # No result yet, or a result that was lost: the intent is enough. The first sweep can arrive
     # before the contain has written its result.
-    assert sweeps.scheduler([intent], "c-1") == sweeps.Scheduler(0, found.began)
+    assert sweeps.scheduler([intent], "c-1") == sweeps.Scheduler(0, found.began, None, False, None)
     # The result alone (its intent lies further back than was read): it began no later than that.
     assert sweeps.scheduler([result], "c-1").began == found.began + dt.timedelta(seconds=4)
 
@@ -253,13 +268,16 @@ def test_a_message_whose_request_id_no_contain_scheduled_sweeps_under_is_not_run
     )
 
 
-def test_a_contain_that_has_only_its_intent_on_record_still_has_its_sweeps(world):
-    """The first sweep can arrive before the contain has written its result, and a result can be lost."""
+def test_a_contain_whose_result_was_lost_still_has_the_sweeps_every_contain_schedules(world):
+    """A result can be lost. The second and third sweep are scheduled by every contain; the first is not."""
     contained(world, result=False)
     world.cell.streams[log_group()] = [session_stream("a")]
     run = Run(world)
-    assert run.handle(body_of(1)) == "allowed"
-    assert world.cell.stopped == [(sid("a"), "DEFAULT")] and len(run.sweep_events()) == 1
+    assert run.handle(body_of(2)) == "allowed" and run.handle(body_of(3)) == "allowed"
+    assert world.cell.stopped[0] == (sid("a"), "DEFAULT") and len(run.sweep_events()) == 2
+    # Whether it scheduled a first sweep is what its result would have said. Not known: not run.
+    assert run.handle(body_of(1)) == "not_scheduled"
+    assert len(run.sweep_events()) == 2 and len(world.dynamo.claims()) == 2
 
 
 # --- once -------------------------------------------------------------------------------------------
@@ -295,8 +313,8 @@ def test_a_sweep_is_run_once_however_often_its_message_arrives(world, caplog):
     )
 
 
-def test_whatever_is_sent_the_sweeps_of_one_contain_leave_at_most_three_events(world):
-    """Send and replay everything a sender can think of: the history grows by three events and stops."""
+def test_whatever_is_sent_the_sweeps_of_one_contain_leave_one_event_for_each_sweep_it_scheduled(world):
+    """Send and replay everything a sender can think of: the history grows by the contain's own sweeps and stops."""
     world.cell.streams[log_group()] = [session_stream("a")]
     code, response = world.post("contain", claims=SEC)
     assert code == 200 and response["sweeps_scheduled_in_seconds"] == [120, 900]  # the contain scheduled two
@@ -311,10 +329,10 @@ def test_whatever_is_sent_the_sweeps_of_one_contain_leave_at_most_three_events(w
         outcomes.add(run.handle(test_sweeps.body(sweep=4, request_id=request_id)))
         outcomes.add(run.handle(test_sweeps.body(sweep=0, request_id=request_id)))
         outcomes.add(run.handle(sweeps.encode(message(request_id=str(uuid.uuid4())))))
-    assert outcomes == {"allowed", "repeated", "no_contain", "invalid"}
-    # Three, although the contain scheduled two: a first sweep that nobody scheduled is run once too.
-    assert len(world.dynamo.events()) == events_before + 3
-    assert sorted(e["sweep"] for e in run.sweep_events()) == ["1", "2", "3"]
+    assert outcomes == {"allowed", "repeated", "no_contain", "invalid", "not_scheduled"}
+    # Two: the contain scheduled the second and the third. A first sweep that it did not schedule is not run.
+    assert len(world.dynamo.events()) == events_before + 2
+    assert sorted(e["sweep"] for e in run.sweep_events()) == ["2", "3"]
     assert {e["request_id"] for e in run.sweep_events()} == {request_id}
     # The release is not held up: the person who did not contain it releases it.
     assert world.post("release", claims=PAT)[0] == 200
@@ -493,14 +511,18 @@ def test_a_claim_is_in_no_history_and_changes_no_decision(world, read):
     assert len(world.dynamo.claims()) == 2
     assert {claim["pk"] for claim in world.dynamo.claims()} == {KEY}
     # A read of the history: four events (intent, result, two sweeps), and no claim.
-    trail = audit_reader.read_back(world.dynamo, TABLE, KEY)
-    assert [(e.action, e.phase) for e in trail.events] == [
+    history = audit_reader.read_history(world.dynamo, TABLE, RUNTIME_ARN)
+    assert [(e.action, e.phase) for e in history.events] == [
         ("sweep", "result"),
         ("sweep", "result"),
         ("contain", "result"),
         ("contain", "intent"),
     ]
-    assert trail.ended is True and len(trail.items) == 4
+    # Each of its two ranges read to its end: the contain's events in one, the sweeps in the other.
+    settling = audit_reader.read_back(world.dynamo, TABLE, KEY)
+    other = audit_reader.read_back(world.dynamo, TABLE, KEY, prefix=audit_reader.OTHER_PREFIX)
+    assert (settling.ended, [e.action for e in settling.events]) == (True, ["contain", "contain"])
+    assert (other.ended, [e.action for e in other.events]) == (True, ["sweep", "sweep"])
     # The view lists the same four and counts the sweeps.
     view = read(world.record_id, SRE)[1]
     assert [e["action"] for e in view["events"]] == ["sweep", "sweep", "contain", "contain"]
@@ -641,9 +663,9 @@ def test_a_sweep_is_not_run_before_it_is_due_and_running_it_early_uses_nothing_u
 # --- the read is bounded -------------------------------------------------------------------------------
 
 
-def test_the_history_is_read_back_to_the_contain_and_never_further_than_the_bound(world):
-    contained(world, minutes_ago=600)  # ten hours ago
-    for n in range(2_500):  # and 2,500 events since: refusals, each one second after the last
+def refusals(world: SweepWorld, count: int, prefix: str | None = None) -> None:
+    """``count`` refused releases, each one second after the last, from 500 minutes ago on."""
+    for n in range(count):
         put(
             world,
             AuditEvent(
@@ -658,18 +680,50 @@ def test_the_history_is_read_back_to_the_contain_and_never_further_than_the_boun
                 actor_label="l",
                 actor_role="security",
             ),
+            prefix=prefix,
         )
+
+
+def test_the_history_is_read_back_to_the_contain_and_never_further_than_the_bound(world):
+    contained(world, minutes_ago=600)  # ten hours ago
+    refusals(world, 2_500)  # and 2,500 events since
     recent = again(world, minutes_ago=30)
     run = Run(world)
-    # A contain near the top: one request of one page.
+    # A contain near the top. The events that can change who holds the containment are two, and
+    # they are read to their end; of the others, one request of one page finds the contain.
     assert run.handle(body_of(2, recent)) == "allowed"
-    assert (world.dynamo.pages_read, world.dynamo.items_read) == (1, audit_reader.PAGE_SIZE)
-    # A contain further back than the bound is not found, and an id that nobody has costs the same.
+    assert world.dynamo.prefixes == [(KEY, "EVENT#"), (KEY, "OTHER#")]
+    assert (world.dynamo.pages_read, world.dynamo.items_read) == (2, 2 + audit_reader.PAGE_SIZE)
+    # The contain that holds the Runtime is found at once, and more was recorded since than a sweep
+    # reads back: whether its sweep has run is not known, so it is not run. An id that nobody has
+    # costs the same.
     for request_id in (REQUEST_ID, FORGED):
         world.dynamo.pages_read = world.dynamo.items_read = 0
         assert run.handle(body_of(2, request_id)) == "no_contain"
-        assert world.dynamo.items_read == audit_reader.MAX_DECISION_EVENTS == 2000
-        assert world.dynamo.pages_read == 10
+        assert world.dynamo.items_read == 2 + audit_reader.MAX_DECISION_EVENTS == 2002
+        assert world.dynamo.pages_read == 1 + 10
+    assert len(run.sweep_events()) == 1 and len(world.dynamo.claims()) == 1
+
+
+def test_a_history_written_before_there_were_two_ranges_is_read_the_same_way(world):
+    """Everything in the one range, as it was written then: the same answers and the same bound."""
+    before = audit_reader.EVENT_PREFIX
+    contained(world, minutes_ago=600)
+    refusals(world, 2_500, prefix=before)
+    recent = again(world, minutes_ago=30, prefix=before)
+    run = Run(world)
+    assert run.handle(body_of(2, recent)) == "allowed"
+    assert (world.dynamo.pages_read, world.dynamo.items_read) == (2, audit_reader.PAGE_SIZE)
+    for request_id in (REQUEST_ID, FORGED):
+        world.dynamo.pages_read = world.dynamo.items_read = 0
+        assert run.handle(body_of(2, request_id)) == "no_contain"
+        # The one range to the bound, and the other, which holds the one sweep that has run since.
+        assert world.dynamo.items_read == audit_reader.MAX_DECISION_EVENTS + 1 == 2001
+        assert world.dynamo.pages_read == 10 + 1
+    # The sweep's own event goes where sweeps go now, and is found there by the next delivery.
+    (event,) = run.sweep_events()
+    assert event["sk"].startswith("OTHER#")
+    assert run.handle(body_of(2, recent)) == "repeated"
     assert len(run.sweep_events()) == 1 and len(world.dynamo.claims()) == 1
 
 
@@ -681,7 +735,7 @@ def test_the_documents_say_what_the_sweeper_writes_and_when():
     contract = " ".join((root / "CONTAINMENT_CONTRACT.md").read_text().split())
     for said in (
         "A message that is not valid leaves no event",
-        "at most three events for one contain",
+        "one event for each sweep that the contain scheduled",
         "is not run a second time",
         f"no earlier than {containment_timing.SWEEP_EARLY_TOLERANCE_SECONDS} seconds before it is due",
         "`SWEEP#<request id>#<sweep number>`",
@@ -693,7 +747,7 @@ def test_the_documents_say_what_the_sweeper_writes_and_when():
     for said in ("`SWEEP#<request id>#<sweep number>`", "`dynamodb:Query`", "`CONTAINMENT#*`"):
         assert said in iam, said
     readme = " ".join((root / "README.md").read_text().split())
-    assert "at most three events for one contain" in readme
+    assert "one event for each sweep that the contain scheduled" in readme
 
 
 # === S16: the page of one agent after a decision ========================================================

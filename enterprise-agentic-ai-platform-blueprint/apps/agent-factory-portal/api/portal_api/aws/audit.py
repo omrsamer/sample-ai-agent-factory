@@ -15,11 +15,33 @@ about its record or Runtime. So:
   left out (``newest``).
 
 No function here follows a partition to its end without such a bound.
+
+A Runtime's containment history is kept in two ranges of its partition, and
+every event is written once, into one of them:
+
+- ``EVENT#``: the events that can change who holds the containment. The
+  intent and the result of a contain that writes the statement, of a
+  release that removes it, and of the first contain that finds the
+  statement in place with nobody on record as holding it;
+- ``OTHER#``: every other event. A background sweep, a refusal, a contain
+  of a Runtime that is already contained and held (it stops sessions and
+  schedules sweeps, and changes nothing about who holds it), a release of a
+  Runtime that is not contained, and an attempt that failed before it could
+  change anything.
+
+Who holds a containment is read from the first range alone (``read_holder``,
+``holder``), so that read does not grow with the sweeps and the repeated
+contains of a long incident: one settled contain is followed there by
+nothing until the next contain or release that changes something. A view,
+the sweeper and the check before a contain need both ranges and read them
+as one list (``History``). A history written before there were two ranges
+holds everything in the first, and is read the same way.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -27,7 +49,7 @@ from typing import Any
 from portal_api import sweeps
 from portal_api.mappers.common import parse_instant
 from portal_api.models.portal import AuditEvent
-from portal_api.reviews import KIND_APPROVAL, KIND_REVIEW, Attestation, parse_date
+from portal_api.reviews import KIND_APPROVAL, KIND_REVIEW, Attestation, approval_reason, parse_date
 
 _FIELDS = (
     "event_id",
@@ -54,11 +76,24 @@ _FIELDS = (
     "sessions_stopped",
     "sessions_failed",
     "sweeps_scheduled",
+    "sweeps_scheduled_numbers",
     "sweep",
     "sessions_not_active",
     "duration_ms",
     "detail",
 )
+
+
+# The sort keys of events begin with one of these. In a record's history every event is under the
+# first. In a Runtime's containment history the first holds the events that can change who holds
+# the containment and the second holds every other event (see the module text).
+EVENT_PREFIX = "EVENT#"
+OTHER_PREFIX = "OTHER#"
+
+
+def event_sort_key(event: AuditEvent, prefix: str = EVENT_PREFIX) -> str:
+    """The sort key of one event: its range, its time, its id. Events of one range sort by time."""
+    return f"{prefix}{event.at}#{event.event_id}"
 
 
 def record_key(record_id: str) -> str:
@@ -79,6 +114,23 @@ def containment_key(runtime_arn: str) -> str:
     it release it under the other name.
     """
     return f"CONTAINMENT#{runtime_arn}"
+
+
+def once_sort_key(state: str, subject: str, action: str, rule: str) -> str:
+    """The sort key of the item that says: this is on record, for this person and this state of the record.
+
+    A refusal of someone who has a part in a record is written into the
+    record's history once for each person, rule and state of the record
+    (its status and the document it holds), and so is an answer that
+    nothing was changed. The item under this key is what makes that "once"
+    hold: it is written with the condition that it does not exist, before
+    the event, so that repeating a request adds nothing however often and
+    however fast it is repeated. It lies in the record's own partition and
+    is not an event: no read of a history returns it. The four parts are
+    hashed, so that none of them can run into another.
+    """
+    digest = hashlib.sha256("\x1f".join((state, subject, action, rule)).encode()).hexdigest()
+    return f"ONCE#{digest}"
 
 
 def sweep_claim_sort_key(request_id: str, number: int) -> str:
@@ -111,15 +163,27 @@ def sweep_claim_id(client: Any, table: str, runtime_arn: str, request_id: str, n
     return None
 
 
-# One partition holds every review attestation, so the read API gets them all with one query
-# instead of one per agent. Its sort key is ``EVENT#<UTC timestamp>#<record id>``.
+# One partition holds the latest review attestation of every record, so the read API gets the
+# review date of every agent with one query instead of one per agent. It holds one item for a
+# record, whatever number of attestations the record has had: the item is replaced by a newer
+# attestation of the same record and by nothing else (``audit_writer.put_attestation``). So the
+# partition grows with the number of records, not with the number of approvals and reviews. The
+# attestations themselves, every one of them, are in the record's own history, as the result
+# event that names each (``attestations_in``), and that history is append-only like every other.
 REVIEWS_KEY = "REVIEWS"
-# Each page is at most 1 MB; this bounds the read. Newest first, so only the oldest are left out.
+LATEST_ATTESTATION_PREFIX = "RECORD#"
+# Attestations that were written before there was one item for a record lie under
+# ``EVENT#<UTC timestamp>#<record id>``, one item each. Nothing writes these any more. They are
+# still read, so that a table that holds them keeps its review dates: the latest attestation of
+# a record wins, whichever of the two it is.
+EARLIER_ATTESTATION_PREFIX = "EVENT#"
+# Each page is at most 1 MB; this bounds each of the two reads.
 MAX_ATTESTATION_PAGES = 20
 
 
-def attestation_sort_key(at: str, record_id: str) -> str:
-    return f"EVENT#{at}#{record_id}"
+def latest_attestation_sort_key(record_id: str) -> str:
+    """The sort key of the one item that holds a record's latest attestation."""
+    return f"{LATEST_ATTESTATION_PREFIX}{record_id}"
 
 
 # How many events one request asks for at a time, and the two bounds of a read.
@@ -171,6 +235,11 @@ def holder(events: list[AuditEvent]) -> Holder:
     have been written, or an intent with no result. A result is always newer
     than its intent, so the newest part of a history is enough to tell
     whether an intent has one.
+
+    ``events`` must be events of the range that can settle it (``EVENT#``)
+    and no others. An event of the other range says nothing about who holds
+    the containment, and an intent there whose result was lost must not be
+    taken for a contain or a release that happened.
     """
     results = {e.request_id for e in events if e.phase == "result" and e.action in ("contain", "release")}
     asserted: AuditEvent | None = None  # the oldest "unchanged" contain since the last release
@@ -218,7 +287,7 @@ def _pages(
     *,
     page_size: int | None = None,
     oldest_first: bool = False,
-    prefix: str = "EVENT#",
+    prefix: str = EVENT_PREFIX,
 ) -> Iterator[dict[str, Any]]:
     """The pages of one partition, newest first, with a strongly consistent read.
 
@@ -258,17 +327,19 @@ def read_back(
     max_events: int = MAX_DECISION_EVENTS,
     page_size: int = PAGE_SIZE,
     oldest_first: bool = False,
+    prefix: str = EVENT_PREFIX,
 ) -> Trail:
     """Read one history back from its newest event, a page at a time, and stop as soon as possible.
 
     The read stops when ``enough(events so far)`` is true, when the history
     ends, or when ``max_events`` have been read, whichever comes first. It is
     the only way this module reads a history, so no read is without a bound.
-    ``oldest_first`` reads forward from the oldest event instead.
+    ``oldest_first`` reads forward from the oldest event instead. ``prefix``
+    names the range that is read: one request reads one range.
     """
     items: list[dict[str, Any]] = []
     events: list[AuditEvent] = []
-    for page in _pages(client, table, partition_key, page_size=page_size, oldest_first=oldest_first):
+    for page in _pages(client, table, partition_key, page_size=page_size, oldest_first=oldest_first, prefix=prefix):
         found = page.get("Items") or []
         items.extend(found)
         events.extend(from_item(item) for item in found)
@@ -292,13 +363,15 @@ def newest(client: Any, table: str, partition_key: str, limit: int = MAX_VIEW_EV
 
 
 def read_holder(client: Any, table: str, runtime_arn: str, *, at_least: int = 0) -> tuple[Trail, Holder]:
-    """A Runtime's containment history, read back to the event that settles who holds it.
+    """The events that can settle who holds a Runtime's containment, read back to the one that does.
 
-    ``at_least`` asks for more than that many events when the history has
-    them (a view shows the newest ones). The answer is settled when the
-    holder says ``decided`` or the trail says ``ended``. If neither is true,
-    ``MAX_DECISION_EVENTS`` were read without finding the event: the caller
-    must not treat the holder as known.
+    Only the range that holds those events is read, so the read does not
+    grow with the sweeps and repeated contains recorded since the Runtime
+    was contained. ``at_least`` asks for more than that many events when
+    the range has them (a view shows the newest ones). The answer is
+    settled when the holder says ``decided`` or the trail says ``ended``. If
+    neither is true, ``MAX_DECISION_EVENTS`` were read without finding the
+    event: the caller must not treat the holder as known.
     """
 
     def enough(events: list[AuditEvent]) -> bool:
@@ -308,17 +381,107 @@ def read_holder(client: Any, table: str, runtime_arn: str, *, at_least: int = 0)
     return trail, holder(trail.events)
 
 
-def read_for_sweep(client: Any, table: str, runtime_arn: str, request_id: str) -> Trail:
+@dataclass(frozen=True)
+class History:
+    """A Runtime's containment history as far as it was read: both of its ranges as one list."""
+
+    events: list[AuditEvent]  # newest first
+    # Who holds the containment, decided on the events that can settle it and on no others.
+    # ``current`` counts in ``events``: everything up to and including the event that settled it.
+    holder: Holder
+    # The holder is settled: an event decided it, or the events that can were read to their end.
+    settled: bool
+    # The events since the containment began are not all here: a bound of the read was reached.
+    cut: bool = False
+
+
+def _newest_first(*groups: list[AuditEvent]) -> list[AuditEvent]:
+    """Events of both ranges as one list, in the order each range has on its own: by time, then by id."""
+    return sorted((event for group in groups for event in group), key=lambda e: (e.at, e.event_id), reverse=True)
+
+
+def _history(settling: Trail, other: Trail, cut: bool = False) -> History:
+    """Both ranges as one history. The holder comes from the first alone (``holder``)."""
+    found = holder(settling.events)
+    events = _newest_first(settling.events, other.events)
+    current = len(events)
+    if found.decided:
+        settled_by = settling.events[found.current - 1]
+        current = next(index for index, event in enumerate(events) if event is settled_by) + 1
+    return History(events, Holder(found.event, found.decided, current), found.decided or settling.ended, cut)
+
+
+def _older_than(events: list[AuditEvent], at: str | None) -> bool:
+    """Whether the oldest of these events (the last: they are newest first) is older than ``at``."""
+    return at is not None and bool(events) and events[-1].at < at
+
+
+def read_history(client: Any, table: str, runtime_arn: str, *, at_least: int = 0) -> History:
+    """A Runtime's containment history for a view: who holds it, and the events since.
+
+    The events that can settle the holder are read back to the one that
+    does (``read_holder``). The other events are read back to the time of
+    that event: the sweeps and repeated contains of the containment that
+    holds are all newer. ``at_least`` asks for more than that many events of
+    each range when it has them, so that the newest ``at_least`` of the two
+    together are among them. Each read stops at ``MAX_DECISION_EVENTS``;
+    ``cut`` says when that left out events of the containment that holds.
+    """
+    key = containment_key(runtime_arn)
+    settling, found = read_holder(client, table, runtime_arn, at_least=at_least)
+    began = settling.events[found.current - 1].at if found.decided else None
+
+    def enough(events: list[AuditEvent]) -> bool:
+        return len(events) > at_least and _older_than(events, began)
+
+    other = read_back(client, table, key, enough, page_size=max(PAGE_SIZE, at_least + 1), prefix=OTHER_PREFIX)
+    return _history(settling, other, cut=not other.ended and not _older_than(other.events, began))
+
+
+def read_newest(client: Any, table: str, runtime_arn: str) -> History:
+    """The newest events of a Runtime's containment history: one request for each range, and no more.
+
+    For the check before a contain, which must never wait for a history
+    however long it is. ``settled`` says whether those events were enough to
+    tell who holds the containment.
+    """
+    key = containment_key(runtime_arn)
+    settling = read_back(client, table, key, max_events=PAGE_SIZE)
+    other = read_back(client, table, key, max_events=PAGE_SIZE, prefix=OTHER_PREFIX)
+    return _history(settling, other)
+
+
+def read_for_sweep(client: Any, table: str, runtime_arn: str, request_id: str) -> History:
     """A Runtime's containment history, read back to the intent of the contain with this request id.
 
     The sweeper decides on it whether a sweep message belongs to a contain
     that is on record, whether that sweep has already left its event, and
     whether the contain is part of the containment that holds. Everything
-    that carries the contain's request id is newer than its intent, so the
-    read ends there. A contain that is not among the newest
-    ``MAX_DECISION_EVENTS`` events is not found, and no sweep is run for it.
+    that carries the contain's request id is newer than its intent, so each
+    range is read back to there: the contain is in one of them (the first
+    when it wrote the statement, the second when the Runtime was already
+    contained), and its sweeps are in the second. A contain that is not
+    among the newest ``MAX_DECISION_EVENTS`` events of either range is not
+    found, and no sweep is run for it. ``cut`` says that the contain was
+    found and the events since were not all read: whether one of its sweeps
+    has left its event is then not known.
     """
-    return read_back(client, table, containment_key(runtime_arn), lambda events: sweeps.intent_read(events, request_id))
+    key = containment_key(runtime_arn)
+
+    def named(events: list[AuditEvent]) -> bool:
+        return sweeps.intent_read(events, request_id)
+
+    settling = read_back(client, table, key, named)
+    began = next(
+        (e.at for e in settling.events if e.action == "contain" and e.phase == "intent" and e.request_id == request_id),
+        None,
+    )
+
+    def reached(events: list[AuditEvent]) -> bool:
+        return named(events) or _older_than(events, began)
+
+    other = read_back(client, table, key, reached, prefix=OTHER_PREFIX)
+    return _history(settling, other, cut=not other.ended and not reached(other.events))
 
 
 def read_submitter(client: Any, table: str, record_id: str) -> tuple[AuditEvent | None, bool]:
@@ -365,22 +528,29 @@ def attestation_from_item(item: dict[str, Any]) -> Attestation | None:
 def query_attestations(
     client: Any, table: str, max_pages: int = MAX_ATTESTATION_PAGES
 ) -> tuple[list[Attestation], bool]:
-    """Every review attestation, newest first, and whether the read stopped before the end.
+    """The review attestations the inventory needs, and whether a read stopped before the end.
 
-    The read is bounded to ``max_pages`` pages. Because it runs newest first,
-    a truncated read leaves out only the oldest attestations.
+    Two reads of the one partition. The first returns the latest attestation
+    of every record, one item each, so its size follows the number of
+    records. The second returns the attestations written before there was
+    one item for a record, newest first; nothing adds to those any more.
+    Each read is bounded to ``max_pages`` pages. The caller takes the latest
+    of a record from all that was found (``reviews.by_record``).
     """
     found: list[Attestation] = []
-    read = 0
-    for page in _pages(client, table, REVIEWS_KEY):
-        read += 1
-        for item in page.get("Items") or []:
-            attestation = attestation_from_item(item)
-            if attestation is not None:
-                found.append(attestation)
-        if read >= max_pages:
-            return found, bool(page.get("LastEvaluatedKey"))
-    return found, False
+    truncated = False
+    for prefix in (LATEST_ATTESTATION_PREFIX, EARLIER_ATTESTATION_PREFIX):
+        read = 0
+        for page in _pages(client, table, REVIEWS_KEY, prefix=prefix):
+            read += 1
+            for item in page.get("Items") or []:
+                attestation = attestation_from_item(item)
+                if attestation is not None:
+                    found.append(attestation)
+            if read >= max_pages:
+                truncated = truncated or bool(page.get("LastEvaluatedKey"))
+                break
+    return found, truncated
 
 
 def read_for_review(client: Any, table: str, record_id: str, since: dt.datetime) -> tuple[Trail, bool]:
@@ -425,35 +595,52 @@ def last_review_attempt(events: list[AuditEvent]) -> AuditEvent | None:
 _ATTESTING_ACTIONS = {"review": KIND_REVIEW, "approve": KIND_APPROVAL}
 
 
-def last_review(events: list[AuditEvent]) -> Attestation | None:
-    """The record's latest completed attestation, from its own events. ``events`` is newest first.
+def attestations_in(events: list[AuditEvent]) -> list[Attestation]:
+    """Every completed attestation among a record's own events, the latest first.
 
-    A review counts, and so does an approval that recorded a review date (its
-    result event then names the attestation in ``attested_at``). Only a
-    ``result`` event that says ``allowed`` counts. An intent with no result
-    does not: showing a registration as not yet reviewed is the safe side of
-    a gap in the trail.
+    This is where the history of a record's attestations is kept. A review
+    counts, and so does an approval that recorded a review date (its result
+    event then names the attestation in ``attested_at``). Only a ``result``
+    event that says ``allowed`` counts. An intent with no result does not:
+    showing a registration as not yet reviewed is the safe side of a gap in
+    the trail.
+
+    The latest is the one that was attested last (``attested_at``), which is
+    the one the ``REVIEWS`` partition holds for the record: two attestations
+    made at nearly the same moment can leave their result events in the
+    other order.
     """
+    found: list[Attestation] = []
     for event in events:
         kind = _ATTESTING_ACTIONS.get(event.action)
         if kind is None or event.phase != "result" or event.outcome != "allowed":
             continue
         if kind == KIND_APPROVAL and not event.attested_at:
-            continue  # the approved document named no review date, or the attestation was not written
+            continue  # the attestation of this approval was not written
         if event.record_id and parse_date(event.next_review_by) is not None:
-            return Attestation(
-                record_id=event.record_id,
-                # The attestation's own time, so every view shows the same instant for one review.
-                at=event.attested_at or event.at,
-                next_review_by=str(event.next_review_by),
-                reviewed_by=event.actor_subject,
-                reviewed_by_label=event.actor_label,
-                reviewed_by_role=event.actor_role,
-                reason=event.reason,
-                request_id=event.request_id,
-                kind=kind,
+            found.append(
+                Attestation(
+                    record_id=event.record_id,
+                    # The attestation's own time, so every view shows the same instant for one review.
+                    at=event.attested_at or event.at,
+                    next_review_by=str(event.next_review_by),
+                    reviewed_by=event.actor_subject,
+                    reviewed_by_label=event.actor_label,
+                    reviewed_by_role=event.actor_role,
+                    # As the stored attestation says it (``approver_flow``).
+                    reason=approval_reason(event.reason) if kind == KIND_APPROVAL else event.reason,
+                    request_id=event.request_id,
+                    kind=kind,
+                )
             )
-    return None
+    # Stable, so that of two with the same time the one whose event is newer comes first.
+    return sorted(found, key=lambda attestation: attestation.at, reverse=True)
+
+
+def last_review(events: list[AuditEvent]) -> Attestation | None:
+    """The record's latest completed attestation, from its own events (``attestations_in``)."""
+    found = attestations_in(events)
+    return found[0] if found else None
 
 
 def submitter(events: list[AuditEvent]) -> AuditEvent | None:

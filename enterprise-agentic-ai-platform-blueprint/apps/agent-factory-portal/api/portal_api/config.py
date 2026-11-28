@@ -135,6 +135,9 @@ class Settings:
     audit_table: str | None = None
     # Optional in the read API: lets /users/me say which tenants the caller can register for.
     group_tenant_map: Mapping[str, tuple[str, ...]] | None = None
+    # How the read API verifies the caller's bearer token. None only in local development with
+    # the header-based identity; inside AWS Lambda it is always set, or the configuration is refused.
+    token: TokenSettings | None = None
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -371,6 +374,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
             if (env.get("PORTAL_GROUP_TENANT_MAP") or "").strip()
             else None
         ),
+        # The read API verifies the caller's token itself, like the action functions: a role read
+        # from the invocation event would be whatever a direct invoker wrote there.
+        token=_parse_token_settings(env, provider),
     )
 
 
@@ -435,12 +441,12 @@ _ENTRA_ISSUER = re.compile(
     re.ASCII,
 )
 _TOKEN_VARIABLES = ("PORTAL_JWT_ISSUER", "PORTAL_JWT_AUDIENCE", "PORTAL_JWT_TOKEN_USE", "PORTAL_JWKS_URL")
-_VERIFIES = "the action functions verify the caller's token themselves"
+_VERIFIES = "the portal's functions verify the caller's token themselves"
 
 
 @dataclass(frozen=True)
 class TokenSettings:
-    """What an action function needs to verify the caller's bearer token (``portal_api/identity/verify.py``)."""
+    """What a function needs to verify the caller's bearer token (``portal_api/identity/verify.py``)."""
 
     provider: str  # cognito | entra
     issuer: str  # compared exactly with the token's iss
@@ -450,7 +456,7 @@ class TokenSettings:
 
 
 def _parse_token_settings(env: Mapping[str, str], provider: str) -> TokenSettings | None:
-    """The token settings of an action function. Required, so a function without them answers 500.
+    """The token settings of the read API or of an action function. Required, so a function without them answers 500.
 
     The one exception is local development: with ``PORTAL_DEV_AUTH`` on (which
     is impossible inside AWS Lambda) and none of the variables set, there is

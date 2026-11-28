@@ -79,13 +79,16 @@ class EvidenceReviews(BaseModel):
     source: str = "none"
     registration_review_by: str | None = None  # review_by of the registration's own document
     overdue: bool | None = None  # null for an agent with no registration
-    attestations: list[EvidenceReview] = Field(default_factory=list)  # oldest first
+    # Oldest first: the attestations that the registration's own events name (those among
+    # ``decisions``), and the latest one the inventory holds, each once.
+    attestations: list[EvidenceReview] = Field(default_factory=list)
 
 
 class EvidenceContainment(BaseModel):
     state: str = "unknown"  # contained | not_contained | unknown
     # Why the state is unknown. Also set when the state is not_contained although a statement with
-    # the portal's identifier is in the policy: that statement does not deny invocation.
+    # the portal's identifier is in the policy: it is not the statement the portal writes, and it
+    # may or may not deny invocation.
     detail: str | None = None
     # The incident record (who contained the agent, why, and the events) is shown only to a caller
     # whose role can contain or release, as in the containment view. For anyone else this is

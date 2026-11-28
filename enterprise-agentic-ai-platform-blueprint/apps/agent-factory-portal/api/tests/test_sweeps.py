@@ -501,15 +501,30 @@ def on_record(
     intent: bool = True,
     subject: str = "sec-1",
     action: str = "contain",
+    numbers: str | None = ...,  # type: ignore[assignment]
+    agent_id: str = RECORD_ID,
+    prefix: str | None = None,
 ) -> str:
     """Put a contain into the Runtime's history, as the containment function writes one. Returns its request id.
 
     Its intent, and one second later its result with the sweeps it
-    scheduled. Forty minutes ago unless a test says otherwise: old enough
-    that its sweeps are due and that it holds no later contain back. The
-    events go straight into the table, so the table's count of writes stays
-    the sweeper's own.
+    scheduled: all three when it scheduled three, the second and third when
+    it scheduled two (``numbers`` says otherwise; ``None`` is a result
+    written before results listed their sweeps). Forty minutes ago unless a
+    test says otherwise: old enough that its sweeps are due and that it
+    holds no later contain back. The events go straight into the table, so
+    the table's count of writes stays the sweeper's own.
+
+    They go into the range the function writes them into: a contain that
+    changed nothing (``unchanged``) among the events that cannot change who
+    holds the containment, every other among those that can. ``prefix``
+    says otherwise: ``EVENT#`` for a history written before there were two
+    ranges.
     """
+    if prefix is None:
+        prefix = audit_reader.OTHER_PREFIX if outcome == "unchanged" else audit_reader.EVENT_PREFIX
+    if numbers is ...:
+        numbers = {3: "1,2,3", 2: "2,3", 1: "2"}.get(scheduled or 0)
     began = time_of_day() - dt.timedelta(minutes=minutes_ago)
     common = {
         "request_id": request_id,
@@ -518,7 +533,7 @@ def on_record(
         "actor_label": f"{subject}@example.com",
         "actor_role": "security",
         "tenant_id": "ws1",
-        "agent_id": RECORD_ID,
+        "agent_id": agent_id,
         "runtime_arn": arn,
     }
     written = []
@@ -538,13 +553,14 @@ def on_record(
                 outcome=outcome,
                 reason="x",
                 sweeps_scheduled=scheduled if action == "contain" else None,
+                sweeps_scheduled_numbers=numbers if action == "contain" else None,
                 **counts,
                 **common,
             )
         )
     key = audit_reader.containment_key(arn)
     for event in written:
-        item = {"pk": {"S": key}, "sk": {"S": f"EVENT#{event.at}#{event.event_id}"}}
+        item = {"pk": {"S": key}, "sk": {"S": audit_reader.event_sort_key(event, prefix)}}
         item.update({name: {"S": str(value)} for name, value in event.model_dump().items() if value not in (None, "")})
         world.dynamo.items[(key, item["sk"]["S"])] = item
     return request_id
@@ -1160,16 +1176,41 @@ def entry(world, monkeypatch):
     return sweep_handler.handler
 
 
-def test_the_function_handles_each_message_of_the_event(world, entry):
+def test_the_function_runs_the_one_message_it_is_handed(world, entry):
     contained(world)
     world.cell.streams[log_group()] = [session_stream("a")]
-    records = [{"eventSource": "aws:sqs", "body": sweeps.encode(message())}, {"body": "junk"}, {}, "not a record"]
-    assert entry({"Records": records}, Context()) == {"handled": 4}
+    assert entry({"Records": [{"eventSource": "aws:sqs", "body": sweeps.encode(message())}]}, Context()) == {
+        "handled": 1
+    }
     assert world.cell.stopped == [(sid("a"), "DEFAULT")]
     assert [e["outcome"] for e in world.dynamo.events() if e.get("action") == "sweep"] == ["allowed"]
-    # Whoever can invoke the function chooses the event: anything else is nothing to do.
-    for odd in ({}, {"Records": []}, {"Records": "junk"}, {"Records": {"body": "x"}}, None, "junk", []):
-        assert entry(odd, Context()) == {"handled": 0}
+    # One record that is not a message is one invalid message: handled, and nothing run.
+    for odd in ({"body": "junk"}, {}, "not a record", None):
+        assert entry({"Records": [odd]}, Context()) == {"handled": 1}
+    assert len(world.cell.stopped) == 1
+
+
+def test_an_invocation_with_any_other_number_of_records_runs_nothing(world, entry, caplog):
+    """The queue hands over one message at a time. Several records would share one invocation's
+    time: a long sweep of one Runtime put first would leave a due sweep of another none."""
+    contained(world)
+    world.cell.streams[log_group()] = [session_stream("a")]
+    before = dict(world.dynamo.items)
+    due = {"eventSource": "aws:sqs", "body": sweeps.encode(message())}
+    with caplog.at_level("ERROR", logger="portal_api.actions.sweeper"):
+        assert entry({"Records": [due, due]}, Context()) == {"handled": 0}
+        assert entry({"Records": [{"body": "junk"}, due]}, Context()) == {"handled": 0}
+        # Whoever can invoke the function chooses the event: anything else is nothing to do either.
+        for odd in ({}, {"Records": []}, {"Records": "junk"}, {"Records": {"body": "x"}}, None, "junk", []):
+            assert entry(odd, Context()) == {"handled": 0}
+    # Nothing was read, claimed, written or stopped, and the function's log says why.
+    assert world.cell.calls == [] and world.cell.stopped == []
+    assert world.dynamo.items == before and world.dynamo.calls == []
+    assert caplog.messages[:2] == ["Sweeper invoked with 2 records, not exactly one: nothing was run"] * 2
+    assert "Sweeper invoked with no records, not exactly one: nothing was run" in caplog.messages
+    # The same message alone is run.
+    assert entry({"Records": [due]}, Context()) == {"handled": 1}
+    assert world.cell.stopped == [(sid("a"), "DEFAULT")]
 
 
 @pytest.mark.parametrize("role", ["containment", "registrar", "", None])
@@ -1209,10 +1250,19 @@ def test_a_sweep_never_counts_as_a_contain_or_a_release(world):
     run = Run(world)
     for sent in world.queue.messages:
         assert run.handle(sent["MessageBody"]) == "allowed"
-    events = audit_reader.read_back(world.dynamo, BASE_ENV["PORTAL_AUDIT_TABLE"], KEY).events
+    history = audit_reader.read_history(world.dynamo, BASE_ENV["PORTAL_AUDIT_TABLE"], RUNTIME_ARN)
+    events = history.events
     assert [e.action for e in events][:2] == ["sweep", "sweep"]
-    holder = audit_reader.container(events)
+    holder = history.holder.event
     assert holder is not None and (holder.action, holder.actor_subject) == ("contain", "sec-1")
+    # The sweeps are not among the events a release reads to find that person: the contain's two are.
+    assert [(e["action"], e["phase"]) for e in world.dynamo.settling()] == [
+        ("contain", "intent"),
+        ("contain", "result"),
+    ]
+    assert [e["action"] for e in world.dynamo.others()] == ["sweep", "sweep"]
+    # A history written before there were two ranges holds them together, and reads the same.
+    assert audit_reader.container(events) == holder
     # The person who contained it still cannot release it; another person can.
     code, response = world.post("release", claims=SEC)
     assert code == 403 and "CON-03-N" in response["detail"]
@@ -1231,13 +1281,16 @@ def test_a_contain_whose_result_was_lost_still_has_its_holder_after_its_sweeps(w
     run = Run(world)
     for sent in world.queue.messages:
         assert run.handle(sent["MessageBody"]) == "allowed"
-    events = audit_reader.read_back(world.dynamo, BASE_ENV["PORTAL_AUDIT_TABLE"], KEY).events
+    history = audit_reader.read_history(world.dynamo, BASE_ENV["PORTAL_AUDIT_TABLE"], RUNTIME_ARN)
+    events = history.events
     assert [(e.action, e.phase) for e in events] == [("sweep", "result"), ("sweep", "result"), ("contain", "intent")]
     assert {e.request_id for e in events} == {response["request_id"]}
     # The intent names the holder, as it did before any sweep ran.
-    holder = audit_reader.container(events)
+    holder = history.holder.event
     assert holder is not None and (holder.action, holder.phase, holder.actor_subject) == ("contain", "intent", "sec-1")
-    assert audit_reader.container(events[2:]) == holder
+    assert [(e["action"], e["phase"]) for e in world.dynamo.settling()] == [("contain", "intent")]
+    # A history written before there were two ranges holds the sweeps beside it, and reads the same.
+    assert audit_reader.container(events) == holder == audit_reader.container(events[2:])
 
     view = read(world.record_id, SEC)[1]
     assert (view["state"], view["contained_by_me"], view["contained_by"]) == ("contained", True, "sec-1")

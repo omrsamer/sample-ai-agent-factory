@@ -41,6 +41,11 @@ SWEEP_DELAYS_SECONDS = (FIRST_SWEEP_DELAY_SECONDS, SECOND_SWEEP_DELAY_SECONDS, T
 # than the containment function's 29 seconds. With it the second sweep still runs no sooner than
 # CONTAIN_DELAY_SECONDS after the contain began.
 SWEEP_EARLY_TOLERANCE_SECONDS = 30
+# A first sweep is sent with no delay, so it can reach the sweeper before its contain has written
+# the result that says which sweeps it scheduled. The sweeper waits for that result this long,
+# counted from the contain's intent: longer than the containment function can run (29 seconds).
+# A result that has not come by then was lost.
+CONTAIN_RESULT_WAIT_SECONDS = 40
 
 # The most sessions a background sweep stops per second. Stops count against the cell account's
 # data-plane rate quota, which the agents' own invocations share, so the sweep stays well below it.

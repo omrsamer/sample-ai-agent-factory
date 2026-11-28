@@ -1,12 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""Verification of the caller's bearer token, inside the action functions.
+"""Verification of the caller's bearer token, inside every function that has a caller.
 
 The API Gateway JWT authorizer verifies the token before a function is
-invoked, and the read API relies on that. The functions that change something
-verify the token again themselves and build the caller from the token alone.
-They do not read the claims API Gateway puts in the event, so an event made up
-by someone who can invoke a function directly carries no weight.
+invoked. The read API and the action functions verify it again themselves
+and build the caller from the token alone. None of them reads the claims API
+Gateway puts in the event, so an event made up by someone who can invoke a
+function directly carries no weight: not to change something, and not to be
+shown what a role is shown (an incident record, on the read API).
 
 What is checked (``verify``):
 

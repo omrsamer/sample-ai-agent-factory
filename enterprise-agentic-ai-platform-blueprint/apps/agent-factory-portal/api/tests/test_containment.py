@@ -1005,7 +1005,9 @@ def test_nothing_is_done_when_the_intent_cannot_be_written(world):
     world.dynamo.fail_put_numbers = {1}
     code, body = world.post("contain")
     assert code == 503 and "not performed" in body["detail"]
-    assert world.cell.calls == [] and world.cell.policies == {}
+    # The policy was read, which changes nothing; nothing was written, there or anywhere.
+    assert world.cell.calls == ["get_resource_policy"] and world.cell.policies == {}
+    assert world.dynamo.items == {}
 
 
 def test_no_decision_when_the_trail_cannot_be_read(world):

@@ -103,8 +103,8 @@ def event(
     all_headers = {"host": "api.example.com", **(headers or {})}
     if claims is not None:
         # As API Gateway does for a request whose token its authorizer accepted: the claims in the
-        # context, and the token itself still in the header. The read API takes the caller from the
-        # context. The action functions ignore the context and verify the token.
+        # context, and the token itself still in the header. Every function ignores the context and
+        # verifies the token.
         context["authorizer"] = {"jwt": {"claims": claims, "scopes": []}}
         all_headers.setdefault("authorization", f"Bearer {tokens.for_claims(claims)}")
     return {
@@ -400,9 +400,16 @@ def test_dev_headers_are_ignored_unless_dev_auth_is_enabled(call, monkeypatch):
 
 
 def test_entra_claims_when_configured(call, monkeypatch):
+    tenant = "00000000-0000-0000-0000-000000000000"
+    issuer = f"https://login.microsoftonline.com/{tenant}/v2.0"
     monkeypatch.setenv("PORTAL_IDENTITY_PROVIDER", "entra")
-    claims = {"oid": "oid-1", "preferred_username": "sec@example.com", "name": "Sec", "roles": "[sec]"}
-    status, body, _ = call("/users/me", claims=claims)
+    monkeypatch.setenv("PORTAL_JWT_ISSUER", issuer)
+    monkeypatch.setenv("PORTAL_JWT_AUDIENCE", '["api://portal"]')
+    monkeypatch.setenv("PORTAL_JWKS_URL", f"https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys")
+    claims = {"oid": "oid-1", "preferred_username": "sec@example.com", "name": "Sec", "roles": ["sec"]}
+    # An ID token as Microsoft Entra ID issues one: its own issuer and audience, and no token_use.
+    token = tokens.sign(claims, iss=issuer, aud="api://portal", token_use=...)
+    status, body, _ = call("/users/me", claims=None, headers={"authorization": f"Bearer {token}"})
     assert status == 200
     assert (body["email"], body["role"], body["role_level"], body["oid"], body["name"]) == (
         "sec@example.com",

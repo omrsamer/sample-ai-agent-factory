@@ -214,7 +214,7 @@ interface RegistrationDetail extends Registration {
   decided_at: string | null;
   decision_reason: string | null;      // the approver's full reason (status_reason is cut to 255 characters)
   previous_approved: RegistrationDocument | null;  // the document as last approved through the portal; null if never
-  // New. The latest attestation: a review, or an approval of a document that names review_by.
+  // New. The latest attestation, by the time it was attested: a review or an approval.
   // Both null when there is none.
   last_reviewed_at: string | null;     // ISO 8601 UTC
   last_reviewed_by: string | null;     // the reviewer's or approver's label
@@ -276,6 +276,12 @@ omitted or null; an empty string is treated as absent.
 
 ## Read endpoints (read API, any mapped role)
 
+The read API takes the caller from the bearer token, which it verifies
+itself as the action functions do. Besides the codes listed for each
+endpoint, every one of them answers 503 when the identity provider's signing
+keys could not be fetched (`detail` is a sentence to show; nothing was read),
+and 500 when the function is not configured.
+
 ### `GET /registrations`
 
 Query: `status?` one of `DRAFT`, `PENDING_APPROVAL`, `APPROVED`, `REJECTED`,
@@ -319,11 +325,32 @@ and review events are there too. A review carries `next_review_by`; a retire
 of a record that was already retired is one `result` event with
 `outcome: "unchanged"`.
 
+**References into a configured cell.** A `runtime_arn`, `gateway_arn` or
+`policy_engine_arn` that points into the account and Region of a configured
+cell must begin with the partition of that cell (`arn:aws:` in the standard
+Regions). The service answers for other spellings of the same resource, and
+the portal acts on a Runtime only under the ARN it builds from the cell, so a
+registration spelled another way could not be contained by its id. Create and
+update answer 422 with `loc` `["body", "runtime_arn"]` (or the other field)
+and a sentence that names the partition to use. It is said only to a caller
+who may register for that tenant; a reference into an account and Region with
+no cell is not checked.
+
 **Who writes into a record's history.** Only a caller who has a part in the
 record: the authority the action needs, and the record's tenant. A refusal of
 such a caller is in the history: separation of duties (`REG-11-N`),
 `REG-12-N`, `REG-13-N` on update and approve, and a status that does not
 permit the action.
+
+**And how often.** Such a refusal is written once for each person, rule and
+state of the record (its status and the document it holds). The same person
+refused again by the same rule, while the record is as it was, gets the same
+answer with a new `request_id`, and the function's log keeps the attempt; the
+history does not grow. The same holds for a `retire` of a record that is
+already retired: its `unchanged` result is in the history once for each
+person. So a history shows that a person was refused, not how many times they
+asked. When the record changes (it is updated, submitted, decided, retired),
+a refusal after that is written again.
 
 Every other refusal is answered with 403 and a `request_id`, and kept in the
 function's log under that id. It is **not** in a history:
@@ -505,7 +532,11 @@ field) is a 422 as on every route.
 Body: `ReviewInput`. Records that the caller reviewed the approved
 registration and by when it must be reviewed again. Nothing in the registry is
 changed: the record stays `APPROVED`, its document and `updated_at` stay as
-they are. The attestation is kept in the audit trail and is append-only.
+they are. The attestation is kept in the audit trail. The review's `result`
+event is the attestation on record (it names `attested_at` and
+`next_review_by`) and is never changed. Beside it the audit table keeps one
+more item, the latest attestation of the record, for the agent list to read:
+a later attestation of the same record takes its place, and nothing else does.
 
 Returns 200 with `ActionResult`: `action` is `review`, `reason` is the
 reviewer's reason, `registration` is the unchanged registration.
@@ -516,16 +547,17 @@ One rule: the latest attestation wins. There are two kinds of attestation.
 
 | Kind | Made by | Its date |
 | --- | --- | --- |
-| `approval` | `POST .../approve`, when the approved document names `review_by` | The document's `review_by`, or the approval date plus 366 days when the document names a later date |
+| `approval` | `POST .../approve`, every time | The document's `review_by`, or the approval date plus 366 days when the document names a later date or none |
 | `review` | `POST .../review` | `next_review_by` from the request, at most 366 days ahead |
 
-So after an approval the date is the document's own; a later review moves it;
-a later re-approval of a changed document moves it again to that document's
-`review_by`. A re-approval of a document with no `review_by` records nothing,
-so the earlier date stays. Changing `review_by` in a document has no effect
-until that document is approved. A registration with no attestation at all
-(for example one approved outside the portal) shows its document's
-`review_by`.
+Every approval records a review date, so every registration approved through
+the portal is due at some point. After an approval the date is the document's
+own, or the approval date plus 366 days when the document names none; a later
+review moves it; a later re-approval moves it again, to the new document's
+`review_by` or to a year from that approval. Changing `review_by` in a
+document has no effect until that document is approved. A registration with
+no attestation at all (for example one approved outside the portal) shows its
+document's `review_by`, and no date when the document names none.
 
 The read API reports the effective date as:
 
@@ -653,7 +685,10 @@ interface AgentEvidence {
     source: "attestation" | "approval" | "registration" | "none";
     registration_review_by: string | null;   // review_by of the document itself
     overdue: boolean | null;            // null for an agent with no registration
-    attestations: {                     // oldest first
+    // Oldest first. Each review and approval among `decisions` that attested, and the latest
+    // attestation the agent list reads, each once. One that is older than the events in
+    // `decisions` is not listed, except that latest one.
+    attestations: {
       kind: "review" | "approval";
       at: string;
       reviewed_by: string;              // subject id
@@ -666,7 +701,7 @@ interface AgentEvidence {
   };
   containment: {
     state: "contained" | "not_contained" | "unknown";
-    detail: string | null;              // why the state is unknown; or, with not_contained, that a statement with the portal's Sid is in the policy but does not deny invocation
+    detail: string | null;              // why the state is unknown; or, with not_contained, that a statement with the portal's Sid is in the policy that is not the one the portal writes (it may or may not deny invocation)
     // The incident record (who contained the agent, why, and the events) is shown only to a
     // caller whose role can contain or release (security, platform, sre), as in the containment
     // view. For any other caller this is false, those fields are null or empty, and limitations
@@ -739,9 +774,10 @@ Notes for whoever reads the document:
   `containment.events_truncated` is true and `limitations` says so.
 - `containment.state` is `contained` only when the Runtime's policy holds the
   statement the portal writes, recognised by all of it and not by its Sid
-  (CONTAINMENT_CONTRACT.md). With a statement under the portal's Sid that
-  does not deny invocation, the state is `not_contained` and
-  `containment.detail` says so.
+  (CONTAINMENT_CONTRACT.md). With a statement under the portal's Sid in any
+  other shape, the state is `not_contained` and `containment.detail` says that
+  it is not the statement the portal writes. Such a statement may or may not
+  deny invocation.
 - `containment.state` is what the Runtime's resource policy says. The service
   applies a change to that policy host by host, so right after a contain some
   calls can still succeed, and right after a release some can still be
@@ -817,7 +853,10 @@ Notes:
 - On 401 the front end may refresh the token and retry, as for the read API.
   The action functions need the same token the read API gets, in
   `Authorization: Bearer <token>`; they check it themselves and give no
-  reason for a refusal.
+  reason for a refusal. The read API checks it itself as well: every read
+  endpoint can answer 401 with `"Not authenticated"`, and 503 with a
+  sentence to show when the identity provider's signing keys could not be
+  fetched.
 
 ## Routing
 

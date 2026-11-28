@@ -8,8 +8,9 @@ temporary credentials are cached until shortly before they expire.
 
 Each function assumes a cell's role under a session name of its own, so the
 cell's CloudTrail says which function made a call. A function can also narrow
-what the assumed role may do with a session policy: the sweeper does, so that
-it cannot write or delete a resource policy whatever its code does.
+what the assumed role may do with a session policy. The sweeper does: the
+session it works with cannot write or delete a resource policy. The caller
+chooses that narrowing; the role itself allows more.
 """
 
 from __future__ import annotations

@@ -4,26 +4,31 @@
 
 An attestation says that an approver reviewed a registration and by when it
 must be reviewed again. It lives in the audit trail only, because any update
-of a registry record returns the record to DRAFT. There are two kinds:
+of a registry record returns the record to DRAFT: every attestation is in the
+history of its record, as the result event of the review or approval that
+made it, and the latest one of each record is kept in one more place where
+the inventory reads them all at once (``aws/audit.py``). There are two kinds:
 
 - ``review``: an approver attested the periodic review of an approved
   registration and set the next date (at most ``MAX_INTERVAL_DAYS`` ahead);
-- ``approval``: an approver approved a document that names a ``reviewBy``
-  date. Approving is reviewing, so the approval is recorded as an attestation
-  with that date, or with the approval date plus ``MAX_INTERVAL_DAYS`` when
-  the document's date is later than that. A document with no ``reviewBy``
-  attests nothing.
+- ``approval``: an approver approved a document. Approving is reviewing, so
+  every approval is recorded as an attestation: with the document's
+  ``reviewBy`` date, or with the approval date plus ``MAX_INTERVAL_DAYS``
+  when the document names a later date or none at all.
 
 No date gets further than ``MAX_INTERVAL_DAYS`` ahead by any way in: not a
 review (``date_error``), not a registration's own date when it is created or
-updated (``document_date_error``), not an approval (``approval_date``). A
-registration approved with a date in the far future would otherwise never be
-due, whatever the limit on reviews.
+updated (``document_date_error``), not an approval (``approval_date``). And
+no approval leaves a registration without a date. A registration approved
+with a date in the far future, or with none, would otherwise never be due,
+whatever the limit on reviews.
 
 One rule decides the effective review date of a registered agent: the latest
-attestation wins. So a later re-approval with a new date moves the date, and
-so does a later review. Without any attestation the date is the ``reviewBy``
-of the registration itself (a record that was approved outside the portal).
+attestation wins. So a later re-approval moves the date, and so does a later
+review. Without any attestation the date is the ``reviewBy`` of the
+registration itself (a record that was approved outside the portal, or
+before approvals recorded a date for a document that names none; such a
+record has no date when its document names none).
 """
 
 from __future__ import annotations
@@ -35,6 +40,9 @@ from dataclasses import dataclass
 
 # A review may be set at most this many days ahead: one year, with room for a leap day.
 MAX_INTERVAL_DAYS = 366
+
+# The longest reason an attestation carries, as for an event.
+REASON_MAX = 1000
 
 KIND_REVIEW = "review"
 KIND_APPROVAL = "approval"
@@ -115,15 +123,24 @@ def document_date_error(review_by: object, today: dt.date) -> str | None:
     return None
 
 
-def approval_date(review_by: str, today: dt.date) -> str:
-    """The review date an approval records: the document's, or ``MAX_INTERVAL_DAYS`` from today if that is earlier.
+def approval_date(review_by: object, today: dt.date) -> str:
+    """The review date an approval records: the document's, or ``MAX_INTERVAL_DAYS`` from today.
 
-    A document written before the limit, or by other means, can name a later
-    date. Approving it does not carry that date into the trail.
+    Every approval records one, so that every approved registration is due
+    at some point. It is the document's own date when the document names
+    one that is no later than ``MAX_INTERVAL_DAYS`` from today. A document
+    that names no date gets that latest day, and so does one that names a
+    later date (written before the limit, or by other means): approving it
+    does not carry that date into the trail.
     """
     date = parse_date(review_by)
     latest = today + dt.timedelta(days=MAX_INTERVAL_DAYS)
-    return review_by if date is None or date <= latest else latest.isoformat()
+    return str(review_by) if date is not None and date <= latest else latest.isoformat()
+
+
+def approval_reason(reason: str | None) -> str:
+    """The reason the attestation of an approval carries: the approver's own, marked as an approval."""
+    return f"Approved: {reason or ''}"[:REASON_MAX]
 
 
 def by_record(attestations: Iterable[Attestation]) -> dict[str, list[Attestation]]:
@@ -134,6 +151,20 @@ def by_record(attestations: Iterable[Attestation]) -> dict[str, list[Attestation
     for items in grouped.values():
         items.sort(key=lambda a: a.at, reverse=True)
     return grouped
+
+
+def merged(*sources: Iterable[Attestation]) -> list[Attestation]:
+    """The attestations of one record from several sources as one list, newest first.
+
+    An attestation carries the request id of the review or approval that
+    made it wherever it is read, so one that several sources name is listed
+    once, as the first source that names it has it.
+    """
+    known: dict[str, Attestation] = {}
+    for source in sources:
+        for attestation in source:
+            known.setdefault(attestation.request_id or f"at {attestation.at}", attestation)
+    return sorted(known.values(), key=lambda a: a.at, reverse=True)
 
 
 def effective(registration_review_by: str | None, latest: Attestation | None) -> EffectiveReview:

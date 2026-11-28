@@ -8,8 +8,8 @@ function's routes and every read route, is answered with 404. A function whose
 everything, so a mis-wired function fails closed.
 
 The caller is taken from the bearer token, which each function verifies itself
-(``portal_api/identity/verify.py``). The claims API Gateway puts in the event
-are not read here.
+(``portal_api/identity/deps.py`` and ``verify.py``). The claims API Gateway
+puts in the event are not read, here or in the read API.
 """
 
 from __future__ import annotations
@@ -32,10 +32,10 @@ from portal_api.actions import sweep_queue
 from portal_api.actions.containment_flow import ContainmentService
 from portal_api.actions.engine import ActionEngine, ActionError
 from portal_api.aws.session import BOTO_CONFIG, SESSION_CONTAINMENT, AwsClients
-from portal_api.config import ACTION_ROLES, ActionSettings, ConfigError, dev_auth_enabled, get_action_settings
+from portal_api.config import ACTION_ROLES, ActionSettings, ConfigError, get_action_settings
 from portal_api.identity import verify as tokens
-from portal_api.identity.deps import dev_claims
-from portal_api.identity.provider import NotAuthenticated, NotAuthorized, Principal, get_provider
+from portal_api.identity.deps import KEYS_UNAVAILABLE, principal_from_request
+from portal_api.identity.provider import NotAuthenticated, NotAuthorized, Principal
 from portal_api.models.portal import (
     ActionResult,
     ContainmentInput,
@@ -51,10 +51,6 @@ logger = logging.getLogger("portal_api.actions")
 API_PREFIX = "/api/v1"
 RecordId = Annotated[str, Path(pattern=r"^[A-Za-z0-9]{12}$")]
 _NOT_FOUND = {"detail": "Not found"}
-KEYS_UNAVAILABLE = (
-    "The caller could not be verified because the identity provider's signing keys are not available. "
-    "Nothing was done. Try again shortly."
-)
 
 _lock = threading.Lock()
 _clients: dict[str, Any] = {}
@@ -76,34 +72,14 @@ def dynamodb_client(settings: ActionSettings = Depends(get_action_settings)) -> 
     return _client("dynamodb", settings.registry_region)
 
 
-def bearer_token(request: Request) -> str | None:
-    """The token of ``Authorization: Bearer <token>``, or ``None`` when the header is not of that form."""
-    scheme, _, value = (request.headers.get("authorization") or "").strip().partition(" ")
-    value = value.strip()
-    return value if scheme.lower() == "bearer" and value and " " not in value else None
-
-
 def action_principal(request: Request, settings: ActionSettings = Depends(get_action_settings)) -> Principal:
-    """The caller, from the bearer token this function verifies itself.
+    """The caller, from the bearer token this function verifies itself (``identity.deps.principal_from_request``).
 
     Nothing of the event's authorizer context is read: a caller who can
-    invoke the function directly chooses that. In local development (never
-    inside AWS Lambda) the header-based identity is accepted as before.
+    invoke the function directly chooses that. The read API takes its
+    caller the same way.
     """
-    provider = get_provider(settings.identity_provider)
-    if dev_auth_enabled():
-        claims = dev_claims(request, settings)
-        if claims is not None:
-            return provider.principal(claims, settings.group_role_map)
-    token = bearer_token(request)
-    if token is None or settings.token is None:
-        raise NotAuthenticated("no bearer token on the request")
-    try:
-        claims = tokens.verify(token, settings.token, tokens.keys_for(settings.token.jwks_url))
-    except tokens.TokenRejected as exc:
-        logger.warning("Bearer token not accepted: %s", exc)
-        raise NotAuthenticated("the bearer token was not accepted") from exc
-    return provider.principal(claims, settings.group_role_map)
+    return principal_from_request(request, settings)
 
 
 def engine(

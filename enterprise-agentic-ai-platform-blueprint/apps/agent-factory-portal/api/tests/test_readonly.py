@@ -212,8 +212,16 @@ def test_the_sweeper_only_reads_the_policy_and_stops_sessions():
     assert not used & {"put_policy", "delete_policy", "get_record", "stop_sessions"}
     assert "sweep_queue" not in source and "query_events" not in source and "query_items" not in source
     # Of the audit table it uses three things, all under the Runtime's own key: the history read
-    # back to the contain a message names, the claim of the sweep, and the sweep's one event.
-    assert set(re.findall(r"\baudit_reader\.([A-Za-z_]+)", source)) == {"read_for_sweep", "holder", "containment_key"}
+    # back to the contain a message names, the claim of the sweep, and the sweep's one event, which
+    # goes into the range of the events that cannot change who holds the containment. Who holds it
+    # is the history's to say (``audit.History``): the sweeper never works that out from events itself.
+    assert set(re.findall(r"\baudit_reader\.([A-Za-z_]+)", source)) == {
+        "read_for_sweep",
+        "History",
+        "containment_key",
+        "OTHER_PREFIX",
+    }
+    assert "prefix=audit_reader.OTHER_PREFIX" in source and "EVENT_PREFIX" not in source
     assert set(re.findall(r"\baudit_writer\.([A-Za-z_]+)", source)) == {"claim_sweep", "put_event", "now_stamp"}
     assert source.count("containment_key(") == 1  # the one place a key is made: the sweep's own event
     # The queue send is the containment function's, and its one operation is documented for that role.

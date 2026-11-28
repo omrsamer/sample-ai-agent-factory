@@ -12,7 +12,7 @@ and, where the cell opts in, a containment role:
 | --- | --- | --- | --- |
 | Read API | `handler.handler` | read role | Nothing |
 | Registrar | `registrar_handler.handler` | registrar role | Registry records (create, update, submit, delete); appends audit events |
-| Approver | `approver_handler.handler` | approver role | A registry record's status (approve, reject, retire); appends audit events and review attestations |
+| Approver | `approver_handler.handler` | approver role | A registry record's status (approve, reject, retire); appends audit events, and keeps the latest review attestation of a record |
 | Containment | `containment_handler.handler` | containment function role, and each opted-in cell's containment role | One deny statement in a Runtime's resource policy; stops Runtime sessions; appends audit events; sends sweep messages |
 | Sweeper | `sweep_handler.handler` | the containment function role, and each opted-in cell's containment role | Stops the sessions of a Runtime that is contained; appends audit events. It serves no route |
 
@@ -49,7 +49,7 @@ Region for every platform-account call is `PORTAL_REGISTRY_REGION`.
 | `agent-registry:GetRegistryRecord` | `arn:aws:agent-registry:REGION:PLATFORM:registry/<PORTAL_REGISTRY_ID>/record/*` and, when set, the records of the registries named in `PORTAL_AGENT_REGISTRY_ID` and `PORTAL_DISCOVERY_REGISTRY_ID` | Same as `ListRegistryRecords` (the list operation does not return descriptors) |
 | `codepipeline:ListPipelineExecutions` | `arn:aws:codepipeline:REGION:PLATFORM:<pipelineName>` for each `pipelineName` in `PORTAL_CELLS` | `/agents/{id}/evals/runs` |
 | `codepipeline:ListActionExecutions` | Same pipeline ARNs | `/agents/{id}/evals/runs` (EvaluationGate action result) |
-| `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | `/registrations/{record_id}`, `/registrations/{record_id}/history`, `/agents/{id}/containment`, `/agents/{id}/evidence`; also every endpoint that returns agents (`/agents*`, `/agents/export`, `/fleet/summary`, `/governance-graph`): one query per inventory load reads the review attestations |
+| `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | `/registrations/{record_id}`, `/registrations/{record_id}/history`, `/agents/{id}/containment`, `/agents/{id}/evidence`; also every endpoint that returns agents (`/agents*`, `/agents/export`, `/fleet/summary`, `/governance-graph`): two queries per inventory load read the latest review attestation of every record |
 | `cloudwatch:GetContextGraph` | `*`; can be limited to the Omni Region (the cells' `omniRegion`) with an `aws:RequestedRegion` condition | `/omni/observed-services` |
 | `bedrock:ListGuardrails` | `*` (list operation) | `/guardrails`, `/guardrails/{id}` |
 | `bedrock:ListTagsForResource` | `arn:aws:bedrock:REGION:PLATFORM:guardrail/*` | `/guardrails`, `/guardrails/{id}`. Called only when `PORTAL_GUARDRAIL_TAG_KEY` is set (tag filter); not needed when it is empty |
@@ -150,12 +150,21 @@ registry that holds the agent records.
 | --- | --- | --- |
 | `agent-registry:GetRegistryRecord` | The registry's record ARNs | `POST /registrations/{record_id}/approve`, `POST /registrations/{record_id}/reject`, `POST /registrations/{record_id}/retire`, `POST /registrations/{record_id}/review` |
 | `agent-registry:UpdateRegistryRecordStatus` | The registry's record ARNs | Approve, reject and retire. Review does not call it: it changes no record |
-| `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Approve and reject (who submitted the record; strongly consistent read). Retire and review do not query |
-| `dynamodb:PutItem` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | All four routes (audit events). A review, and an approval of a document that names a review date, also write an attestation: one item under the partition key `REVIEWS` |
+| `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Approve, reject and review (who submitted the record, and for a review when it was last attested; strongly consistent read). Retire does not query |
+| `dynamodb:PutItem` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | All four routes (audit events). A review and every approval also write the record's latest attestation: the one item `REVIEWS` / `RECORD#<record id>` |
 
 Neither action role has `dynamodb:UpdateItem` or `dynamodb:DeleteItem`, and the
-code writes with the condition `attribute_not_exists(pk)`, so an audit event
-can be added but never changed or removed through the API. The approver role
+code writes every event, mark and claim with the condition
+`attribute_not_exists(pk)`, so an audit event can be added but never changed
+or removed through the API. One item is not an event and is the only one a
+later `PutItem` may replace: the latest review attestation of a record
+(`pk = REVIEWS`, `sk = RECORD#<record id>`), which the approver function
+writes with the condition `attribute_not_exists(#at) OR #at < :at`, so that
+only an attestation that was attested later takes its place. The attestation
+itself stays in the record's history, as the result event that names it. IAM
+cannot tell the two conditions apart: `dynamodb:PutItem` allows both, and
+which one a write carries is the code's (`portal_api/actions/audit_writer.py`,
+the only module that writes to the table). The approver role
 cannot create, update or delete a record; the registrar role cannot set a
 record's status.
 
@@ -168,7 +177,7 @@ Function `containment_handler.handler`, `PORTAL_ACTION_ROLE=containment`.
 | `sts:AssumeRole` | The `containmentRoleArn` of each cell that opts in (exact role ARNs) | Both containment routes. Everything in the cell is done with that role |
 | `agent-registry:GetRegistryRecord` | The records of the registry that holds the agent records (this function's `PORTAL_REGISTRY_ID`) | Both routes, for a registered agent: its Runtime ARN is read from its record, never taken from the request. The record plays no part in deciding the tenant |
 | `dynamodb:Query` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Both routes (who contained the agent, for the two-person rule; strongly consistent read) |
-| `dynamodb:PutItem` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Both routes (audit events) |
+| `dynamodb:PutItem` | `arn:aws:dynamodb:REGION:PLATFORM:table/AUDIT_TABLE` | Both routes (audit events, and the mark that records a refused release once) |
 | `sqs:SendMessage` | The ARN of the sweep queue (the queue named in `PORTAL_SWEEP_QUEUE_URL`) | Contain, when a sweep queue is configured: the messages for the background sweeps. Not needed when the variable is unset |
 
 This role can read a record of that one registry and nothing more of it: it
@@ -228,7 +237,9 @@ this role whose statement Sid is not `AgenticAIPortalContainment`).
 ## 7. Sweeper function (platform account, under the containment function role)
 
 Function `sweep_handler.handler`, `PORTAL_ACTION_ROLE=sweeper`. It is invoked
-by the sweep queue through an event source mapping and serves no route. It
+by the sweep queue through an event source mapping and serves no route. The
+mapping must hand it one message at a time (batch size 1): the function runs
+an invocation that holds exactly one record and nothing of any other. It
 runs under the containment function's role, so that the cells' containment
 roles keep trusting exactly one role.
 
@@ -250,11 +261,12 @@ registry record: its code calls none of `PutResourcePolicy`,
 checks that). Of the audit table it uses three things, all under the
 Runtime's own key: the history read back to the contain a message names
 (`dynamodb:Query`), the claim of the sweep, and the sweep's one event (both
-`dynamodb:PutItem`, with the condition that the item does not exist).
+`dynamodb:PutItem`, with the condition that the item does not exist). The
+event goes into the `OTHER#` range of the Runtime's partition.
 
-**And its session could not, even if its code did.** The sweeper parses input
-that anyone who can reach the queue or the function chose, so it does not
-hold what the containment function holds. It assumes the cell's containment
+**The session its code asks for cannot either.** The sweeper parses input
+that anyone who can reach the queue or the function chose, so it asks for
+less than the containment function uses. It assumes the cell's containment
 role with a session policy (`session_policy` in
 `portal_api/actions/sweeper.py`), and a session can do only what both the
 role and that policy allow:
@@ -268,6 +280,16 @@ role and that policy allow:
 among them. Its `Resource` is `*` because the role's own policy already names
 the resources; the session policy only takes actions away. This needs no
 change in any cell: a session policy travels with the `AssumeRole` request.
+
+It is a restraint the sweeper's code puts on itself, not a limit on the role.
+The function runs under the containment function's role, and that role may
+assume a cell's role without a session policy. So the limit holds for the
+code as it is: every assumption the sweeper makes goes through one function
+that always passes the policy, and a test pins that. It would not hold for a
+later change that left the policy out. A limit that does not depend on the
+sweeper's code needs a role of the sweeper's own, which every cell's
+containment role would have to trust under a condition; that is a change in
+the cells and is not made here.
 
 Reading the queue is done by the Lambda service with the function's role, not
 by the code. The role therefore also needs, on the sweep queue only:
@@ -288,9 +310,10 @@ request id is on record and scheduled sweeps, when the sweep is due and has
 not left its event, and when no later containment has taken that contain's
 place; it claims the sweep with a conditional write before it does anything
 in the cell. Whoever can invoke the sweeper can therefore cause at most a
-sweep that a contain scheduled, at the time it is due, and its one event: at
-most three events for one contain. A message that is not valid, or whose
-sweep is not run, leaves nothing in the table.
+sweep that a contain scheduled, at the time it is due, and its one event: no
+other sweep number is admitted than those the contain's result lists. A
+message that is not valid, or whose sweep is not run, leaves nothing in the
+table.
 
 **Who can invoke the sweeper, and who can take a sweep away.** The queue
 invokes it, and so can any principal of the Platform account that holds
@@ -307,7 +330,10 @@ reaching the dead-letter queue.
 `sqs:PurgeQueue` to every principal whose `aws:PrincipalArn` is not the
 containment function's role (the role the Lambda service reads the queue
 with), so an administrator of the Platform account can neither put a message
-on it nor take one away. Two alarms notice sweeps that are not being run:
+on it nor take one off it. The statement covers the queue's messages, not the
+queue itself: a principal that may change the queue's attributes or delete
+the queue can still make scheduled sweeps disappear. Two alarms notice sweeps
+that are not being run:
 one on the dead-letter queue, one on the age of the oldest message (one
 hour). That is a second layer, not a replacement: the sweeper validates
 every message as described above, whoever sent it.
@@ -317,18 +343,42 @@ every message as described above, whoever sent it.
 Each function reads and writes only its own part of the audit table. The
 keys below are exact; a policy that narrows the table actions with a
 `dynamodb:LeadingKeys` condition can use the patterns in the last column,
-and the construct does so for the three action roles. Every sort key begins
-with `EVENT#`, with one exception: the sweeper's claim of a sweep, whose sort
-key is `SWEEP#<request id>#<sweep number>`. A claim lies in the Runtime's own
-partition and is not an event: every read of a history asks for sort keys
-that begin with `EVENT#`, so none returns it.
+and the construct does so for the three action roles. Nothing below needs a
+partition key or an action that the tables above do not already name: what
+differs is the sort key, which IAM does not look at.
+
+The sort key of an event begins with `EVENT#`. In a Runtime's partition
+(`CONTAINMENT#<Runtime ARN>`) there is a second range, `OTHER#`, for the
+events that cannot change who holds a containment (a sweep, a refusal, a
+contain of a Runtime that is already contained and held, a release of one
+that is not contained, an attempt that could not read the policy); an event
+is written into one of the two and never into both, and a release reads the
+first alone. Three kinds of item are not events, and no read of a history
+returns them:
+
+- The latest review attestation of a record: `RECORD#<record id>` in the
+  partition `REVIEWS`. One item for a record, and the only item of the table
+  that a later write may replace (by an attestation that was attested
+  later). A table that holds attestations from before that has them under
+  `EVENT#<UTC timestamp>#<record id>` in the same partition; nothing writes
+  those any more and the read API still reads them.
+- The sweeper's claim of a sweep: `SWEEP#<request id>#<sweep number>`, in the
+  Runtime's own partition.
+- The mark that a refusal, or an answer that nothing was changed, is on
+  record for one person and one state of a record: `ONCE#<hash>`, in the
+  record's own partition (or, for a refused create, in the partition of the
+  record's name). The registrar and the approver function write it with
+  `PutItem` and the usual condition, before the event; neither reads it.
+  The containment function writes the same kind of mark in the Runtime's
+  own partition, for a refused release: once for each person, rule and
+  containment.
 
 | Function (role) | Writes (`PutItem`) | Reads (`Query`) | Leading keys |
 | --- | --- | --- | --- |
 | Read API (read role) | nothing | `RECORD#<record id>`, `RECORD#NAME#<record name>`, `CONTAINMENT#<Runtime ARN>`, `REVIEWS` | `RECORD#*`, `CONTAINMENT#*`, `REVIEWS` |
 | Registrar (registrar role) | `RECORD#<record id>`, `RECORD#NAME#<record name>` | nothing | `RECORD#*` |
 | Approver (approver role) | `RECORD#<record id>`, `REVIEWS` | `RECORD#<record id>` | `RECORD#*`, `REVIEWS` |
-| Containment (containment function role) | `CONTAINMENT#<Runtime ARN>` | `CONTAINMENT#<Runtime ARN>` | `CONTAINMENT#*` |
+| Containment (containment function role) | `CONTAINMENT#<Runtime ARN>`: events in either range, and marks | `CONTAINMENT#<Runtime ARN>` | `CONTAINMENT#*` |
 | Sweeper (the same role) | `CONTAINMENT#<Runtime ARN>`: one claim and one event for each sweep | `CONTAINMENT#<Runtime ARN>` | `CONTAINMENT#*` |
 
 - The registrar writes under `RECORD#NAME#<record name>` what is decided
@@ -353,10 +403,10 @@ call:
 | --- | --- | --- |
 | Retire: read the record, set its status to `DEPRECATED`, read it back | approver role | agent-registry GetRegistryRecord and UpdateRegistryRecordStatus |
 | Retire and review: write the intent and result events | approver role | dynamodb PutItem |
-| Review, and approval of a document that names a review date: write the attestation (partition key `REVIEWS`) | approver role | dynamodb PutItem |
+| Review, and every approval: write the record's latest attestation (partition key `REVIEWS`, one item for a record) | approver role | dynamodb PutItem |
 | Review: read the record to see that it is approved | approver role | agent-registry GetRegistryRecord |
 | Refuse a change to a retired record (update, submit) | registrar role | agent-registry GetRegistryRecord, dynamodb PutItem |
-| Read every attestation for the inventory (partition key `REVIEWS`) | read role | dynamodb Query |
+| Read the latest attestation of every record for the inventory (partition key `REVIEWS`, two queries) | read role | dynamodb Query |
 | Evidence: the registration's events and the containment events | read role | dynamodb Query |
 | Evidence: the Runtime's containment state | cell reader role | bedrock-agentcore GetResourcePolicy |
 | Evidence: the policies of the agent's Tool Gateways (hashed, never returned) | cell reader role | bedrock-agentcore ListPolicies and GetPolicy |
@@ -373,12 +423,16 @@ the read role's query and the approver role's write.
 
 ## 9. Token verification and the reference rule: no action
 
-- **Token verification.** The registrar, approver and containment functions
+- **Token verification.** The read API and the registrar, approver and
+  containment functions
   verify the caller's bearer token themselves. That needs no IAM action. It
   needs outbound HTTPS from the function to the token issuer's key set, read
   once per execution environment and then cached (README, "Identity"). Keys
   fetched more than 48 hours ago are not used, so a function that cannot
-  reach the issuer for that long answers 503 until it can.
+  reach the issuer for that long answers 503 until it can. The read function
+  needs that way out as well now, and the token variables
+  (`PORTAL_JWT_ISSUER`, `PORTAL_JWT_AUDIENCE`, and `PORTAL_JWKS_URL` for
+  Entra): without them it answers 500 on every data endpoint.
 - **The reference rule (`REG-13-N`).** The registrar and approver functions
   read `PORTAL_CELLS` to know which tenant runs where. They make no call for
   it and assume no role in a cell.

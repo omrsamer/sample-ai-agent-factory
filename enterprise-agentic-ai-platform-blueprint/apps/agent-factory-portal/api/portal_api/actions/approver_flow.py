@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: MIT-0
 """Approver actions: approve or reject a record that was submitted for approval.
 
-An approval counts as a review. When the approved document names a ``reviewBy``
-date, the approval is also recorded as an attestation with that date, so the
-one rule "the latest attestation wins" gives the effective review date: a
-re-approval with a new date moves it, and so does a later review. The date
-recorded is never more than a year from the approval (``reviews.approval_date``).
+An approval counts as a review. Every approval is also recorded as an
+attestation, so the one rule "the latest attestation wins" gives the
+effective review date: a re-approval moves it, and so does a later review.
+The date recorded is the approved document's ``reviewBy``, and never more
+than a year from the approval; a document that names no date gets the day a
+year from the approval, so that every approved registration is due at some
+point (``reviews.approval_date``).
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from botocore.exceptions import ClientError
 
 from portal_api import registrations, reviews
 from portal_api.actions import approver, audit_writer, authority, lifecycle_rules, reference_rules
-from portal_api.actions.engine import ActionEngine, ActionError, Target
+from portal_api.actions.engine import ActionEngine, ActionError, Target, record_state
 from portal_api.aws import audit as audit_reader
 from portal_api.aws.session import error_code
 from portal_api.models.portal import ActionResult, DecisionInput, Registration
@@ -61,6 +63,7 @@ def decide(engine: ActionEngine, action: str, record_id: str, body: DecisionInpu
         status_before=str(record.get("status")),
         document_sha256=registrations.sha256(registrations.canonical(document)),
     )
+    target.state = record_state(target.status_before, target.document_sha256)
     state: dict[str, Any] = {
         "recordId": record_id,
         "tenantId": document.get("tenantId"),
@@ -111,9 +114,9 @@ def decide(engine: ActionEngine, action: str, record_id: str, body: DecisionInpu
         nonlocal recorded
         status = _STATUS[action]
         approver.set_status(engine.registry, engine.settings.registry_id, record_id, status, body.reason)
-        if reviews.parse_date(review_by) is not None:
-            # The document's date, or a year from now if the document names a later one.
-            attested = reviews.approval_date(str(review_by), dt.datetime.now(dt.UTC).date())
+        if action == "approve":
+            # The document's date, or a year from now if the document names a later one or none.
+            attested = reviews.approval_date(review_by, dt.datetime.now(dt.UTC).date())
             recorded = _attest_approval(engine, target, attested, body.reason, request_id, attributes)
         try:
             return approver.get_record(engine.registry, engine.settings.registry_id, record_id)
@@ -140,7 +143,7 @@ def decide(engine: ActionEngine, action: str, record_id: str, body: DecisionInpu
 def _attest_approval(
     engine: ActionEngine, target: Target, review_by: str, reason: str, request_id: str, attributes: dict[str, str]
 ) -> bool:
-    """Record the approval as an attestation with the approved document's review date.
+    """Record the approval as an attestation with the review date it sets (``reviews.approval_date``).
 
     Called after the registry accepted the approval, which cannot be taken
     back, so a failed write does not fail the approval: the result event says
@@ -151,7 +154,7 @@ def _attest_approval(
     principal = engine.principal
     at = audit_writer.now_stamp()
     try:
-        audit_writer.put_attestation(
+        latest = audit_writer.put_attestation(
             engine.dynamodb,
             engine.settings.audit_table,
             at=at,
@@ -160,18 +163,19 @@ def _attest_approval(
             reviewed_by=principal.subject,
             reviewed_by_label=principal.label,
             reviewed_by_role=principal.role,
-            reason=f"Approved: {reason}",
+            reason=reviews.approval_reason(reason),
             request_id=request_id,
             record_name=target.record_name,
             tenant_id=target.tenant_id,
             kind=reviews.KIND_APPROVAL,
         )
     except Exception as exc:  # noqa: BLE001 - the approval itself is not in question
-        # As for a review: an item with this call's own key can only be this call's write, sent twice.
-        if error_code(exc) != "ConditionalCheckFailedException":
-            logger.error("The approval's review date could not be recorded: %s", error_code(exc))
-            attributes["detail"] = REVIEW_NOT_RECORDED
-            return False
+        logger.error("The approval's review date could not be recorded: %s", error_code(exc))
+        attributes["detail"] = REVIEW_NOT_RECORDED
+        return False
+    if not latest:
+        # As for a review: the stored attestation is this one, sent twice, or one attested later.
+        logger.warning(audit_writer.LATER_ATTESTATION_STORED)
     attributes["attested_at"] = at
     attributes["next_review_by"] = review_by
     return True

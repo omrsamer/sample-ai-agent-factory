@@ -25,8 +25,11 @@ registration and by when it must be reviewed again.
 - The record's submitter cannot attest its review (REV-05-N), as the
   submitter cannot approve it: a review is a second pair of eyes. A record
   the portal knows no submitter of can be attested by any approver.
-- A record's review can be attested once in 24 hours (REV-06-N). An approval
-  is not a review attestation and is not counted.
+- A record's review can be attested once in 24 hours (REV-06-N): each
+  attestation adds two events to the record's own history, which the
+  decisions about the record read back. An approval records an attestation
+  of its own kind and is not counted by this rule: it follows a new submit,
+  where that read ends.
 
 The rules are evaluated in that order and the first that fails decides. The
 last two need the record's history, so they are functions of their own

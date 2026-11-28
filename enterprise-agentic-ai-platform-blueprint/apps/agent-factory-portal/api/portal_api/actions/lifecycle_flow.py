@@ -30,7 +30,7 @@ from botocore.exceptions import ClientError
 from portal_api import registrations, reviews
 from portal_api.actions import approver, audit_writer, authority
 from portal_api.actions import lifecycle_rules as rules
-from portal_api.actions.engine import ActionEngine, ActionError, Target
+from portal_api.actions.engine import ActionEngine, ActionError, Target, record_state
 from portal_api.aws import audit as audit_reader
 from portal_api.aws.session import error_code
 from portal_api.mappers.common import parse_instant
@@ -84,6 +84,7 @@ def _load(engine: ActionEngine, action: str, record_id: str) -> tuple[dict[str, 
         status_before=str(record.get("status")),
         document_sha256=registrations.sha256(registrations.canonical(document)),
     )
+    target.state = record_state(target.status_before, target.document_sha256)
     return record, target
 
 
@@ -142,19 +143,18 @@ def _spaced_and_separate(engine: ActionEngine, target: Target, record_id: str, n
 
     Both are read from the record's own history, for a caller who has
     already passed the authority, the tenant and the status. Each refusal is
-    written once and logged after that.
+    written once for each person while the record stays as it is, and logged
+    after that (``ActionEngine.deny``).
     """
     events = engine.history_for_review(record_id, now)
     submitted = audit_reader.submitter(events)
     refusal = rules.submitter_refusal(engine.principal.subject, submitted.actor_subject if submitted else None)
     if refusal is not None:
-        newer = events if submitted is None else events[: events.index(submitted)]
-        raise engine.deny(target, 403, refusal.reason, since=newer)
+        raise engine.deny(target, 403, refusal.reason)
     last = audit_reader.last_review_attempt(events)
     refusal = rules.recent_review_refusal(parse_instant((last.attested_at or last.at) if last else None), now)
     if refusal is not None:
-        newer = events if last is None else events[: events.index(last)]
-        raise engine.deny(target, 409, refusal.reason, since=newer)
+        raise engine.deny(target, 409, refusal.reason)
 
 
 def review(engine: ActionEngine, record_id: str, body: ReviewInput) -> ActionResult:
@@ -175,7 +175,7 @@ def review(engine: ActionEngine, record_id: str, body: ReviewInput) -> ActionRes
     def call() -> dict[str, Any]:
         at = audit_writer.now_stamp()
         try:
-            audit_writer.put_attestation(
+            latest = audit_writer.put_attestation(
                 engine.dynamodb,
                 engine.settings.audit_table,
                 at=at,
@@ -190,12 +190,14 @@ def review(engine: ActionEngine, record_id: str, body: ReviewInput) -> ActionRes
                 tenant_id=target.tenant_id,
             )
         except Exception as exc:  # noqa: BLE001 - whatever the cause, nothing was attested
-            # The sort key holds this call's own timestamp. An item that is already there can only be
-            # this call's write, sent again by the SDK after a response that never arrived.
-            if error_code(exc) != "ConditionalCheckFailedException":
-                logger.error("The review attestation could not be written: %s", error_code(exc))
-                raise ActionError(503, "The review could not be recorded, so nothing was attested") from exc
-            logger.warning("The review attestation was already written by an earlier attempt of this call")
+            logger.error("The review attestation could not be written: %s", error_code(exc))
+            raise ActionError(503, "The review could not be recorded, so nothing was attested") from exc
+        if not latest:
+            # The attestation that is stored for this record is as new as this one: this very
+            # write, sent again by the SDK after an answer that never arrived, or one that was
+            # attested later at nearly the same moment. It stays the latest. This review is
+            # attested all the same: its result event, which follows, is where it is on record.
+            logger.warning(audit_writer.LATER_ATTESTATION_STORED)
         attested["attested_at"] = at
         return record
 

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT-0
 """Identity provider seam.
 
-The API runs behind an Amazon API Gateway HTTP API whose JWT authorizer has
-already validated signature, issuer and audience. This module only reads the
-validated claims and turns them into a ``Principal``. Role comes from
+This module turns claims into a ``Principal``. The claims it is given are
+those of the caller's bearer token, after the function verified the token
+itself (``portal_api/identity/verify.py``, ``portal_api/identity/deps.py``):
+it never sees claims taken from the invocation event. Role comes from
 ``PORTAL_GROUP_ROLE_MAP``; the highest-privilege mapped role wins and a caller
 with no mapped group has no access.
 """

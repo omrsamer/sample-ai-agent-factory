@@ -50,10 +50,14 @@ CONTAINED = "contained"  # the policy holds the statement the portal writes for 
 FOREIGN = "foreign"  # a statement carries the portal's Sid but is not that statement
 ABSENT = "absent"  # no statement carries the portal's Sid
 
-# Said wherever a state is shown and the policy is ``FOREIGN``.
+# Said wherever a state is shown and the policy is ``FOREIGN``. It does not say what that
+# statement does: one in another shape can deny nothing (an Allow, a condition that never holds)
+# or deny invocation to some callers or to all (another form of the principal, action names in
+# another case). The portal does not try to tell which. It is not the statement the portal
+# writes, so the Runtime is not contained by the portal, and a contain replaces it.
 FOREIGN_STATEMENT = (
-    "A statement with the portal's identifier is in the Runtime's resource policy but does not deny "
-    "invocation; contain the agent to replace it."
+    "A statement with the portal's identifier is in the Runtime's resource policy, but it is not the "
+    "statement the portal writes and may or may not deny invocation; contain the agent to replace it."
 )
 
 # The elements of the statement the portal writes. A statement with any other element (a

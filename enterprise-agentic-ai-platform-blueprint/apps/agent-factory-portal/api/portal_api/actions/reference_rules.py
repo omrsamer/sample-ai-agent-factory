@@ -24,6 +24,16 @@ every tenant.
 The registrar function applies the rule on create and on update, and the
 approver function applies it again on approve, so that a record written
 before the rule existed, or by other means, is not approved either.
+
+A second rule is about spelling (``misspelled_reference``). The service
+answers for more than one spelling of an ARN (another partition string reads
+the same resource), and the portal acts on a Runtime only under the ARN it
+builds from the cell's configuration. A registration that names a resource
+of a cell with another partition string would look registered and could not
+be contained by its id. So a reference into the account and Region of a
+configured cell must carry that cell's partition. The registrar function
+refuses anything else on create and on update, as a document that is not
+valid.
 """
 
 from __future__ import annotations
@@ -46,6 +56,28 @@ HINT = (
     "or of an account and Region in which the portal has no cell. In an account that several tenants "
     "share, only someone who holds every tenant there can name one."
 )
+
+
+def misspelled_reference(document: Mapping[str, Any], cells: Iterable[Cell]) -> tuple[str, str] | None:
+    """The field and the sentence for a reference into a cell that is not written with the cell's partition.
+
+    ``None`` when every reference that points into the account and Region of
+    a configured cell begins with that cell's partition, and for a reference
+    into an account and Region with no cell: nothing is known about those.
+    """
+    cells = tuple(cells)
+    for field, what in REFERENCES:
+        parts = arn_parts(document.get(field))
+        if not parts:
+            continue
+        partitions = {c.partition for c in cells if (c.account_id, c.region) == (parts["account"], parts["region"])}
+        if partitions and parts["partition"] not in partitions:
+            expected = sorted(partitions)[0]
+            return field, (
+                f"document.{field} names a {what} in the account and Region of a configured cell, "
+                f"so it must begin with arn:{expected}: as the ARNs of that cell do"
+            )
+    return None
 
 
 def foreign_reference(

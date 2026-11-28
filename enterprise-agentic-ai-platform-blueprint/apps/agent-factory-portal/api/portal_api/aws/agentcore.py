@@ -47,7 +47,7 @@ def containment_state(client: Any, runtime_arn: str) -> str | None:
     """What the Runtime's resource policy says about its containment. ``None`` when it cannot be read.
 
     One of ``containment_policy.CONTAINED``, ``FOREIGN`` (a statement carries
-    the portal's Sid but does not deny invocation) and ``ABSENT``.
+    the portal's Sid but is not the statement the portal writes) and ``ABSENT``.
     ``runtime_arn`` is the ARN as the service or the portal spells it, never
     as a caller wrote it.
     """

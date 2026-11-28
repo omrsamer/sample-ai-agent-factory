@@ -66,7 +66,17 @@ from tests.test_containment import (
     session_stream,
     sid,
 )
-from tests.test_lifecycle import a_day_later, day, events_of, retire, review, reviews_items
+from tests.test_lifecycle import (
+    a_day_later,
+    attestation_items,
+    attested,
+    day,
+    events_of,
+    kinds,
+    retire,
+    review,
+    reviews_items,
+)
 from tests.test_sweeps import KEY, SWEEPER_ENV, Run, SweepWorld, contained
 
 read = test_containment.read  # the read API over the same cell, record and audit table
@@ -321,8 +331,11 @@ def test_one_function_reads_a_policy_for_containment_and_every_user_goes_through
     # Where each user asks.
     package = Path(portal_api.__file__).resolve().parent
     flow = (package / "actions" / "containment_flow.py").read_text()
-    # A contain, a release, and a contain that is answered at once because it comes too soon.
-    assert flow.count("containment_policy.state(policy, target.runtime_arn)") == 3
+    # One place for a contain, a release, and a contain that is answered at once because it comes
+    # too soon: the policy is read once, before anything is written, and everything follows from it.
+    assert flow.count("found=containment_policy.state(policy, arn),") == 1
+    assert flow.count("containment_policy.state(") == 1 and flow.count("containment.get_policy(") == 3
+    assert flow.count("self._open(target, action)") == 1
     assert flow.count("containment_policy.is_contained(verified, target.runtime_arn)") == 2  # both read-backs
     sweeper_source = (package / "actions" / "sweeper.py").read_text()
     assert "containment_policy.state(containment.get_policy(control, arn), arn)" in sweeper_source
@@ -374,6 +387,7 @@ def forget(dynamo: FakeDynamo) -> None:
     """Start counting the table's reads and writes afresh."""
     dynamo.calls.clear()
     dynamo.queried.clear()
+    dynamo.prefixes.clear()
     dynamo.pages_read = dynamo.items_read = 0
 
 
@@ -498,11 +512,14 @@ def test_a_release_reads_back_only_to_the_contain_it_is_about(world):
 
 def test_a_contain_never_waits_or_fails_for_the_history(world):
     """An emergency action does not depend on how long the Runtime's history is, or on reading it."""
+    # A history written before there were two ranges: its sweeps lie among the events a release reads.
     seed(world.dynamo, KEY, [stored(later(n), "sweep", "skipped", "agent-factory-portal") for n in range(2500)])
-    # It looks at the newest events once, to see whether it was contained a moment ago: one request.
+    # It looks at the newest events once, to see whether it was contained a moment ago: one request
+    # for each range of the history, one page each.
     code, body = world.post("contain", claims=SEC)
     assert code == 200 and body["state"] == "contained", body
-    assert (world.dynamo.calls.count("query"), world.dynamo.pages_read) == (1, 1)
+    assert (world.dynamo.calls.count("query"), world.dynamo.pages_read) == (2, 2)
+    assert world.dynamo.prefixes == [(KEY, "EVENT#"), (KEY, "OTHER#")]
     assert world.dynamo.items_read == audit_reader.PAGE_SIZE
     assert world.post("release", claims=PAT)[0] == 409  # the holder is too far back: see the next test
     # And when the trail cannot be read at all, it goes on as it always did.
@@ -813,10 +830,10 @@ def test_the_containment_view_shows_the_newest_events_and_says_when_there_are_mo
     # Who holds it, and the sweeps of this containment, are right although the history was cut.
     assert (view["state"], view["contained_by"], view["detail"]) == ("contained", "sec-1", None)
     assert view["sweeps"] == {"scheduled": 2, "done": 0}
-    # One request of the Runtime's history, for one more event than is shown. (The other request is
-    # the inventory's, for the review attestations.)
-    assert world.dynamo.queried == ["REVIEWS", KEY]
-    assert (world.dynamo.pages_read, world.dynamo.items_read) == (2, limit + 1)
+    # One request for each range of the Runtime's history, for one more event than is shown. (The
+    # other two requests are the inventory's, for the review attestations.)
+    assert world.dynamo.prefixes == [("REVIEWS", "RECORD#"), ("REVIEWS", "EVENT#"), (KEY, "EVENT#"), (KEY, "OTHER#")]
+    assert (world.dynamo.pages_read, world.dynamo.items_read) == (4, limit + 1)
     # A role that is not shown the incident record is not told anything about its length either.
     other = read(world.record_id, VIEW)[1]
     assert (other["events"], other["events_truncated"], other["state"]) == ([], False, "contained")
@@ -924,11 +941,12 @@ def test_the_documents_say_what_the_code_does_about_statements_histories_and_arn
         "replaced_foreign_statement: boolean;",
         # S2
         "**Who writes into a Runtime's history.** Only a caller who has a part in the Runtime",
-        "The same refusal of the same person is written once per containment and logged after that.",
+        "A refusal is written once for each person, rule and containment, and logged after that.",
         f"events: AuditEvent[]; // the newest {view} events of the Runtime's history, newest first",
         "events_truncated: boolean;",
         f"at most {decision} events",
-        f"A contain reads at most the newest {audit_reader.PAGE_SIZE} events of the Runtime's history, in one request",
+        f"A contain looks at the newest {audit_reader.PAGE_SIZE} events of each range of the Runtime's history, "
+        "one request each",
         # S3
         "**One ARN per Runtime.**",
         "refused with 422 before anything is read",
@@ -1196,7 +1214,7 @@ def test_a_sweep_message_under_another_spelling_is_not_run_and_writes_nothing(wo
     assert run.handle(sweeps.encode(sweeps.SweepMessage(2, RUNTIME_ARN, RUNTIME_ID, request_id))) == "allowed"
     assert run.handle(json.dumps({"runtime_arn": RUNTIME_ARN, "sweep": 9})) == "invalid"
     assert [e["outcome"] for e in run.sweep_events()] == ["allowed"]
-    assert world.dynamo.queried == [KEY]
+    assert world.dynamo.prefixes == [(KEY, "EVENT#"), (KEY, "OTHER#")]  # the one history that was read
 
 
 @pytest.mark.parametrize(
@@ -1626,10 +1644,17 @@ def test_a_repeated_contain_does_its_work_at_once_when_the_statement_is_not_ther
     world.cell.policies[RUNTIME_ARN] = policy_of(DECOYS["a condition that never holds"])
     body = world.post("contain", claims=SEC)[1]
     assert (body["outcome"], body["replaced_foreign_statement"]) == ("allowed", True)
-    # Not readable: the contain goes on, and says itself what is wrong.
+    # Not readable: the contain is not answered at once. It says itself what is wrong, and that nothing
+    # was changed. The policy is read once for a request, so the next request reads it again.
+    events_before = len(world.dynamo.events())
     world.cell.fail["get_resource_policy"] = "AccessDeniedException"
     code, body = world.post("contain", claims=SEC)
-    assert code == 200 and body["retry_after_seconds"] is None  # the first read failed, the contain's own did not
+    assert code == 502 and body["detail"] == (
+        "Nothing was changed. The Runtime's resource policy could not be read (AccessDeniedException)."
+    )
+    (failed,) = world.dynamo.events()[events_before:]
+    assert (failed["phase"], failed["outcome"], failed["reason"]) == ("result", "failed", body["detail"])
+    assert failed["sk"].startswith("OTHER#") and failed["request_id"] == body["request_id"]
     world.assumed.error = client_error("AccessDenied", "AssumeRole")
     code, body = world.post("contain", claims=SEC)
     assert code == 502 and "could not be assumed" in body["detail"]
@@ -2007,8 +2032,10 @@ def test_a_record_with_another_submitter_or_with_none_is_attested_by_any_approve
 
 
 def test_a_records_review_is_attested_once_in_24_hours(records, monkeypatch, caplog):
-    """The attack: attest one's own approved record thousands of times, so that the one partition that
-    holds every attestation is read only as far as those, and other tenants' reviews drop out."""
+    """The attack was: attest one's own approved record thousands of times, so that the one partition
+    the inventory reads is read only as far as those, and other tenants' reviews drop out. The rule
+    spaces the attestations of a record out, and the partition holds one item for a record whatever
+    their number, so even the ones the rule lets through add nothing to that read."""
     record_id = records.new_record("APPROVED")
     assert review(records, record_id, ANN, day(90))[0] == 200
     recorded = len(record_events(records, record_id))
@@ -2026,7 +2053,9 @@ def test_a_records_review_is_attested_once_in_24_hours(records, monkeypatch, cap
     assert review(records, record_id, ANN, day(120))[0] == 409
     a_day_later(monkeypatch, 24.1)
     assert review(records, record_id, RECORD_SEC, day(120))[0] == 200
-    assert [item["next_review_by"] for item in reviews_items(records)] == [day(90), day(120)]
+    # Both reviews are in the record's history. The partition the inventory reads holds the latest.
+    assert [e["next_review_by"] for e in attested(records, record_id) if e["action"] == "review"] == [day(90), day(120)]
+    assert [item["next_review_by"] for item in attestation_items(records)] == [day(120)]
 
 
 def test_an_approval_is_not_counted_as_a_review_attestation(records):
@@ -2034,12 +2063,13 @@ def test_an_approval_is_not_counted_as_a_review_attestation(records):
     code, body = records.create(review_by=day(200))
     record_id = body["registration"]["record_id"]
     assert records.submit(record_id)[0] == 200 and records.decide("approve", record_id, ANN)[0] == 200
-    assert [item["kind"] for item in reviews_items(records)] == ["approval"]
+    assert [item["kind"] for item in attestation_items(records)] == ["approval"]
     assert review(records, record_id, RECORD_SEC, day(100))[0] == 200  # at once
     # And a review does not hold up a later approval.
     assert records.update(record_id, DEV, review_by=day(150))[0] == 200
     assert records.submit(record_id)[0] == 200 and records.decide("approve", record_id, ANN)[0] == 200
-    assert [item["kind"] for item in reviews_items(records)] == ["approval", "review", "approval"]
+    assert kinds(records) == ["approval", "review", "approval"]
+    assert [item["kind"] for item in attestation_items(records)] == ["approval"]  # the latest one
     # The review of a moment ago still counts after the re-approval: one attestation of a review in 24 hours.
     assert review(records, record_id, RECORD_SEC, day(100))[0] == 409
 
@@ -2210,7 +2240,7 @@ def test_the_documents_say_what_the_code_does_about_the_rest_of_the_review():
     for said in (
         "**Role session names.**",
         "| Sweeper | the cell's containment role, with a session policy (section 7) | `portal-sweeper` |",
-        "**And its session could not, even if its code did.**",
+        "**The session its code asks for cannot either.**",
         "### The audit table, by partition key",
         "| Registrar (registrar role) | `RECORD#<record id>`, `RECORD#NAME#<record name>` | nothing | `RECORD#*` |",
         "| Approver (approver role) | `RECORD#<record id>`, `REVIEWS` | `RECORD#<record id>` | `RECORD#*`, `REVIEWS` |",

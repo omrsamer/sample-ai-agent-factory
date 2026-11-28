@@ -290,8 +290,10 @@ class AuditEvent(BaseModel):
     sessions_found: int | None = None
     sessions_stopped: int | None = None
     sessions_failed: int | None = None
-    # The result of a contain: how many background sweeps it scheduled.
+    # The result of a contain: how many background sweeps it scheduled, and which (for example
+    # "2,3"). The sweeper runs a sweep only when its number is in that list.
     sweeps_scheduled: int | None = None
+    sweeps_scheduled_numbers: str | None = None
     # A background sweep (action "sweep"): which one it is (1, 2 or 3), how many sessions had
     # already ended, and how long the sweep took.
     sweep: int | None = None
@@ -409,7 +411,8 @@ class ContainmentView(BaseModel):
     contained_by_me: bool = False  # the caller contained it and therefore cannot release it
     # Why the state is unknown (for example no reader in the agent's account). Also set when the
     # state is not_contained although a statement with the portal's identifier is in the policy:
-    # that statement does not deny invocation, and a contain replaces it.
+    # it is not the statement the portal writes (it may or may not deny invocation), and a
+    # contain replaces it.
     detail: str | None = None
     partial: bool = False  # the containment that holds did not stop every session it found
     # How long a contain, and a release, can take to apply everywhere.

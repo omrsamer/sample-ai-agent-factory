@@ -139,6 +139,9 @@ class World:
     def trail(self) -> list[tuple[str, str, str]]:
         return [(e["action"], e["phase"], e["outcome"]) for e in self.dynamo.events()]
 
+    def attestations(self) -> list[dict[str, str]]:
+        return self.dynamo.attestations()
+
 
 @pytest.fixture
 def world(monkeypatch: pytest.MonkeyPatch) -> World:

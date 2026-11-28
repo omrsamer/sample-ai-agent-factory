@@ -17,6 +17,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from portal_api.aws.logs import UnsafeQueryValue
 from portal_api.aws.session import error_code
 from portal_api.config import ConfigError
+from portal_api.identity import verify as tokens
+from portal_api.identity.deps import KEYS_UNAVAILABLE
 from portal_api.identity.provider import NotAuthenticated, NotAuthorized
 from portal_api.routes import (
     agents,
@@ -103,6 +105,12 @@ def create_app() -> FastAPI:
     @app.exception_handler(NotAuthorized)
     async def not_authorized(_: Request, exc: NotAuthorized) -> JSONResponse:
         return JSONResponse({"detail": "No portal role is assigned to this identity"}, status_code=403)
+
+    @app.exception_handler(tokens.KeysUnavailable)
+    async def keys_unavailable(_: Request, exc: tokens.KeysUnavailable) -> JSONResponse:
+        # The read API verifies the caller's token itself, like the action functions.
+        logger.error("No token can be verified: %s", exc)
+        return JSONResponse({"detail": KEYS_UNAVAILABLE}, status_code=503)
 
     @app.exception_handler(Forbidden)
     async def forbidden(_: Request, exc: Forbidden) -> JSONResponse:

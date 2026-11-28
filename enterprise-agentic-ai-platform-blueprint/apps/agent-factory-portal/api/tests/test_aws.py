@@ -294,10 +294,10 @@ def test_retire_sends_the_status_call_the_sdk_accepts():
         stub.assert_no_pending_responses()
 
 
-def _attestation_item(at: str, record_id: str = "recAAAAAAAAA1") -> dict:
+def _attestation_item(at: str, record_id: str = "recAAAAAAAAA1", sort_key: str | None = None) -> dict:
     return {
         "pk": {"S": "REVIEWS"},
-        "sk": {"S": f"EVENT#{at}#{record_id}"},
+        "sk": {"S": sort_key or f"RECORD#{record_id}"},
         "kind": {"S": "review"},
         "at": {"S": at},
         "record_id": {"S": record_id},
@@ -310,47 +310,52 @@ def _attestation_item(at: str, record_id: str = "recAAAAAAAAA1") -> dict:
     }
 
 
-def test_attestations_are_read_page_by_page_with_a_real_query_request():
+def test_attestations_are_read_page_by_page_with_real_query_requests():
+    """Two reads of the one partition: the latest of every record, then the ones written before that."""
     from portal_api.aws import audit
 
     client = _client("dynamodb")
-    request = {
-        "TableName": "agenticai-portal-audit-test",
-        "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
-        "ExpressionAttributeValues": {":pk": {"S": "REVIEWS"}, ":prefix": {"S": "EVENT#"}},
-        "ConsistentRead": True,
-        "ScanIndexForward": False,
-    }
-    newer, older = "2026-06-01T10:00:00.000000Z", "2026-01-01T10:00:00.000000Z"
-    last_key = {"pk": {"S": "REVIEWS"}, "sk": {"S": f"EVENT#{newer}#recAAAAAAAAA1"}}
 
-    def stub_two_pages(stub: Stubber, pages: int) -> None:
-        stub.add_response("query", {"Items": [_attestation_item(newer)], "LastEvaluatedKey": last_key}, request)
+    def request(prefix: str) -> dict:
+        return {
+            "TableName": "agenticai-portal-audit-test",
+            "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
+            "ExpressionAttributeValues": {":pk": {"S": "REVIEWS"}, ":prefix": {"S": prefix}},
+            "ConsistentRead": True,
+            "ScanIndexForward": False,
+        }
+
+    latest, newer, older = "2026-09-01T10:00:00.000000Z", "2026-06-01T10:00:00.000000Z", "2026-01-01T10:00:00.000000Z"
+    earlier = {at: _attestation_item(at, sort_key=f"EVENT#{at}#recAAAAAAAAA1") for at in (newer, older)}
+    last_key = {"pk": {"S": "REVIEWS"}, "sk": earlier[newer]["sk"]}
+
+    def stub_the_reads(stub: Stubber, pages: int) -> None:
+        stub.add_response("query", {"Items": [_attestation_item(latest)]}, request("RECORD#"))
+        stub.add_response("query", {"Items": [earlier[newer]], "LastEvaluatedKey": last_key}, request("EVENT#"))
         if pages > 1:
-            stub.add_response(
-                "query", {"Items": [_attestation_item(older)]}, {**request, "ExclusiveStartKey": last_key}
-            )
+            following = {**request("EVENT#"), "ExclusiveStartKey": last_key}
+            stub.add_response("query", {"Items": [earlier[older]]}, following)
 
     with Stubber(client) as stub:
-        stub_two_pages(stub, 2)
+        stub_the_reads(stub, 2)
         found, truncated = audit.query_attestations(client, "agenticai-portal-audit-test")
         stub.assert_no_pending_responses()
-    assert [a.at for a in found] == [newer, older] and truncated is False
+    assert [a.at for a in found] == [latest, newer, older] and truncated is False
     assert (found[0].record_id, found[0].next_review_by, found[0].reviewed_by_label) == (
         "recAAAAAAAAA1",
         "2027-06-01",
         "Ann Approver",
     )
 
-    # Bounded: after the last allowed page it stops, and says that more was left unread.
+    # Bounded: after the last allowed page of a read it stops, and says that more was left unread.
     with Stubber(client) as stub:
-        stub_two_pages(stub, 1)
+        stub_the_reads(stub, 1)
         found, truncated = audit.query_attestations(client, "agenticai-portal-audit-test", max_pages=1)
         stub.assert_no_pending_responses()
-    assert [a.at for a in found] == [newer] and truncated is True
+    assert [a.at for a in found] == [latest, newer] and truncated is True
 
 
-def test_an_attestation_is_written_with_a_put_the_sdk_accepts_and_cannot_replace_an_item():
+def test_an_attestation_is_written_with_a_put_the_sdk_accepts_and_replaces_only_an_older_one():
     from botocore.exceptions import ClientError
 
     from portal_api.actions import audit_writer
@@ -360,7 +365,10 @@ def test_an_attestation_is_written_with_a_put_the_sdk_accepts_and_cannot_replace
     expected = {
         "TableName": "agenticai-portal-audit-test",
         "Item": _attestation_item(at),
-        "ConditionExpression": "attribute_not_exists(pk)",
+        # One item for a record. It is written when no attestation is stored or the stored one is older.
+        "ConditionExpression": "attribute_not_exists(#at) OR #at < :at",
+        "ExpressionAttributeNames": {"#at": "at"},
+        "ExpressionAttributeValues": {":at": {"S": at}},
     }
     arguments = {
         "at": at,
@@ -374,12 +382,16 @@ def test_an_attestation_is_written_with_a_put_the_sdk_accepts_and_cannot_replace
     }
     with Stubber(client) as stub:
         stub.add_response("put_item", {}, expected)
-        audit_writer.put_attestation(client, "agenticai-portal-audit-test", **arguments)
+        assert audit_writer.put_attestation(client, "agenticai-portal-audit-test", **arguments) is True
+        # The condition refused it: what is stored is not older. That is an answer, not a failure.
         stub.add_client_error("put_item", "ConditionalCheckFailedException", expected_params=expected)
+        assert audit_writer.put_attestation(client, "agenticai-portal-audit-test", **arguments) is False
+        # Anything else is a failure, and is raised.
+        stub.add_client_error("put_item", "ProvisionedThroughputExceededException", expected_params=expected)
         try:
             audit_writer.put_attestation(client, "agenticai-portal-audit-test", **arguments)
         except ClientError as exc:
-            assert error_code(exc) == "ConditionalCheckFailedException"
+            assert error_code(exc) == "ProvisionedThroughputExceededException"
         else:
-            raise AssertionError("a second write of the same attestation must fail")
+            raise AssertionError("a write that failed must not be reported as done")
         stub.assert_no_pending_responses()

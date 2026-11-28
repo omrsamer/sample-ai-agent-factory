@@ -350,10 +350,11 @@ class PortalService:
         return inventory
 
     def _load_attestations(self, inventory: Inventory) -> None:
-        """Every review attestation with one query. A failure never fails the inventory.
+        """The latest review attestation of every record, without a query per agent.
 
-        When they cannot be read, each agent's review date is its registration's own
-        and the fleet summary carries a warning.
+        A failure never fails the inventory. When they cannot be read, each
+        agent's review date is its registration's own and the fleet summary
+        carries a warning.
         """
         table = self.settings.audit_table
         if not table:
@@ -685,14 +686,15 @@ class PortalService:
         role, for the caller's own use (the evidence document checks how recent they are).
         """
         dynamodb = self.clients.platform("dynamodb", self.settings.registry_region)
-        # The history belongs to the Runtime, whatever id the agent is listed under. It is read back
-        # from its newest event to the one that settles who holds the containment, and far enough
-        # to show the newest events: never to its end for its own sake.
-        trail, found = audit_reader.read_holder(dynamodb, table, runtime_arn, at_least=audit_reader.MAX_VIEW_EVENTS)
-        events = trail.events
+        # The history belongs to the Runtime, whatever id the agent is listed under. Who holds the
+        # containment is read from the events that can settle it, back to the one that does; the
+        # sweeps and repeated contains since are read back to the time of that event, and both
+        # far enough to show the newest events: never to the end for its own sake.
+        history = audit_reader.read_history(dynamodb, table, runtime_arn, at_least=audit_reader.MAX_VIEW_EVENTS)
+        events = history.events
         incident_reader = caller_role in (authorities.CONTAIN_ROLES | authorities.RELEASE_ROLES)
-        settled = found.decided or trail.ended
-        holder = found.event if settled else None
+        settled = history.settled
+        holder = history.holder.event if settled else None
         if not settled and view.state == "contained":
             view.detail = HOLDER_NOT_FOUND
         if holder is not None and view.state != "not_contained":
@@ -1216,8 +1218,8 @@ class PortalService:
             )
         if inventory.attestations_truncated:
             warnings.append(
-                "Only the newest review attestations were read. For an agent whose latest attestation "
-                "is older than those, the registration's own review date is shown."
+                "Not every review attestation was read. For an agent whose latest attestation was "
+                "left out, the review date shown is an earlier one or the registration's own."
             )
         return warnings
 
@@ -1438,6 +1440,10 @@ class PortalService:
             if release is None and not runs.warnings:
                 limitations.append("The pipeline of this agent's cell has no execution to show.")
 
+        # The review date comes from the inventory, like the sections beside it. What is listed is
+        # every attestation that was read for this record: the ones among its events above, where
+        # the history of attestations is kept, and what the inventory holds (the latest).
+        known = inventory.attestations.get(entry.agent.id, []) if entry.record is not None else []
         return evidence_builder.build(
             entry=entry,
             generated_at=now_iso(),
@@ -1447,7 +1453,8 @@ class PortalService:
             assessed_at=inventory.assessed_at,
             decisions=decisions,
             decisions_truncated=decisions_truncated,
-            attestations=inventory.attestations.get(entry.agent.id, []) if entry.record is not None else [],
+            attestations=reviews.merged(known, audit_reader.attestations_in(decisions)),
+            latest_attestation=known[0] if known else None,
             containment=containment,
             containment_details=principal.role in (authorities.CONTAIN_ROLES | authorities.RELEASE_ROLES),
             gateways=gateways,

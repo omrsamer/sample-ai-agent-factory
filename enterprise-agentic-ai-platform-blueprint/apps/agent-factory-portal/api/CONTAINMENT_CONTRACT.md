@@ -112,21 +112,23 @@ recognised by all of it, not by its Sid: `Effect` `Deny`, `Principal` `"*"`,
 actions and nothing but invoke actions, and no other element (no `Condition`,
 `NotAction`, `NotPrincipal` or `NotResource`). Whoever can write the
 Runtime's policy can put a statement under the portal's Sid that denies
-nothing: an `Allow`, a condition that never holds, one harmless action. Such
-a statement is not containment, wherever the portal looks:
+nothing: an `Allow`, a condition that never holds, one harmless action. A
+statement in another shape can also deny invocation, to some callers or to
+all: another form of the principal, action names in another case. The portal
+does not try to tell which. A statement under its Sid that is not the one it
+writes is not containment by the portal, wherever the portal looks:
 
 - The view and `flags.contained` say `not_contained`, and the view's `detail`
-  says: "A statement with the portal's identifier is in the Runtime's
-  resource policy but does not deny invocation; contain the agent to replace
-  it."
+  says: "A statement with the portal's identifier is in the Runtime's resource policy, but it is not the statement the portal writes and may or may not deny invocation; contain the agent to replace it."
+  The sentence claims nothing about what that statement does.
 - A contain replaces it with the portal's statement, stops the sessions as
   for any contain, and says so: `replaced_foreign_statement` is true and the
   `reason`, the `policy` step and the result event carry the sentence "A
   statement with the portal's identifier that the portal had not written was
   in the policy and was replaced."
-- A release leaves it where it is, answers `unchanged`, and says that it is
-  there.
-- A sweep stops nothing (outcome `skipped`).
+- A release leaves it where it is, answers `unchanged`, and says that the
+  statement the portal writes was not there to remove, with the same sentence.
+- A sweep stops nothing (outcome `skipped`), and says the same.
 
 Both actions are idempotent: containing a contained agent, or releasing one
 that is not contained, changes nothing and answers `outcome: "unchanged"`.
@@ -183,11 +185,22 @@ function (the sweeper) runs later with no caller waiting:
 
 Each sweep, on its own:
 
-1. Reads the Runtime's containment history, back to the contain whose request
+1. Reads the Runtime's containment history (both of its ranges, see "The
+   Runtime's history"), back to the contain whose request
    id the message carries. A message proves nothing: whoever can invoke the
    sweeper writes any request id and any sweep number into one. The sweep is
    run only when the history says all of this:
    - a contain with that request id is on record and scheduled sweeps;
+   - this sweep is one of them. The contain's result lists the sweeps it
+     scheduled (`sweeps_scheduled_numbers`, for example `"2,3"`), and the
+     sweeper admits only the sweeps that the contain's result lists. A first
+     sweep for a contain that needed none would otherwise run at once and
+     count as one of its sweeps. A first sweep can reach the sweeper before
+     its contain has written that result, so the sweeper waits for that
+     result for up to 40 seconds, counted from the contain's intent, which
+     is longer than the containment function can run. A result that has not
+     come by then was lost: the second and third sweep, which every contain
+     schedules, are still admitted; a first sweep is not;
    - this sweep has not left its event yet;
    - it is due. A sweep is run no earlier than 30 seconds before it is due,
      counted from the contain's own events. The queue never delivers a
@@ -223,14 +236,27 @@ Each sweep, on its own:
 5. Writes one event in the Runtime's history: action `sweep`, with what it
    found, what it stopped and how long it took.
 
-**What a sweep writes, and how often.** A history is never shortened, and a
-release reads it back to the contain it undoes. So the sweeper writes into a
-history only for a sweep that a contain on record scheduled, and once: at
-most three events for one contain, whoever sends or replays messages or
-invokes the function. Beside the event it writes one item that is not an
-event, the claim of step 1: sort key `SWEEP#<request id>#<sweep number>`, in
-the Runtime's own partition. No read of a history returns a claim, and like
-every item of the table it is never changed or deleted.
+**What a sweep writes, and how often.** A history is never shortened. So the
+sweeper writes into a
+history only for a sweep that a contain on record scheduled, and once: one
+event for each sweep that the contain scheduled, so two or three for one
+contain, whoever sends or replays messages or invokes the function. A sweep
+changes nothing about who holds a containment, so its event is written into
+the range of the history that a release does not read. The
+event carries the agent id of the contain, taken from the contain's own
+events, and nothing of the message but the request id and the sweep number
+that the history confirmed. Beside the event the sweeper writes one item that
+is not an event, the claim of step 1: sort key
+`SWEEP#<request id>#<sweep number>`, in the Runtime's own partition. No read
+of a history returns a claim, and like every item of the table it is never
+changed or deleted.
+
+**One invocation, one sweep.** The sweeper runs exactly one message for each
+invocation. The queue hands it one at a time. An invocation with no record,
+or with more than one, did not come from the queue as it is set up: it is
+logged and nothing in it is run. Several records would share one
+invocation's time, and a long sweep of one Runtime put first would leave a
+due sweep of another none.
 
 A sweep that was claimed and has left no event is still running, or its run
 was cut short. Either way it is not run a second time. A further delivery of
@@ -269,6 +295,9 @@ Limits, so that nothing here reads as more than it is:
   it wrote its event is not run again. Sweeps 2 and 3 run however sweep 1
   ended. If the last one fails, `quiet_at` stays null; contain the agent
   again to schedule more.
+- A sweep whose message arrives so late that more than 2000 events were
+  recorded since its contain is not run: what a sweep reads of the history
+  then no longer says whether it has run.
 - If the sweeps cannot be scheduled, the contain still succeeds: the
   `background` step is `failed`, `partial` is true, and the step's `detail`
   says how many were scheduled. Contain again to schedule them. The same
@@ -277,6 +306,70 @@ Limits, so that nothing here reads as more than it is:
 - Without a sweep queue there are no sweeps: no `background` step,
   `sweeps_scheduled_in_seconds` is empty, and the view shows
   `sweeps.scheduled` 0 and `quiet_at` null.
+
+## The Runtime's history
+
+Every contain, release, refusal and sweep leaves events in the Runtime's
+history, which is one partition of the audit table:
+`CONTAINMENT#<Runtime ARN>`. Every event is written once, into one of two
+ranges of that partition:
+
+| Sort key begins with | Holds | Read by |
+| --- | --- | --- |
+| `EVENT#` | The events that can change who holds the containment: the intent and the result of a contain that writes the statement, of a release that removes it, and of the first contain that finds the statement in place with nobody on record as holding it | A release, to find who contained the Runtime. Also the view, the sweeper and the check before a contain |
+| `OTHER#` | Every other event: a background sweep, a refusal, a contain of a Runtime that is already contained and held (it stops sessions and schedules sweeps, and changes nothing about who holds it), a contain that was answered at once, a release of a Runtime that is not contained, and an attempt that could not read the Runtime's policy | The view, the sweeper and the check before a contain. Never a release |
+
+- **A release finds who holds a containment whatever number of sweeps and
+  repeated contains were recorded since.** It reads the first range only,
+  back to the event that settles the holder. One settled contain is followed
+  there by nothing until the next contain or release that changes something.
+  Before, every event was in the one range: a contain repeated every sixteen
+  minutes (an intent, a result and two or three sweeps each time) put the
+  contain that holds the Runtime out of a release's reach after five and a
+  half days, with no misuse needed, only an automation during a long
+  incident.
+- **Which range an event goes into follows from what the request can
+  change**, never from anything the caller sends. The containment function
+  reads the Runtime's policy before it writes the intent; reading changes
+  nothing, and that read is the one the action then works with. A contain
+  that will write the statement and a release that will remove it are
+  written into the first range, intent and result both. So is a contain that
+  finds the statement in place while the history says that nobody holds the
+  containment (the Runtime was contained by other means): the first person
+  to assert a containment holds it, and a release must find that person.
+  Every other request is written into the second range, intent and result
+  both.
+- **An attempt that could not read the policy leaves one event:** a `result`
+  with outcome `failed`, in the second range, with no intent before it.
+  Nothing was about to be changed. This covers a containment role that
+  could not be assumed, a policy that could not be read, and one that could
+  not be parsed. Before, such an attempt left an intent and a result.
+- **What is left of the bound.** A release reads at most 2000 events of the
+  first range. What can still pile up there without settling anything is a
+  request that was about to change the policy and failed at that write (the
+  service refused it): an intent and a result, two events for each such
+  failure, and no caller brings one about at will. A thousand of them in a
+  row, with no contain or release in between that worked, would again put
+  the holder out of reach. The release then answers 409 with "The Runtime's containment history holds more than 2000 events since its last contain or release, so who contained it could not be established. The Runtime was not released."
+  and the view's `detail` says "Who contained the agent could not be established: the Runtime's history holds more than 2000 events since its last contain or release."
+  The remedy is the one it was: remove the statement in the cell account,
+  then contain and release through the portal.
+- **A history written before there were two ranges** holds everything in
+  the first. Nothing is moved, and it is read the same way. For a
+  containment that began before the upgrade, the sweeps and repeated
+  contains recorded until then still count towards the bound; they stop
+  growing with it, because new ones are written into the second range.
+- **Refusals.** A refused release (`CON-03-N`, `CON-06-N`) is written once
+  for each person, rule and containment, into the second range, and logged
+  after that. A mark in the Runtime's partition (`ONCE#<hash>`, written with
+  the condition that it does not exist) makes the "once" hold without a
+  read of the history. If the mark cannot be written, the refusal is logged
+  and not recorded.
+
+Nothing in a response changes shape for this. Two things show in `events`:
+an attempt that could not read the policy is one event where it was two, and
+the list is the newest 200 events of the two ranges together, in the order
+they were written.
 
 ## Types
 
@@ -340,7 +433,7 @@ interface ContainmentView {
   contained_at: string | null;        // ISO 8601 UTC
   reason: string | null;
   contained_by_me: boolean;           // the caller contained it and so cannot release it
-  detail: string | null;              // a sentence to show: why the state is unknown; or, with state not_contained, that a statement with the portal's Sid is in the policy but does not deny invocation; or, with state contained, that who contained the agent could not be established
+  detail: string | null;              // a sentence to show: why the state is unknown; or, with state not_contained, that a statement with the portal's Sid is in the policy that is not the one the portal writes (it may or may not deny invocation); or, with state contained, that who contained the agent could not be established
   partial: boolean;                   // the containment that holds did not stop every session it found
   enforcement_delay_seconds: number;  // 90: how long a contain can take to apply everywhere
   release_delay_seconds: number;      // 300: how long a release can take to apply everywhere
@@ -358,7 +451,9 @@ Containment events use the `AuditEvent` shape of ACTIONS_CONTRACT.md with
 `status_before` and `status_after` are `contained`, `not_contained` or
 `unknown`. `outcome` can be `allowed`, `unchanged`, `denied` or `failed`.
 The result event of a contain that scheduled background sweeps also has
-`sweeps_scheduled` (how many).
+`sweeps_scheduled` (how many) and `sweeps_scheduled_numbers` (which, as text:
+`"2,3"` when the request dealt with every session it found, `"1,2,3"` when it
+left something undone, fewer when not every message could be sent).
 
 A `sweep` event is written by the sweeper, one per sweep, with no intent
 event before it:
@@ -390,7 +485,9 @@ A history written before these rules can hold both: a `sweep` event with
 outcome `failed`, no `sweep` number and a request id of its own (an invalid
 message), and two events for one sweep (a message that was delivered
 twice). They stay as they are, and the counts in `sweeps` count a sweep
-once.
+once. A contain recorded before its result listed its sweeps has no
+`sweeps_scheduled_numbers`; for such a contain every sweep number is
+admitted, as it was when that contain was made.
 
 ## Read endpoint (read API, any mapped role)
 
@@ -414,22 +511,27 @@ other means shows `contained` with it null.
 `detail` is also set in three cases in which the state is known or cannot be
 asked for. Show it as it is:
 
-- `not_contained` with a statement under the portal's Sid that does not deny
-  invocation (see "Contained means the portal's statement, whole"). Offer
+- `not_contained` with a statement under the portal's Sid that is not the
+  one the portal writes (see "Contained means the portal's statement,
+  whole"; it may or may not deny invocation). Offer
   Contain as usual: it replaces that statement.
 - `unknown` for a registration that names its Runtime by another spelling of
   its ARN: the portal reads a policy and a history only under the ARN it
   builds itself, so neither was read.
 - `contained` when who contained the agent could not be established, because
   the Runtime's history holds more than 2000 events since its last contain
-  or release. `contained_by` and `contained_at` are then null, and a release
+  or release among those a release reads (see "The Runtime's history": no
+  number of sweeps or repeated contains brings that about any more).
+  `contained_by` and `contained_at` are then null, and a release
   is refused (409) for the same reason.
 
 `events` holds the newest 200 events of the Runtime's history.
 `events_truncated` is true when the history holds older ones. Who holds the
-containment, `partial`, `sweeps` and `quiet_at` are not affected by that: they
+containment and `partial` are not affected by that: they
 are read back to the event that began the containment, however many events
-came before it.
+came before it. `sweeps` and `quiet_at` are read back to that event too, and
+at most 2000 events: for a containment with more sweeps and repeated
+contains than that since it began, they describe the newest 2000.
 
 **The incident record is for responders.** Who contained the agent, why, and
 the history of attempts (`contained_by`, `contained_by_label`, `reason`,
@@ -439,7 +541,13 @@ an empty list, and still gets `state`, `enabled`, `contained_at`, `partial`,
 `contained_by_me`, `sweeps`, `quiet_at` and the two delays. Show "Contained
 since <time>" to those roles and no history table.
 
-Status codes: 200; 401; 403 (no mapped group); 404 (no such agent); 422 (malformed id).
+The role that decides this is the one the caller's token gives. The read
+API verifies the token itself, as the containment function does, and takes
+nothing about the caller from the invocation event.
+
+Status codes: 200; 401; 403 (no mapped group); 404 (no such agent); 422
+(malformed id); 503 (the identity provider's signing keys could not be
+fetched, so the caller could not be verified and nothing was read).
 
 ## Action endpoints (containment function)
 
@@ -507,8 +615,8 @@ Notes for the UI:
   history, and what is in the function's log under that `request_id`:
   - **In the history:** every contain and release that was allowed, every
     failure, the two-person refusal (`CON-03-N`) and the refusal for a
-    tenant that changed (`CON-06-N`). The same refusal of the same person is
-    written once per containment and logged after that.
+    tenant that changed (`CON-06-N`). A refusal is written once for each
+    person, rule and containment, and logged after that.
   - **In the log only:** a refusal for the role (`CON-01-N`, `CON-02-N`),
     for the tenant (`CON-04-N`, `CON-05-N`), for a cell that did not enable
     containment, and for a history too long to establish who contained the
@@ -527,18 +635,22 @@ for release), `CON-03-N` (two-person rule), `CON-04-N` (tenant not held),
 `CON-06-N` (release: the Runtime's tenant changed since it was contained, or
 was not known then; `platform` only).
 
-**A long history.** A contain reads at most the newest 200 events of the
-Runtime's history, in one request, to see whether it was contained a moment
-ago; it does its work whatever that read says, and also when it fails, so it
-does not depend on the history's length. A release reads it back from the newest event to
-the contain it is about, and at most 2000 events. If the contain is not among
-them, the release is refused with 409 and the Runtime stays contained: who
-contained it is not known, and that must not read as "nobody". The statement
-can then be removed only in the cell account, outside the portal. Someone
-with no part in the Runtime cannot add an event to its history, and a refusal
-is written once per containment. A responder of the Runtime's own tenant
-adds events by containing it again only when that contain does its work,
-which is at most once in 15 minutes, and one event in between.
+**A long history.** A contain looks at the newest 200 events of each range
+of the Runtime's history, one request each, to see whether it was contained
+a moment ago and whether somebody holds it; it does its work whatever those
+reads say, and also when they fail, so it does not depend on the history's
+length. (A contain of a Runtime that is already contained reads further only
+when the newest events of an old history do not say who holds it, and then
+as far as a release reads.) A release reads the events that can change who
+holds the containment, from the newest back to the one that settles it, and
+at most 2000 of them. If none of them settles it, the release is refused
+with 409 and the Runtime stays contained: who contained it is not known, and
+that must not read as "nobody". The statement can then be removed only in
+the cell account, outside the portal. Someone with no part in the Runtime
+cannot add an event to its history, and a refusal is written once for each
+person, rule and containment. A responder of the Runtime's own tenant who
+contains it again and again adds nothing to what a release reads: those
+contains and their sweeps are written into the other range.
 
 ## Routing
 
@@ -558,14 +670,21 @@ As the blueprint deploys the portal:
 - Only the containment function's role can send, receive, delete, change the
   visibility of or purge a message of the sweep queue. The queue's own
   policy denies those five to every other principal, an administrator of
-  the account included, so nobody else can start a sweep through the queue
-  or make a scheduled one disappear.
+  the account included, so nobody else can put a message on the queue or
+  take one off it. That is the queue's messages, not the queue: a principal
+  that may change the queue's attributes or delete it (the role that deploys
+  the portal, for one) can still make scheduled sweeps disappear, for
+  example by shortening how long the queue keeps a message.
 - Two alarms watch the sweeps: one when a message could not be processed
   twice and was set aside in the dead-letter queue, one when the oldest
   message of the queue has waited for more than an hour.
-- Contain and release each have a request budget of their own at the API: 5
-  requests per second with a burst of 10. No other route can use it up, so
-  a flood of reads does not keep a responder from containing an agent.
+- Contain and release each have a request budget of their own at the API:
+  100 requests per second with a burst of 200. No other route can use it
+  up, so a flood of reads does not keep a responder from containing an
+  agent. A request is counted before the function decides who may act, so
+  the budget is set far above what responders need.
+- Up to five sweeps run side by side, so that one Runtime with very many
+  sessions does not hold up the sweeps of every other.
 
 CORS: with `PORTAL_ALLOWED_ORIGINS` set, the containment function allows
 `POST` with the request headers `authorization` and `content-type`.

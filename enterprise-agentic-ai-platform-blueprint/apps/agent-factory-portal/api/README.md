@@ -36,7 +36,7 @@ caller with a mapped role.
 | Path | Source |
 | --- | --- |
 | `/health` | Liveness only. No authentication, no data, no configuration |
-| `/users/me` | Validated token claims and `PORTAL_GROUP_ROLE_MAP` |
+| `/users/me` | The claims of the caller's token, which the function verified itself, and `PORTAL_GROUP_ROLE_MAP` |
 | `/agents`, `/agents/{id}` | AWS Agent Registry records with the `agenticai.agent-governance/1.0` document, merged with Amazon Bedrock AgentCore runtimes found in cell accounts. A runtime that no record references is returned with `lifecycle_state` and `registration` set to `discovered`. A registered agent's `name` is its agent id; the registry record name is in `record_name` |
 | `/agents/{id}/runtime` | Runtime status from the cell account |
 | `/agents/{id}/deployments` | Runtime versions of the agent's runtime |
@@ -282,8 +282,12 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   `NotAction`, `NotPrincipal`, `NotResource`). Whoever can write a Runtime's
   policy can put a statement under the portal's Sid that denies nothing, and
   a check of the Sid alone would then report the Runtime as contained and a
-  contain as already done. Such a statement is not containment: the read
-  side says `not_contained` with a sentence, a contain replaces it and says
+  contain as already done. A statement under the Sid in any other shape is
+  not containment by the portal, whether it denies nothing or denies
+  invocation in a form of its own; the portal does not try to tell which,
+  and its sentence says only that it is not the statement the portal
+  writes. The read
+  side says `not_contained` with that sentence, a contain replaces it and says
   so (`replaced_foreign_statement`), a release leaves it and says that it is
   there, and a sweep stops nothing. `Principal` must be the plain `"*"`: it
   is the one form that covers a Runtime whose callers sign in with OAuth
@@ -348,9 +352,12 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   from the message. It assumes the cell's containment role with a session
   policy that allows only what a sweep does (read the policy, list endpoints
   and log streams, stop a session, and the two query actions in a cell with
-  the spans option), so its session cannot write or delete a resource policy
-  whatever its code does (`session_policy` in
-  `portal_api/actions/sweeper.py`). Each function assumes a cell's role
+  the spans option), so the session it works with cannot write or delete a
+  resource policy (`session_policy` in `portal_api/actions/sweeper.py`). The
+  sweeper's own code asks for that session. The role it runs under is the
+  containment function's, which may assume a cell's role without a session
+  policy, so this limits the code as it is written, not what the role could
+  do. Each function assumes a cell's role
   under a session name of its own (`portal-reader`, `portal-containment`,
   `portal-sweeper`), so the cell's CloudTrail tells their calls apart. A
   message it cannot validate is logged and dropped, and leaves no event.
@@ -363,11 +370,18 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   have taken that contain's place. It then claims the sweep with one
   conditional write (`claim_sweep` in `portal_api/actions/audit_writer.py`),
   so that a second delivery or a second invocation at the same moment cannot
-  run it as well. That is at most three events for one contain, whoever
-  sends or replays messages or invokes the function: a history is never
-  shortened, and a release reads it back to the contain it undoes. The
-  worst a forged or replayed message can do is start, at the time it is due,
-  a sweep that a contain scheduled. The containment view
+  run it as well. That is one event for each sweep that the contain
+  scheduled, whoever sends or replays messages or invokes the function: a
+  history is never shortened. A sweep's event is written into the range of
+  the history that a release does not read (`OTHER#`, see "Two ranges"
+  below). Which sweeps a contain scheduled is in its result event
+  (`sweeps_scheduled_numbers`), and no other number is admitted; a first
+  sweep that is here before that result waits for it, for up to 40 seconds.
+  The sweep's event carries the agent id of its contain, not of the message.
+  One invocation runs exactly one message: an invocation with any other
+  number of records is logged and nothing in it is run. The worst a forged
+  or replayed message can do is start, at the time it is due, a sweep that a
+  contain scheduled. The containment view
   reports `sweeps` (scheduled, done) and `quiet_at`, the end of the first
   complete sweep that started after the 90 seconds. Without the queue
   variable the feature is off and a contain is exactly what it was.
@@ -377,7 +391,10 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   hours, of which none or one was running: 430 stop calls and 21.5 to 22
   seconds per sweep, which is the cap of 20 per second plus about half a
   second of listing; the service did not push back. On a busy Runtime that
-  is the cost of each of the three sweeps.
+  is the cost of each of the three sweeps. The cap is for one sweep. Up to
+  five sweeps run side by side, so the stops in one cell account can add up
+  to 100 per second when five sweeps of its Runtimes run at once; that rate
+  was not measured.
 - **A contain repeated too soon.** A contain of an agent that is already
   contained does its work again (stops sessions, schedules sweeps) only
   when the sweeps of the last one are over: no sooner than 15 minutes after
@@ -459,12 +476,37 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   repeated contain is recorded as `unchanged` and does not replace the
   holder; a contain that failed after the statement may have been written
   still names a holder.
+- **Two ranges, and every event written once.** The events of a Runtime's
+  history lie in two ranges of its partition.
+  `sk = EVENT#<UTC timestamp>#<event id>` holds the events that can change
+  who holds the containment: the intent and the result of a contain that
+  writes the statement, of a release that removes it, and of the first
+  contain that finds the statement in place with nobody on record as holding
+  it. `sk = OTHER#<UTC timestamp>#<event id>` holds every other event: a
+  sweep, a refusal, a contain of a Runtime that is already contained and
+  held, a contain that was answered at once, a release of a Runtime that is
+  not contained, and an attempt that could not read the Runtime's policy
+  (one `failed` result with no intent: nothing was about to change). An
+  event is written into one range and never into both, so the two cannot
+  disagree. To know which, the containment function reads the Runtime's
+  policy before it writes the intent. Reading changes nothing, and that read
+  is the one the action then works with. A release finds who contained the
+  Runtime in the first range alone (`read_holder`), so that read does not
+  grow with the sweeps and the repeated contains of a long incident. Before,
+  every event was in the one range, and a contain repeated every sixteen
+  minutes (an intent, a result and two or three sweeps each time) put the
+  contain that holds the Runtime out of a release's reach after five and a
+  half days. A history written before there were two ranges holds
+  everything in the first; nothing is moved, and it is read the same way.
 - **Who writes into a Runtime's history.** Only a caller who has a part in
   the Runtime: the role for the action and the Runtime's tenant, for a
   Runtime of a cell that has a containment role. So the history holds every
   contain and release that was allowed, every failure, and the two-person
-  refusal (`CON-03-N`), which is written once per person and containment
-  and logged after that. Every other refusal goes to the function's log
+  refusal (`CON-03-N`), which is written once for each person, rule and
+  containment and logged after that. A mark in the Runtime's partition
+  (`ONCE#<hash>`, written with the condition that it does not exist) makes
+  that "once" hold without a read, however long the containment lasts.
+  Every other refusal goes to the function's log
   with the `request_id` the answer carries, and nothing is read of the
   history for it: a refusal for the role, for the tenant (`CON-04-N`,
   `CON-05-N`), and for a cell that did not enable containment. A history is
@@ -472,14 +514,21 @@ Specified for the front end in [CONTAINMENT_CONTRACT.md](CONTAINMENT_CONTRACT.md
   responder of one tenant could fill the history of another tenant's
   Runtime, or a history under an ARN of their own choosing, one event per
   request.
-- **How far a read of the history goes.** A contain never reads it, so an
-  emergency action does not depend on its length. A release reads it back
-  from the newest event to the one that settles who holds the containment
-  (`read_holder` in `portal_api/aws/audit.py`), and at most 2000 events. If
-  nothing settles it within that, the release is refused with 409 and the
-  Runtime stays contained: an unknown holder must not read as no holder.
-  The view and the evidence document read the same way and show the newest
-  200 events, with `events_truncated` when there are older ones.
+- **How far a read of the history goes.** A contain looks at the newest 200
+  events of each range, one request each, to see whether it was contained a
+  moment ago and whether somebody holds it. It does its work whatever those
+  reads say, and when they fail, so an emergency action does not depend on
+  the history's length. A release reads the first range back from its newest
+  event to the one that settles who holds the containment (`read_holder` in
+  `portal_api/aws/audit.py`), and at most 2000 events. What can still pile
+  up there without settling anything is a request that was about to change
+  the policy and failed at that write: an intent and a result each, and no
+  caller brings one about at will. If nothing settles it within 2000, the
+  release is refused with 409 and the Runtime stays contained: an unknown
+  holder must not read as no holder. The view and the evidence document read
+  both ranges, the second back to the event that began the containment and
+  at most 2000 events, and show the newest 200 events of the two together,
+  with `events_truncated` when there are older ones.
 - **Who reads the incident record.** `GET /agents/{id}/containment` returns
   who contained the agent, why, and the events only to a role that can
   contain or release. Other roles get the state.
@@ -546,36 +595,61 @@ agent can be downloaded as one document. Specified for the front end in
   registration and by when it must be reviewed again (after today in UTC, at
   most 366 days ahead). It never touches the record, because any update of a
   record returns it to `DRAFT`. It writes the usual `intent` and `result`
-  events to the record's own partition, and between them one item to the
-  partition `pk = REVIEWS`, `sk = EVENT#<UTC timestamp>#<record id>`, with the
-  record id, who reviewed, when, the next review date and the reason. Like
-  every event it is written with `attribute_not_exists(pk)`: a new item per
-  attestation, never an overwrite. The `result` event names the attestation's
-  time (`attested_at`).
+  events to the record's own partition. The `result` event is the
+  attestation on record: it names the attestation's time (`attested_at`)
+  and the next review date, and the history of a record's attestations is
+  read from those events. Between the two events the function writes the
+  attestation where the inventory reads it: `pk = REVIEWS`,
+  `sk = RECORD#<record id>`, with the record id, who reviewed, when, the next
+  review date and the reason.
+- **One item for a record where the inventory reads.** The `REVIEWS`
+  partition holds one item for a record, its latest attestation, whatever
+  number of times the record was attested. The write carries the condition
+  `attribute_not_exists(#at) OR #at < :at`: no attestation is stored for the
+  record yet, or the stored one was attested earlier (`at` is a reserved
+  word of DynamoDB, hence `#at`). It is the only item of the table that a
+  later write may replace; every event, mark and claim is written with
+  `attribute_not_exists(pk)` and stays as it is. The two times compared are
+  the function's own clock, never a value of the request. When the condition
+  refuses the write, a later attestation is already stored (two were made at
+  nearly the same moment and reached the table in the other order), or this
+  very write was sent twice. Either way the stored one is the latest, the
+  attestation is in the record's history all the same, and the action goes
+  on. So the partition grows with the number of records and not with the
+  number of approvals and reviews: a record that is updated, submitted and
+  approved again and again, which added one item each time before, now has
+  one.
 - **Who attests, and how often.** A review is a second pair of eyes, so the
   record's submitter cannot attest it (`REV-05-N`), as the submitter cannot
   approve it. A record the portal knows no submitter of (published by a
   pipeline) can be attested by any approver of its tenant. And a record's
-  review is attested once in 24 hours (`REV-06-N`, 409): every attestation
-  lives in the one `REVIEWS` partition, whose read is bounded, so one record
-  attested thousands of times would push other records' attestations out of
-  that read. An approval is not a review attestation and is not counted.
+  review is attested once in 24 hours (`REV-06-N`, 409): each attestation
+  adds two events to the record's own history, which the decisions about
+  the record read back to its latest submit. An approval records an
+  attestation of its own kind and is not counted by this rule: it follows a
+  new submit, where that read ends. A record whose review is attested every
+  single day reaches the bound of that read (2,000 events) after about two
+  years and nine months without a new submit; a review then answers 409 and
+  says so, until the record is updated and submitted again.
   Both rules are read from the record's own history, back to its latest
-  submit and 24 hours, and each refusal is written once and logged after
-  that.
-- **An approval counts as a review.** When an approval completes and the
-  approved document names `reviewBy`, the approver function also writes an
-  attestation of kind `approval` for the record, with that date, or with the
-  approval date plus 366 days when the document names a later one, and the
-  approver as the reviewer.
-  A document with no `reviewBy` writes nothing. The write follows the
+  submit and 24 hours, and each refusal is written once for each person
+  while the record stays as it is, and logged after that.
+- **An approval counts as a review.** When an approval completes, the
+  approver function also writes an attestation of kind `approval` for the
+  record, with the approver as the reviewer: its result event names it, and
+  it takes the place of the record's item in `REVIEWS`. Its date is the approved
+  document's `reviewBy`, or a year from the approval (the approval date plus
+  366 days) when the document names a later date or none. So every
+  registration approved through the portal is due at some point: before, one
+  that named no date never was. The write follows the
   registry's answer, which cannot be taken back, so if it fails the approval
   stands, the result event says that the review date was not recorded, and
   the response has `audit_complete: false`.
 - **The effective review date.** One rule: the latest attestation wins, of
-  either kind. After an approval the date is the document's own; a later
-  review moves it; a later re-approval with a new date moves it again; a
-  re-approval of a document with no date leaves the earlier one. A
+  either kind. After an approval the date is the document's own, or a year
+  from the approval when the document names none; a later review moves it; a
+  later re-approval moves it again, to the new document's date or to a year
+  from that approval. A
   registration with no attestation (one approved outside the portal) shows
   the `reviewBy` of its document. `review_by` on an agent,
   `flags.review_overdue` and the `REVIEW_OVERDUE` rule use that date, and the
@@ -583,13 +657,24 @@ agent can be downloaded as one document. Specified for the front end in
   a record that no longer exists is ignored. A retired registration is never
   overdue: it can no longer be attested, so the flag would ask for something
   nobody can do.
-- **How the read API reads attestations.** With one query of the `REVIEWS`
-  partition per inventory load, newest first, never one per agent. The read is
-  bounded to 20 pages of 1 MB. If it cannot be read, each agent keeps its
+- **How the read API reads attestations.** With two queries of the `REVIEWS`
+  partition per inventory load, whatever the number of agents. The first
+  returns the latest attestation of every record (`sk` begins with
+  `RECORD#`), so its size follows the number of records. The second returns
+  what a table holds from before there was one item for a record
+  (`sk = EVENT#<UTC timestamp>#<record id>`, one item for each attestation,
+  newest first); nothing writes those any more, and they are read so that
+  such a table keeps its review dates. The latest attestation of a record
+  wins, whichever of the two reads returned it. Each read is bounded to 20
+  pages of 1 MB. If one stops there, `/fleet/summary` says in `warnings`:
+  "Not every review attestation was read. For an agent whose latest
+  attestation was left out, the review date shown is an earlier one or the
+  registration's own." If the partition cannot be read, each agent keeps its
   registration's own date and `/fleet/summary` says so in `warnings` and
   `review_attestations`; the inventory never fails for it.
   `GET /registrations/{record_id}` takes the last review from the record's own
-  events, so it shows an attestation as soon as it is made.
+  events, so it shows an attestation as soon as it is made: the latest by
+  the time it was attested, which is the one `REVIEWS` holds.
 
 ### Evidence document
 
@@ -603,7 +688,7 @@ no-store`). Any mapped role may read it. Its sections:
 | `agent` | Id, name, tenant, environment, account alias or masked account, Region, Runtime ARN, inventory state, detection sources, reader status, inbound authorizer | The inventory |
 | `registration` | Record id and name, status, version, the governance document exactly as stored, and its SHA-256 (the value the audit events carry). Null for an agent with no registration | The inventory |
 | `decisions` | The registration's audit events, oldest first | The audit table, read for the document |
-| `reviews` | The attestations of both kinds, oldest first, and the effective review date with its source | The inventory |
+| `reviews` | The effective review date with its source, and the attestations of both kinds, oldest first | The inventory for the date. For the list: the registration's own events, where each review and approval names its attestation, and the latest attestation the inventory holds, each once |
 | `containment` | The current state, who holds it, the background sweeps (scheduled, done, and since when no session the portal can find is running), the containment events, oldest first, and how long a contain and a release take to apply everywhere | The Runtime's resource policy through the cell reader, the audit table, and `portal_api/containment_timing.py` |
 | `risk` | Level, reasons, flags and `assessed_at` | The inventory |
 | `policy` | Per linked Tool Gateway: id, name, policy mode, number of policies, and SHA-256 hashes of the Cedar statements as deployed | The gateway's policy engine through the cell reader |
@@ -669,6 +754,15 @@ The two action functions and their endpoints are specified in
 - **Record shape.** The same document, record name and calls as
   `pipelines/publish_agent_record.py`. `schemas/agent-governance-1.0.json` is a
   copy of the canonical schema in `packages/agent-registry/schemas`.
+- **A reference is spelled as its cell spells it.** A Runtime, Tool Gateway
+  or policy engine ARN that points into the account and Region of a
+  configured cell must begin with that cell's partition
+  (`misspelled_reference` in `portal_api/actions/reference_rules.py`; 422 on
+  create and update). The service answers for other partition strings, and
+  the portal acts on a Runtime only under the ARN it builds from the cell,
+  so a registration spelled another way would look registered and could not
+  be contained by its id. A reference into an account and Region with no
+  cell is not checked.
 - **Audit trail.** Every decision about a record is appended to the Amazon
   DynamoDB table in `PORTAL_AUDIT_TABLE` (`pk = RECORD#<record_id>`,
   `sk = EVENT#<UTC timestamp>#<uuid>`). For an allowed action an `intent` event
@@ -688,6 +782,21 @@ The two action functions and their endpoints are specified in
     (`cross-tenant ... is denied`, `RET-02-N`, `REV-02-N`);
   - a create refused for authority, for the tenant or by `REG-13-N`, before
     any record exists.
+
+  A refusal of a caller who does have a part is written once for each
+  person, rule and state of the record (its status and the document it
+  holds), and so is the `unchanged` answer of a retirement that is asked for
+  again. Repeated, it is answered as before and logged. A person with a part
+  in a record could otherwise lengthen its history with every request, and
+  approve, reject and review, which read it back to the record's last
+  submit, would fail closed: two thousand refused approvals take little more
+  than a minute. "Once" is one conditional write and no read (`mark_once` in
+  `portal_api/actions/audit_writer.py`): an item with the sort key
+  `ONCE#<hash>` in the record's partition, written before the event with the
+  condition that it does not exist. So it holds however fast a request is
+  repeated, and the registrar function, whose role may only write, can do it.
+  The state is read from the registry, never from the request, so a new
+  proposal in every request is not a new state.
 
   A history is keyed by a record the function has read, never by an id or a
   name a caller sent, and it is never shortened. Otherwise any signed-in user
@@ -745,14 +854,17 @@ validates signature, issuer and audience before a function is invoked.
 `security`, `sre`, `approver`, `finops`, `developer`, `readonly`. The highest
 mapped role wins. No identity is `401`; no mapped group is `403`.
 
-**The read API takes the caller from the claims API Gateway verified** and
-passes in the event.
-
-**The three action functions verify the token themselves**
-(`portal_api/identity/verify.py`) and build the caller from the token alone.
-They do not read the claims in the event, so an event made up by someone who
-can invoke a function directly carries no weight: without a token the issuer
-signed, the answer is `401`. For each request they check:
+**No function takes the caller from the invocation event.** The read API
+verifies the caller's bearer token itself, and so do the three action
+functions, with the same code (`portal_api/identity/verify.py`, and
+`principal_from_request` in `portal_api/identity/deps.py`). They build the
+caller from the token alone. They do not read the claims API Gateway puts
+into the event, so an event made up by someone who can invoke a function
+directly carries no weight: without a token the issuer signed, the answer is
+`401`. On the read API that decides what a role is shown: who contained an
+agent, why, and the events of the incident are returned only to a responder
+role, and a role named in an event would otherwise be believed. For each
+request they check:
 
 1. **The token:** `Authorization: Bearer <token>`.
 2. **Algorithm:** `RS256` only. `none` and the HMAC algorithms are refused
@@ -806,11 +918,13 @@ owner a signer of portal tokens. The address follows from the issuer:
 
 **What this does not cover.**
 
-- **The read API** still trusts the claims API Gateway passes. A principal of
-  the Platform account who holds `lambda:InvokeFunction` on the read function
-  can call it with claims of its own making and read what any persona may
-  read. It cannot change anything that way. Treat that permission on the
-  portal's functions as a protected authority of the Platform account.
+- **Invoking a function directly.** A principal of the Platform account who
+  holds `lambda:InvokeFunction` on one of the functions can call it without
+  API Gateway. It then needs a token the issuer signed for a person with a
+  portal role, like any caller, and gets what that person gets and no more.
+  What it goes around is what the gateway adds: its throttling and its own
+  check of the token. Treat that permission on the portal's functions as a
+  protected authority of the Platform account.
 - **The sweeper** has no caller and no token: its input is a queue message,
   which is not signed. Only the containment function's role can put a
   message on its queue, but whoever holds `lambda:InvokeFunction` on the
@@ -865,6 +979,9 @@ callers their own name.
 | `PORTAL_CELLS` | yes | JSON list of `{ tenantId, agentId, applicationId?, environment, accountId, region, readerRoleArn, externalId?, alarmNamePrefix?, pipelineName?, accountAlias?, containmentRoleArn?, containmentSpans?, omniDomainUrl?, omniRegion? }`. `containmentSpans` (true or false, default false) lets containment also search the cell's spans for sessions; it needs a containment role and widens what that role can read (see "Containment") |
 | `PORTAL_IDENTITY_PROVIDER` | yes | `cognito` or `entra` |
 | `PORTAL_GROUP_ROLE_MAP` | yes | JSON object, group or app role name to portal role |
+| `PORTAL_JWT_ISSUER`, `PORTAL_JWT_AUDIENCE` | yes | The token issuer and the accepted audiences, as for the action functions below: the read API verifies the caller's token itself |
+| `PORTAL_JWT_TOKEN_USE` | no | Cognito only: `id` (default) or `access`, as below |
+| `PORTAL_JWKS_URL` | for Entra | The key set of the issuer's own tenant, as below. Not used for Cognito |
 | `PORTAL_GUARDRAIL_TAG_KEY`, `PORTAL_GUARDRAIL_TAG_VALUE` | no | Tag that marks a guardrail as part of the blueprint. Both empty (the default): every guardrail in the account and Region is listed and tags are not read. Set both or neither |
 | `PORTAL_MODEL_ALLOWLIST` | yes | JSON list of model ids, or of `{ modelId, provider?, regions?, status? }` |
 | `PORTAL_ALLOWED_ORIGINS` | no | JSON list of origins for CORS. Default: none. `*` is rejected |
@@ -902,11 +1019,13 @@ with a reason that names the variable, and the reason is logged. There is no
 fallback to sample data. The sweeper raises instead, so its message goes back
 to the queue and ends in the dead-letter queue.
 
-The token variables are required for the three action functions, so the code
-that reads them and the variables must be deployed together: an action
-function without `PORTAL_JWT_ISSUER` answers `500` with "PORTAL_JWT_ISSUER is
-not set: the action functions verify the caller's token themselves and need
-the token issuer". The read API and the sweeper do not read them.
+The token variables are required for the read API and for the three action
+functions, so the code that reads them and the variables must be deployed
+together: a function without `PORTAL_JWT_ISSUER` answers `500` on every data
+endpoint with "PORTAL_JWT_ISSUER is not set: the portal's functions verify
+the caller's token themselves and need the token issuer", and never falls
+back to the claims in the event. The liveness probe (`/health`) reads no
+configuration and still answers. The sweeper does not read them.
 
 ## Run locally
 
@@ -922,8 +1041,8 @@ curl -H 'x-portal-dev-user: dev@example.com' -H 'x-portal-dev-groups: my-group' 
 `PORTAL_DEV_AUTH=1` lets a request name its user and groups in headers. The
 role is still resolved through `PORTAL_GROUP_ROLE_MAP`. It is ignored whenever
 `AWS_LAMBDA_FUNCTION_NAME` is set, so it cannot be enabled inside AWS Lambda.
-With it on, and none of the token variables set, an action function run
-locally needs no issuer.
+With it on, and none of the token variables set, the read API and an action
+function run locally need no issuer.
 Local runs use your own AWS credentials for the platform account and still
 assume each cell's reader role.
 
@@ -942,7 +1061,8 @@ than the SDK included in the Lambda runtime.
 Function settings used by the infrastructure: Python 3.13 on arm64, timeout 29 seconds, memory 1024 MB. The source stays compatible with Python 3.12.
 
 The sweeper differs: timeout 900 seconds, invoked by the sweep queue one
-message at a time (batch size 1). The queue's visibility timeout must be at
+message at a time (batch size 1), with up to five sweeps running side by
+side. The queue's visibility timeout must be at
 least the function's timeout, and a message that fails twice goes to a
 dead-letter queue. A sweep keeps the last 30 seconds of its time to write its
 audit event. A message whose sweep was claimed and never left its event (the
@@ -954,7 +1074,9 @@ a message in the dead-letter queue, one when the oldest message has waited
 for more than an hour. The sweeper reads the audit table as well as writing
 to it, so its role needs `dynamodb:Query` beside `dynamodb:PutItem`, both
 under the leading key `CONTAINMENT#*`. Contain and release each have a
-request budget of their own at the API (5 requests per second, burst 10).
+request budget of their own at the API (100 requests per second, burst 200).
+A request is counted before the function decides who may act, so the budget
+is set far above what responders need.
 
 ## Test
 

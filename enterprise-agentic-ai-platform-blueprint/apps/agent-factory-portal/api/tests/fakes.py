@@ -153,8 +153,21 @@ class FakeRegistry:
         return {"status": status}
 
 
+# The sort-key prefixes of events: a record's history has the first, a Runtime's containment both.
+EVENT_RANGES = ("EVENT#", "OTHER#")
+
+# The only two conditions a write of the portal carries.
+APPEND_ONLY = "attribute_not_exists(pk)"
+KEEP_LATEST = "attribute_not_exists(#at) OR #at < :at"
+
+
 class FakeDynamo:
-    """An append-only table: put with a condition, query by partition. Nothing else exists.
+    """A table that is written with a condition and queried by partition. Nothing else exists.
+
+    Every write is append-only, with one exception: the item that holds a
+    record's latest review attestation (``REVIEWS`` / ``RECORD#<record id>``)
+    may be replaced by one that was attested later. ``replaced`` lists the
+    keys of the items that were, so a test can show that nothing else is.
 
     A query is served the way the service serves one: only the items whose
     sort key begins with the prefix the caller named, a page at a time, each
@@ -171,17 +184,33 @@ class FakeDynamo:
         self.pages_read = 0
         self.items_read = 0
         self.queried: list[str] = []  # the partition key of every query, in order
+        self.prefixes: list[tuple[str, str]] = []  # the partition key and sort-key prefix of every query
+        self.replaced: list[tuple[str, str]] = []  # the key of every item a later write replaced
         self._puts = 0
 
-    def put_item(self, TableName: str, Item: dict, ConditionExpression: str) -> dict[str, Any]:  # noqa: N803
+    def put_item(self, TableName: str, Item: dict, ConditionExpression: str, **expression: Any) -> dict[str, Any]:  # noqa: N803
         self.calls.append("put_item")
         self._puts += 1
         if self._puts in self.fail_put_numbers:
             raise client_error("ProvisionedThroughputExceededException", "PutItem")
-        assert ConditionExpression == "attribute_not_exists(pk)"  # noqa: S101
         key = (Item["pk"]["S"], Item["sk"]["S"])
-        if key in self.items:
+        stored = self.items.get(key)
+        if ConditionExpression == APPEND_ONLY:
+            assert not expression  # noqa: S101
+            allowed = stored is None
+        else:
+            # As the service evaluates it: a comparison with an attribute the item lacks is false.
+            assert ConditionExpression == KEEP_LATEST  # noqa: S101
+            assert set(expression) == {"ExpressionAttributeNames", "ExpressionAttributeValues"}  # noqa: S101
+            assert expression["ExpressionAttributeNames"] == {"#at": "at"}  # noqa: S101
+            (name,) = expression["ExpressionAttributeValues"]
+            assert name == ":at"  # noqa: S101
+            newer = expression["ExpressionAttributeValues"][":at"]["S"]
+            allowed = stored is None or "at" not in stored or stored["at"]["S"] < newer
+        if not allowed:
             raise client_error("ConditionalCheckFailedException", "PutItem")
+        if stored is not None:
+            self.replaced.append(key)
         self.items[key] = Item
         return {}
 
@@ -199,6 +228,7 @@ class FakeDynamo:
                 pk = kwargs["ExpressionAttributeValues"][":pk"]["S"]
                 prefix = kwargs["ExpressionAttributeValues"][":prefix"]["S"]
                 table.queried.append(pk)
+                table.prefixes.append((pk, prefix))
                 rows = [item for (p, sk), item in table.items.items() if p == pk and sk.startswith(prefix)]
                 rows.sort(key=lambda item: item["sk"]["S"], reverse=not kwargs.get("ScanIndexForward", True))
                 return table._serve(rows, (kwargs.get("PaginationConfig") or {}).get("PageSize"))
@@ -223,13 +253,31 @@ class FakeDynamo:
                 return
 
     def events(self) -> list[dict[str, str]]:
-        """Every stored event and attestation as plain strings, oldest first: what a history read can return."""
-        return self._rows(lambda sort_key: sort_key.startswith("EVENT#"))
+        """Every stored audit event as plain strings, oldest first: what the histories hold.
+
+        Both ranges of a Runtime's containment history: the events that can
+        change who holds a containment (``EVENT#``) and every other
+        (``OTHER#``), in the order they were written.
+        """
+        rows = self._rows(lambda pk, sk: pk != "REVIEWS" and sk.startswith(EVENT_RANGES))
+        return sorted(rows, key=lambda row: row["sk"].split("#", 1)[1])
+
+    def settling(self) -> list[dict[str, str]]:
+        """Of those, the events a release reads to find who holds a containment: the ``EVENT#`` range."""
+        return [row for row in self.events() if row["sk"].startswith("EVENT#")]
+
+    def others(self) -> list[dict[str, str]]:
+        """Of those, the events that cannot change who holds a containment: the ``OTHER#`` range."""
+        return [row for row in self.events() if row["sk"].startswith("OTHER#")]
+
+    def attestations(self) -> list[dict[str, str]]:
+        """What the ``REVIEWS`` partition holds as plain strings, oldest first: one attestation for a record."""
+        return sorted(self._rows(lambda pk, sk: pk == "REVIEWS"), key=lambda item: item["at"])
 
     def claims(self) -> list[dict[str, str]]:
-        """Every stored item that is not an event: the sweeps the sweeper has claimed."""
-        return self._rows(lambda sort_key: not sort_key.startswith("EVENT#"))
+        """Every stored item that is neither: the sweeps the sweeper has claimed, and the marks."""
+        return self._rows(lambda pk, sk: pk != "REVIEWS" and not sk.startswith(EVENT_RANGES))
 
     def _rows(self, wanted: Any) -> list[dict[str, str]]:
         rows = sorted(self.items.values(), key=lambda item: item["sk"]["S"])
-        return [{k: v["S"] for k, v in row.items()} for row in rows if wanted(row["sk"]["S"])]
+        return [{k: v["S"] for k, v in row.items()} for row in rows if wanted(row["pk"]["S"], row["sk"]["S"])]

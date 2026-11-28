@@ -10,12 +10,12 @@ in a message is trusted. For one message it:
      its own configuration, never in the message, and accepts the Runtime's
      ARN only in the spelling the portal builds for that cell;
   2. reads the Runtime's containment history, back to the contain the message
-     names. The sweep is run only when that contain is on record and got as
-     far as scheduling sweeps, when this sweep is due and has not left its
-     event yet, and when no later containment has taken that contain's
-     place. It then claims the sweep with a conditional write, so that a
-     second delivery, a replay or a second invocation at the same moment
-     cannot run it again;
+     names. The sweep is run only when that contain is on record and its
+     result lists this sweep among those it scheduled, when this sweep is
+     due and has not left its event yet, and when no later containment has
+     taken that contain's place. It then claims the sweep with a conditional
+     write, so that a second delivery, a replay or a second invocation at
+     the same moment cannot run it again;
   3. reads the Runtime's resource policy with the cell's containment role. If
      the statement the portal writes is not there (the agent was released
      meanwhile, or a statement that only carries the portal's Sid stands in
@@ -28,22 +28,38 @@ in a message is trusted. For one message it:
   6. writes one audit event (action ``sweep``) in the Runtime's containment
      history: what it found, what it stopped, and how long it took.
 
-A history is never shortened, and a release reads it back to the contain it
-undoes. So the sweeper writes into it only for a sweep that a contain on
-record scheduled, and once: at most three events for one contain, whoever
-sends or replays messages or invokes the function. A message that fails
-step 1 or step 2 goes to the function's log and nowhere else.
+A history is never shortened. So the sweeper writes into it only for a sweep
+that a contain on record scheduled, and once: at most three events for one
+contain, whoever sends or replays messages or invokes the function. A
+message that fails step 1 or step 2 goes to the function's log and nowhere
+else. The sweep's event takes nothing from the message but the request id
+and the sweep number that the history confirmed: the agent id it carries is
+the contain's. A sweep changes nothing about who holds a containment, so its
+event is written into the range of the history that a release does not read
+(``portal_api/aws/audit.py``): the read that finds who contained a Runtime
+does not grow with its sweeps.
+
+One invocation is one sweep. The queue hands over one message at a time; an
+invocation with any other number of records did not come from the queue as
+it is set up, and nothing in it is run. Otherwise whoever invokes the
+function could put a long sweep of one Runtime before a due sweep of another
+and leave that one with no time.
 
 It decides nothing about who may contain an agent: the contain that left the
 message was authorised. It can only ever stop sessions of a Runtime that the
 portal's own statement contains at that moment, in a cell that opted in.
 
 It parses input that anyone who can reach the queue or the function chose, so
-it does not hold the authority the containment function holds. It assumes the
-cell's containment role with a session policy (``session_policy``) that
-allows only what a sweep does: read the policy, list sessions, stop them.
-Writing or deleting a resource policy is not among it, whatever this code or
-a later change to it does.
+it asks for less than the containment function uses. It assumes the cell's
+containment role with a session policy (``session_policy``) that allows only
+what a sweep does: read the policy, list sessions, stop them. A session made
+that way cannot write or delete a resource policy.
+
+That is a restraint this code puts on itself, not a limit on the role. The
+function runs under the containment function's role, and that role may assume
+a cell's role without a session policy. So the limit holds for the code as
+it is written here (every assumption goes through ``_client``, which always
+passes the policy), and not for a later change that left the policy out.
 """
 
 from __future__ import annotations
@@ -55,6 +71,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from portal_api import arns, containment_policy, sweeps
@@ -65,6 +82,7 @@ from portal_api.aws.parallel import pmap
 from portal_api.aws.session import SESSION_SWEEPER, AwsClients, error_code
 from portal_api.config import Cell, SweeperSettings
 from portal_api.containment_timing import (
+    CONTAIN_RESULT_WAIT_SECONDS,
     SWEEP_DELAYS_SECONDS,
     SWEEP_EARLY_TOLERANCE_SECONDS,
     SWEEP_STOPS_PER_SECOND,
@@ -76,7 +94,9 @@ logger = logging.getLogger(__name__)
 
 INVALID = "invalid"
 # What ``handle`` returns for a valid message whose sweep is not run and leaves no event.
-NO_CONTAIN = "no_contain"  # no contain that scheduled sweeps is on record under its request id
+# No contain that scheduled sweeps is on record under its request id, as far back as a sweep reads.
+NO_CONTAIN = "no_contain"
+NOT_SCHEDULED = "not_scheduled"  # its contain is on record and did not schedule a sweep with this number
 REPEATED = "repeated"  # this sweep has already left its event
 SUPERSEDED = "superseded"  # its contain belongs to an earlier containment, and a later one holds
 CONTAINED, NOT_CONTAINED, UNKNOWN = "contained", "not_contained", "unknown"
@@ -92,6 +112,8 @@ MAX_PAUSE_SECONDS = 8.0
 SPANS_WAIT_SECONDS = 60.0
 # How often a sweep that is stopping sessions reads the policy again, so that a release ends it.
 RECHECK_SECONDS = 30.0
+# How often a first sweep looks again for the result of a contain that has not written one yet.
+RESULT_POLL_SECONDS = 1.0
 
 
 # What a sweep does in a cell, and nothing more. The first three are always needed; the last two
@@ -150,6 +172,15 @@ class SweepNotFinished(Exception):
     """
 
 
+@dataclass(frozen=True)
+class Admission:
+    """What the Runtime's history says about one sweep message."""
+
+    left_out: str | None = None  # what became of a message whose sweep is not run (see ``Sweeper.handle``)
+    held: bool = False  # a contain holds the Runtime, according to the history
+    agent_id: str = ""  # the id the sweep's contain was addressed with, for the sweep's own event
+
+
 class _Current:
     """A client that is looked up again at every call.
 
@@ -193,9 +224,9 @@ class Sweeper:
         """Run the sweep one message asks for, and return what became of it.
 
         ``allowed``, ``failed`` and ``skipped`` are the outcomes of a sweep
-        that left its one event. ``invalid``, ``no_contain``, ``repeated``
-        and ``superseded`` are messages that were not run and left nothing
-        but a line in the function's log.
+        that left its one event. ``invalid``, ``no_contain``,
+        ``not_scheduled``, ``repeated`` and ``superseded`` are messages that
+        were not run and left nothing but a line in the function's log.
 
         Returning means the message is done with and can be deleted. Four
         things raise, so that the queue delivers the message again: a
@@ -217,10 +248,10 @@ class Sweeper:
         if arns.canonical_in(cell, message.runtime_arn) is None:
             # Another spelling of the ARN would be another history. Nothing is read or written under it.
             return self._refuse("its Runtime ARN is not written the way the portal writes it for that cell")
-        left_out, held = self._admit(message)
-        if left_out is not None:
-            return left_out
-        return self._sweep(message, cell, cells, started, remaining_seconds, held)
+        admission = self._admit(message)
+        if admission.left_out is not None:
+            return admission.left_out
+        return self._sweep(message, cell, cells, started, remaining_seconds, admission)
 
     def _cells(self, runtime_arn: str) -> list[Cell]:
         parts = arn_parts(runtime_arn) or {}
@@ -241,37 +272,64 @@ class Sweeper:
 
     # --- whether the sweep belongs to a contain on record, once --------------------------------
 
-    def _admit(self, message: sweeps.SweepMessage) -> tuple[str | None, bool]:
-        """Whether this message's sweep is run, decided on the Runtime's own history.
+    def _history(self, message: sweeps.SweepMessage) -> audit_reader.History:
+        """The Runtime's history back to the contain the message names. No history, no sweep."""
+        try:
+            return audit_reader.read_for_sweep(
+                self.dynamodb, self.settings.audit_table, message.runtime_arn, message.request_id
+            )
+        except Exception as exc:  # noqa: BLE001 - the message comes back
+            logger.error(
+                "Sweep %s of contain %s: the history could not be read: %s",
+                message.sweep,
+                message.request_id,
+                error_code(exc),
+            )
+            raise SweepNotVerified(error_code(exc)) from exc
 
-        Returns what became of a message that is not run (see ``handle``),
-        or ``None`` for one that is; and whether a contain holds the Runtime
-        according to the history.
+    def _admit(self, message: sweeps.SweepMessage) -> Admission:
+        """Whether this message's sweep is run, decided on the Runtime's own history.
 
         A valid message proves nothing: its request id and sweep number are
         whatever its sender wrote. The history says whether a contain with
-        that id scheduled sweeps, whether this one has already left its
-        event, whether it is due, and whether that contain is part of the
+        that id scheduled this sweep, whether it has already left its event,
+        whether it is due, and whether that contain is part of the
         containment that holds. A sweep that passes is claimed before
         anything is done in the cell.
         """
         arn, number, request_id = message.runtime_arn, message.sweep, message.request_id
-        try:
-            trail = audit_reader.read_for_sweep(self.dynamodb, self.settings.audit_table, arn, request_id)
-        except Exception as exc:  # noqa: BLE001 - no history, no sweep; the message comes back
-            logger.error(
-                "Sweep %s of contain %s: the history could not be read: %s", number, request_id, error_code(exc)
-            )
-            raise SweepNotVerified(error_code(exc)) from exc
-        events = trail.events
+        history = self._history(message)
+        events = history.events
 
-        def left_out(outcome: str, why: str) -> tuple[str, bool]:
+        def left_out(outcome: str, why: str) -> Admission:
             logger.warning("Sweep %s of contain %s not run, nothing written (%s): %s", number, request_id, outcome, why)
-            return outcome, False
+            return Admission(left_out=outcome)
 
         contain = sweeps.scheduler(events, request_id)
         if contain is None:
             return left_out(NO_CONTAIN, "the Runtime's history holds no contain with that id that scheduled sweeps")
+        admitted = sweeps.admits(contain, number)
+        # A first sweep is sent with no delay and can be here before its contain has written the
+        # result that lists its sweeps. That result comes within the time the containment function
+        # can run; until then the sweeper looks again. A result that has not come by then was lost.
+        for _ in range(int(CONTAIN_RESULT_WAIT_SECONDS / RESULT_POLL_SECONDS)):
+            if admitted is not None or (self.now() - contain.began).total_seconds() >= CONTAIN_RESULT_WAIT_SECONDS:
+                break
+            self.sleep(RESULT_POLL_SECONDS)
+            history = self._history(message)
+            events = history.events
+            contain = sweeps.scheduler(events, request_id)
+            if contain is None:
+                return left_out(NO_CONTAIN, "its contain failed, or scheduled no sweep")
+            admitted = sweeps.admits(contain, number)
+        if not admitted:
+            listed = "has left no result that lists it" if admitted is None else "did not schedule it"
+            return left_out(NOT_SCHEDULED, f"the contain with that id {listed}")
+        if history.cut:
+            # More was recorded since that contain than a sweep reads back, so what was read does
+            # not say whether this sweep has left its event. A sweep is due within minutes of its
+            # contain; one that comes this late is not run.
+            return left_out(NO_CONTAIN, "its contain is further back in the Runtime's history than a sweep reads")
         if sweeps.recorded(events, request_id, number):
             return left_out(REPEATED, "this sweep has already left its event")
         wait = sweeps.seconds_until_due(contain.began, number, self.now(), SWEEP_DELAYS_SECONDS)
@@ -283,9 +341,12 @@ class Sweeper:
                 wait,
             )
             raise SweepNotDue(f"sweep {number} of contain {request_id}")
-        holder = audit_reader.holder(events)
-        held = holder.event is not None
-        if held and contain.position >= holder.current:
+        # Who holds the containment comes from the events that can settle it, and from no others
+        # (``audit.History``). When they do not settle it, the events read hold nothing that says
+        # this contain was undone: it counts as holding, and the policy has the last word.
+        holder = history.holder
+        held = holder.event is not None or not history.settled
+        if holder.event is not None and contain.position >= holder.current:
             # Released since, and contained again: the sweeps of the contain that holds do the work.
             return left_out(SUPERSEDED, "its contain belongs to an earlier containment of the Runtime")
         try:
@@ -300,7 +361,8 @@ class Sweeper:
                 request_id,
             )
             raise SweepNotFinished(f"sweep {number} of contain {request_id}")
-        return None, held
+        # The id the contain was addressed with, from its own events. Never the message's.
+        return Admission(held=held, agent_id=contain.agent_id or message.runtime_id)
 
     # --- the sweep -----------------------------------------------------------------
 
@@ -327,20 +389,20 @@ class Sweeper:
         cells: list[Cell],
         started: float,
         remaining_seconds: Callable[[], float],
-        held: bool,
+        admission: Admission,
     ) -> str:
         """The sweep itself, for a message that ``_admit`` let through. It leaves exactly one event.
 
-        ``held`` says whether a contain holds the Runtime according to its
-        history. When none does, the Runtime was released after the contain
-        that scheduled this sweep, and nothing is stopped.
+        ``admission.held`` says whether a contain holds the Runtime according
+        to its history. When none does, the Runtime was released after the
+        contain that scheduled this sweep, and nothing is stopped.
         """
-        arn, number = message.runtime_arn, message.sweep
+        arn, number, held = message.runtime_arn, message.sweep, admission.held
 
         def record(outcome: str, reason: str, state: str, after: str | None = None, **counts: Any) -> str:
             event = self._event(
                 runtime_arn=arn,
-                agent_id=message.agent_id,
+                agent_id=admission.agent_id,
                 request_id=message.request_id,
                 cells=cells,
                 outcome=outcome,
@@ -369,7 +431,11 @@ class Sweeper:
         if found != containment_policy.CONTAINED:
             reason = f"Background sweep {number} stopped nothing: the Runtime is no longer contained."
             if found == containment_policy.FOREIGN:
-                reason = f"{reason} {containment_policy.FOREIGN_STATEMENT}"
+                # That statement may deny invocation, so the sweep does not say "not contained".
+                reason = (
+                    f"Background sweep {number} stopped nothing: the statement the portal writes is no longer "
+                    f"in the Runtime's policy. {containment_policy.FOREIGN_STATEMENT}"
+                )
             return record(sweeps.SKIPPED, reason, NOT_CONTAINED)
         if not held:
             # The history says released, the policy does not yet (a release that is under way), or
@@ -549,10 +615,18 @@ class Sweeper:
         )
 
     def _write(self, runtime_arn: str, event: AuditEvent) -> None:
-        """Append the sweep's one event to the Runtime's containment history, under the Runtime's own key."""
+        """Append the sweep's one event to the Runtime's containment history, under the Runtime's own key.
+
+        Into the range of the events that cannot change who holds the
+        containment: a sweep is nobody's contain or release.
+        """
         try:
             audit_writer.put_event(
-                self.dynamodb, self.settings.audit_table, audit_reader.containment_key(runtime_arn), event
+                self.dynamodb,
+                self.settings.audit_table,
+                audit_reader.containment_key(runtime_arn),
+                event,
+                prefix=audit_reader.OTHER_PREFIX,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Sweep event could not be written (%s): %s", event.outcome, error_code(exc))
@@ -586,7 +660,7 @@ _clients: AwsClients | None = None
 
 
 def lambda_handler(event: Any, context: Any) -> dict[str, int]:
-    """Entry point of the sweeper function: one sweep per queue message.
+    """Entry point of the sweeper function: one sweep per invocation, for the one message it is handed.
 
     A function whose ``PORTAL_ACTION_ROLE`` is not ``sweeper``, or whose
     configuration is malformed, raises before doing anything: the message goes
@@ -605,9 +679,17 @@ def lambda_handler(event: Any, context: Any) -> dict[str, int]:
     def remaining_seconds() -> float:
         return context.get_remaining_time_in_millis() / 1000
 
+    # Whoever can invoke the function chooses the event. The queue hands over exactly one message
+    # (its batch size is one), so anything else did not come from it, and nothing in it is run:
+    # several records would share one invocation's time, and a long sweep put first would leave
+    # a due sweep of another Runtime none.
     records = event.get("Records") if isinstance(event, dict) else None
-    # Whoever can invoke the function chooses the event: anything that is not a record with a body is invalid.
-    bodies = [r.get("body") if isinstance(r, dict) else None for r in (records if isinstance(records, list) else [])]
-    outcomes = [sweeper.handle(body, remaining_seconds) for body in bodies]
-    logger.info("Sweeps handled: %s", ", ".join(outcomes) or "none")
-    return {"handled": len(outcomes)}
+    if not isinstance(records, list) or len(records) != 1:
+        count = len(records) if isinstance(records, list) else "no"
+        logger.error("Sweeper invoked with %s records, not exactly one: nothing was run", count)
+        return {"handled": 0}
+    # Anything that is not a record with a body is an invalid message.
+    body = records[0].get("body") if isinstance(records[0], dict) else None
+    outcome = sweeper.handle(body, remaining_seconds)
+    logger.info("Sweep handled: %s", outcome)
+    return {"handled": 1}

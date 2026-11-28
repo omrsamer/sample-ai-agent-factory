@@ -11,7 +11,7 @@ from botocore.exceptions import ClientError
 
 from portal_api import registrations, reviews
 from portal_api.actions import audit_writer, authority, lifecycle_rules, reference_rules, registrar
-from portal_api.actions.engine import ActionEngine, ActionError, Target
+from portal_api.actions.engine import ActionEngine, ActionError, Target, record_state
 from portal_api.aws.session import error_code
 from portal_api.models.portal import ActionResult, Registration, RegistrationInput
 
@@ -64,13 +64,16 @@ def _load(engine: ActionEngine, action: str, record_id: str) -> tuple[dict[str, 
 
 
 def _target(action: str, record: dict[str, Any], document: dict[str, Any]) -> Target:
+    held = registrations.sha256(registrations.canonical(document))
     return Target(
         action=action,
         tenant_id=str(document.get("tenantId")),
         record_name=str(record.get("name")),
         record_id=str(record["recordId"]),
         status_before=str(record.get("status")),
-        document_sha256=registrations.sha256(registrations.canonical(document)),
+        document_sha256=held,
+        # The record as it is held, also when an update goes on to name the document it proposes.
+        state=record_state(record.get("status"), held),
     )
 
 
@@ -107,6 +110,18 @@ def _foreign(error: ActionError) -> ActionError:
     return error
 
 
+def _spelled_as_the_cell_does(document: dict[str, Any], engine: ActionEngine) -> None:
+    """Refuse (422) a reference into a configured cell that does not carry the cell's partition.
+
+    Said only to a caller who has passed the authority, the tenant and the
+    reference rule, so the answer tells nobody else where a cell is.
+    """
+    misspelled = reference_rules.misspelled_reference(document, engine.settings.cells)
+    if misspelled is not None:
+        field, problem = misspelled
+        raise ActionError(422, registrations.DocumentError(problem, f"document.{field}").errors())
+
+
 def _not_retired(engine: ActionEngine, target: Target) -> None:
     """A retired record is final: it is refused by rule, not left to the registry to reject."""
     retired = lifecycle_rules.retired_refusal(target.action, target.status_before)
@@ -137,6 +152,7 @@ def create(engine: ActionEngine, body: RegistrationInput) -> ActionResult:
     foreign = _own_references(document, engine)
     if foreign is not None:
         raise _foreign(engine.refuse_unrecorded(target, 403, foreign))
+    _spelled_as_the_cell_does(document, engine)
     if registrar.find_by_name(engine.registry, engine.settings.registry_id, name):
         raise engine.deny(target, 409, f"A record named {name} already exists")
 
@@ -182,6 +198,7 @@ def update(engine: ActionEngine, record_id: str, body: RegistrationInput) -> Act
     foreign = _own_references(document, engine)
     if foreign is not None:
         raise _foreign(engine.deny(target, 403, foreign))
+    _spelled_as_the_cell_does(document, engine)
     _in_transition(engine, target)
     if target.status_before not in UPDATABLE:
         raise engine.deny(target, 409, f"A record in status {target.status_before} cannot be updated")

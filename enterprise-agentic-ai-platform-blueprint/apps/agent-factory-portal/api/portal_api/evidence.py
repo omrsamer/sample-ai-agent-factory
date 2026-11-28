@@ -129,13 +129,21 @@ def _registration(entry: AgentEntry) -> EvidenceRegistration | None:
     )
 
 
-def _reviews(entry: AgentEntry, attestations: Iterable[Attestation], registered: bool) -> EvidenceReviews:
+def _reviews(
+    entry: AgentEntry, attestations: Iterable[Attestation], latest: Attestation | None, registered: bool
+) -> EvidenceReviews:
+    """The review date as the inventory has it, and the attestations that were read for the document.
+
+    ``latest`` is the attestation the inventory took the date from, so the
+    date, its source and ``overdue`` describe the same moment as the agent
+    and risk sections. ``attestations`` is what is listed.
+    """
     if not registered:
         return EvidenceReviews()
     newest_first = sorted(attestations, key=lambda a: a.at, reverse=True)
     governance = entry.agent.governance
     registration_review_by = governance.review_by if governance else None
-    effective = reviews.effective(registration_review_by, newest_first[0] if newest_first else None)
+    effective = reviews.effective(registration_review_by, latest)
     return EvidenceReviews(
         effective_review_by=effective.review_by,
         source=effective.source,
@@ -238,6 +246,7 @@ def build(
     decisions: Iterable[AuditEvent] = (),
     decisions_truncated: bool = False,
     attestations: Iterable[Attestation] = (),
+    latest_attestation: Attestation | None = None,
     containment: ContainmentView | None = None,
     containment_details: bool = True,
     gateways: Iterable[GatewayPolicies] = (),
@@ -270,7 +279,7 @@ def build(
         registration=registration,
         decisions=ordered,
         decisions_truncated=decisions_truncated,
-        reviews=_reviews(entry, attestations, registration is not None),
+        reviews=_reviews(entry, attestations, latest_attestation, registration is not None),
         containment=held,
         risk=EvidenceRisk(
             level=agent.risk.level,
