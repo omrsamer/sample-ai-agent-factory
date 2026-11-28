@@ -1068,6 +1068,32 @@ def test_portal_policy_grants_no_key_creation_tagging_or_change() -> None:
     assert kms == ["kms:DescribeKey"]
 
 
+def test_portal_policy_manages_the_sweep_queue_without_touching_its_messages() -> None:
+    statements = _by_sid(_render_plain("portal"))
+    sweep = statements["PortalSweepQueuesAndAlarm"]
+    assert sweep["Resource"] == [
+        f"arn:aws:sqs:{REGION}:{PLATFORM}:AgenticAI-AgentFactoryPor*",
+        f"arn:aws:cloudwatch:{REGION}:{PLATFORM}:alarm:AgenticAI-AgentFactoryPor*",
+    ]
+    assert not any(
+        action.split(":")[1] in {"SendMessage", "ReceiveMessage", "DeleteMessage", "PurgeQueue"}
+        for action in sweep["Action"]
+    ), "the execution role manages the queue, never its messages"
+    mapping = statements["PortalSweeperEventSource"]
+    assert mapping["Resource"] == "*"
+    assert mapping["Condition"] == {
+        "ArnLike": {
+            "lambda:FunctionArn": f"arn:aws:lambda:{REGION}:{PLATFORM}:function:AgenticAI-AgentFactoryPor*"
+        }
+    }
+    assert all(action.endswith("EventSourceMapping") for action in mapping["Action"])
+    # Tags of a mapping, and nothing else of Lambda, on every mapping: found by deploying, where
+    # CloudFormation's tagging of the new mapping was refused.
+    tags = statements["PortalSweeperEventSourceTags"]
+    assert tags["Resource"] == f"arn:aws:lambda:{REGION}:{PLATFORM}:event-source-mapping:*"
+    assert sorted(tags["Action"]) == ["lambda:ListTags", "lambda:TagResource", "lambda:UntagResource"]
+
+
 def test_portal_cell_policy_manages_only_the_fleet_reader_role() -> None:
     policy = _render_plain("portal-cell", WORKSTREAM)
     statements = _by_sid(policy)

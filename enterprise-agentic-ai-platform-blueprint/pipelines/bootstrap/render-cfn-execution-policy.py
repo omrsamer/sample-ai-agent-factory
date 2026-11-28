@@ -1447,6 +1447,58 @@ def portal_policy(account: str, region: str) -> dict[str, Any]:
                 "Resource": arn("dynamodb", region, account, f"table/{PORTAL_STACK_PREFIX}*"),
             },
             {
+                # Background containment sweeps: one queue, its dead-letter
+                # queue and the alarm on it. Names are generated from the
+                # stack name.
+                "Sid": "PortalSweepQueuesAndAlarm",
+                "Effect": "Allow",
+                "Action": [
+                    "sqs:CreateQueue",
+                    "sqs:DeleteQueue",
+                    "sqs:GetQueueAttributes",
+                    "sqs:GetQueueUrl",
+                    "sqs:SetQueueAttributes",
+                    "sqs:ListQueueTags",
+                    "sqs:TagQueue",
+                    "sqs:UntagQueue",
+                    "cloudwatch:PutMetricAlarm",
+                    "cloudwatch:DescribeAlarms",
+                    "cloudwatch:DeleteAlarms",
+                    "cloudwatch:TagResource",
+                    "cloudwatch:UntagResource",
+                ],
+                "Resource": [
+                    arn("sqs", region, account, f"{PORTAL_STACK_PREFIX}*"),
+                    arn("cloudwatch", region, account, f"alarm:{PORTAL_STACK_PREFIX}*"),
+                ],
+            },
+            {
+                # The queue is the only event source of the sweeper function.
+                "Sid": "PortalSweeperEventSource",
+                "Effect": "Allow",
+                "Action": [
+                    "lambda:CreateEventSourceMapping",
+                    "lambda:UpdateEventSourceMapping",
+                    "lambda:DeleteEventSourceMapping",
+                    "lambda:GetEventSourceMapping",
+                ],
+                "Resource": "*",
+                "Condition": {
+                    "ArnLike": {
+                        "lambda:FunctionArn": arn("lambda", region, account, f"function:{PORTAL_STACK_PREFIX}*")
+                    }
+                },
+            },
+            {
+                # CloudFormation tags the mapping it creates. A mapping has a
+                # generated id, so its tags cannot be scoped by name, and the
+                # function condition above does not apply to tagging.
+                "Sid": "PortalSweeperEventSourceTags",
+                "Effect": "Allow",
+                "Action": ["lambda:TagResource", "lambda:UntagResource", "lambda:ListTags"],
+                "Resource": arn("lambda", region, account, "event-source-mapping:*"),
+            },
+            {
                 "Sid": "PortalDistribution",
                 "Effect": "Allow",
                 "Action": "cloudfront:*",

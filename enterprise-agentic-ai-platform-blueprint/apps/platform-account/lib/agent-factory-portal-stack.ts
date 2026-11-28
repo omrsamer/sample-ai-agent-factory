@@ -101,6 +101,12 @@ export interface AgentFactoryPortalStackProps extends StackProps {
   /** Operator-provisioned key ARN for the portal's log groups. */
   readonly logsKeyArn?: string;
   /**
+   * Operator-provisioned Amazon SNS topic for the portal's operational alarm
+   * (a background containment sweep that could not be processed). The stack
+   * creates no topic and no subscription.
+   */
+  readonly alarmTopicArn?: string;
+  /**
    * Governed registration and approval (opt-in). Off by default: the portal
    * is then read-only and has no write route, role or table.
    */
@@ -150,6 +156,7 @@ export class AgentFactoryPortalStack extends Stack {
       guardrailTag,
       retainData,
       logsKeyArn,
+      alarmTopicArn,
       governedActions,
       registry,
       agentRegistry,
@@ -169,6 +176,7 @@ export class AgentFactoryPortalStack extends Stack {
 
     let jwtIssuer: string;
     let jwtAudience: readonly string[];
+    let jwksUrl: string | undefined;
     let groupRoleMap: Record<string, PortalRole>;
     let webAuthConfig: Record<string, unknown>;
     if (identityProvider === "cognito") {
@@ -200,6 +208,7 @@ export class AgentFactoryPortalStack extends Stack {
       const resolved = resolvePortalEntraIdentity(entra);
       jwtIssuer = resolved.issuer;
       jwtAudience = resolved.audience;
+      jwksUrl = resolved.jwksUrl;
       groupRoleMap = { ...entra.groupRoleMap, ...(extraGroupRoleMap ?? {}) };
       webAuthConfig = {
         authProvider: "entra",
@@ -266,11 +275,15 @@ export class AgentFactoryPortalStack extends Stack {
         registryArn: agentRegistry!.arn,
         auditTable: audit.table,
         identityProvider,
+        jwtIssuer,
+        jwtAudience,
+        jwksUrl,
         groupRoleMap,
         groupTenantMap: governedActions.groupTenantMap,
         allowedOrigins: [web.origin],
         logsKey,
         cells,
+        alarmTopicArn,
       });
       if (actions.containmentRole) {
         new CfnOutput(this, "PortalContainmentRoleArn", {

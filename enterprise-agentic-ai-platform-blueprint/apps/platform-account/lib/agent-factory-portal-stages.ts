@@ -97,6 +97,15 @@ function keyArnContext(app: App, key: string, region: string): string | undefine
   return value;
 }
 
+function topicArnContext(app: App, key: string, region: string): string | undefined {
+  const value = context(app, key);
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !new RegExp(`^arn:aws[\\w-]*:sns:${region}:\\d{12}:[\\w-]{1,256}$`).test(value)) {
+    throw new Error(`Context ${key} must be an Amazon SNS topic ARN in ${region}.`);
+  }
+  return value;
+}
+
 function governedActionsContext(
   app: App,
 ): { groupTenantMap: Record<string, string[]> } | undefined {
@@ -375,6 +384,7 @@ export function addAgentFactoryPortalStage(
         guardrailTag: jsonContext(app, "agenticai/portalGuardrailTag"),
         retainData: retain === undefined ? undefined : retain === true || retain === "true",
         logsKeyArn: keyArnContext(app, "agenticai/portalLogsKeyArn", deploymentRegion),
+        alarmTopicArn: topicArnContext(app, "agenticai/portalAlarmTopicArn", deploymentRegion),
         governedActions: governedActionsContext(app),
         registry: registryContext(app, deploymentRegion),
         agentRegistry: registryContext(

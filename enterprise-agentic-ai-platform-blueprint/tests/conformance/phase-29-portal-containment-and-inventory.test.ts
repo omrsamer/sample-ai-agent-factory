@@ -5,8 +5,9 @@
  * Containment is the one deliberate exception to "central visibility must not
  * become central write access". This suite pins how narrow it is:
  *   - a cell is containable only when it deploys the target role;
- *   - the target role holds five actions on that cell's Runtimes (resource
- *     policy read, put and delete; stop a session; list endpoints), may find
+ *   - the target role holds six actions on that cell's Runtimes (resource
+ *     policy read, put and delete; stop a session; list endpoints; read
+ *     tags, for the tenant tag in a shared account), may find
  *     the sessions in the names of the Runtimes' log streams, and trusts only
  *     the portal's containment function role, with the cell's external id.
  *     It cannot run a query: a role that can query the spans log group can
@@ -32,7 +33,13 @@ import { Annotations, Match, Template } from "aws-cdk-lib/assertions";
 import { AwsSolutionsChecks, NIST80053R5Checks } from "cdk-nag";
 
 import {
+  PORTAL_CONTAINMENT_AUDIT_KEYS,
   PORTAL_CONTAINMENT_REGISTRY_ACTIONS,
+  PORTAL_CONTAINMENT_ROUTE_THROTTLE,
+  PORTAL_HEALTH_ROUTE_THROTTLE,
+  PORTAL_SWEEP_BACKLOG_SECONDS,
+  PORTAL_SWEEP_MESSAGE_ACTIONS,
+  PORTAL_SWEEP_QUEUE_ACTIONS,
   PORTAL_CONTAINMENT_TARGET_ACTIONS,
   PORTAL_EXTERNAL_READER_AGENTCORE_ACTIONS,
   PORTAL_EXTERNAL_READER_METRIC_ACTIONS,
@@ -59,7 +66,7 @@ const apiCode = path.join(assets, "api");
 const webDist = path.join(assets, "web");
 fs.mkdirSync(apiCode);
 fs.mkdirSync(webDist);
-for (const name of ["handler.py", "registrar_handler.py", "approver_handler.py", "containment_handler.py"]) {
+for (const name of ["handler.py", "registrar_handler.py", "approver_handler.py", "containment_handler.py", "sweep_handler.py"]) {
   fs.writeFileSync(path.join(apiCode, name), "def handler(event, context):\n    return {}\n");
 }
 fs.writeFileSync(path.join(webDist, "index.html"), "<!doctype html><title>portal</title>\n");
@@ -137,11 +144,13 @@ describe("Phase 29 — containment target role (Workstream cell)", () => {
   const template = Template.fromStack(stack);
   const statements = statementsOfRole(template, "AgenticAI-PortalContainmentTarget-nonprod");
 
-  it("holds exactly the five containment actions on this cell's Runtimes, and the two reads that find sessions", () => {
+  it("holds exactly six actions on this cell's Runtimes, and the read that finds sessions", () => {
     expect([...PORTAL_CONTAINMENT_TARGET_ACTIONS].sort()).toEqual([
       "bedrock-agentcore:DeleteResourcePolicy",
       "bedrock-agentcore:GetResourcePolicy",
       "bedrock-agentcore:ListAgentRuntimeEndpoints",
+      // The Runtime's tenant tag: in an account several tenants share, it says whose Runtime it is.
+      "bedrock-agentcore:ListTagsForResource",
       "bedrock-agentcore:PutResourcePolicy",
       "bedrock-agentcore:StopRuntimeSession",
     ]);
@@ -149,7 +158,7 @@ describe("Phase 29 — containment target role (Workstream cell)", () => {
     expect(actions([runtime]).sort()).toEqual([...PORTAL_CONTAINMENT_TARGET_ACTIONS].sort());
     expect(JSON.stringify(runtime.Resource)).toContain(`:bedrock-agentcore:${REGION}:${CELL}:runtime/*`);
     expect(JSON.stringify(runtime.Resource)).not.toMatch(/gateway|memory|"\*"/);
-    // By default: those five, and the names of session log streams. No query, so no span content.
+    // By default: those six, and the names of session log streams. No query, so no span content.
     expect(actions(statements).sort()).toEqual([...PORTAL_CONTAINMENT_TARGET_ACTIONS, "logs:DescribeLogStreams"].sort());
     expect(statements.map((s) => s.Sid).sort()).toEqual(["ContainRuntimes", "FindRuntimeSessionStreams"]);
   });
@@ -263,6 +272,10 @@ describe("Phase 29 — containment function (Platform account)", () => {
     const allowed = new Set([
       "sts:AssumeRole",
       "agent-registry:GetRegistryRecord",
+      "sqs:SendMessage",
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
       "dynamodb:PutItem",
       "dynamodb:Query",
       "logs:CreateLogStream",
@@ -322,6 +335,131 @@ describe("Phase 29 — containment function (Platform account)", () => {
     );
   });
 
+  it("finishes containment in the background through one queue and a sweeper that shares the containment role", () => {
+    const json = template.toJSON() as { Resources: Record<string, { Type: string; Properties: Record<string, unknown> }> };
+    const of = (type: string): Array<[string, Record<string, unknown>]> =>
+      Object.entries(json.Resources)
+        .filter(([, r]) => r.Type === type)
+        .map(([id, r]) => [id, r.Properties]);
+
+    // Two queues: the sweep queue and its dead-letter queue. Encrypted, TLS only, short-lived.
+    const queues = of("AWS::SQS::Queue");
+    expect(queues).toHaveLength(2);
+    const [queueId, queue] = queues.find(([, q]) => q.RedrivePolicy !== undefined)!;
+    expect(queue.VisibilityTimeout).toBe(900);
+    expect(queue.MessageRetentionPeriod).toBe(14400);
+    expect((queue.RedrivePolicy as { maxReceiveCount: number }).maxReceiveCount).toBe(2);
+    for (const [, q] of queues) expect(q.SqsManagedSseEnabled).toBe(true);
+    const policies = of("AWS::SQS::QueuePolicy").map(([, p]) => JSON.stringify(p));
+    expect(policies).toHaveLength(2);
+    for (const policy of policies) expect(policy).toContain('"aws:SecureTransport":"false"');
+    // Only the containment role may send, receive, delete, hide or purge a message of the sweep
+    // queue, whatever a principal's own policy allows: nobody else starts a sweep or makes one vanish.
+    type QueueStatement = { Sid?: string; Effect: string; Action: string[]; Principal: unknown; Condition?: Record<string, unknown> };
+    const queuePolicy = of("AWS::SQS::QueuePolicy").find(([, p]) => JSON.stringify(p.Queues).includes(queueId))![1];
+    const senders = (queuePolicy.PolicyDocument as { Statement: QueueStatement[] }).Statement.find(
+      (s) => s.Sid === "OnlyTheContainmentRoleHandlesMessages",
+    )!;
+    expect(senders.Effect).toBe("Deny");
+    expect([...senders.Action].sort()).toEqual([...PORTAL_SWEEP_MESSAGE_ACTIONS].sort());
+    for (const action of ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:PurgeQueue"]) {
+      expect(senders.Action).toContain(action);
+    }
+    expect(senders.Principal).toEqual({ AWS: "*" });
+    expect(Object.keys(senders.Condition!)).toEqual(["ArnNotEquals"]);
+    const onlySender = JSON.stringify(senders.Condition!.ArnNotEquals);
+    expect(onlySender).toContain("aws:PrincipalArn");
+
+    // The sweeper: its own handler and timeout, no route, and the containment function's role,
+    // so that no cell has to trust a second principal.
+    const functions = of("AWS::Lambda::Function");
+    const [sweeperId, sweeper] = functions.find(([, f]) => f.Handler === "sweep_handler.handler")!;
+    const [, containment] = functions.find(([, f]) => f.Handler === "containment_handler.handler")!;
+    expect(sweeper.Role).toEqual(containment.Role);
+    expect(onlySender).toContain(JSON.stringify(containment.Role).slice(1, -1));
+    expect(sweeper.Timeout).toBe(900);
+    expect(containment.Timeout).toBe(29);
+    const sweeperEnvironment = (sweeper.Environment as { Variables: Record<string, unknown> }).Variables;
+    expect(sweeperEnvironment.PORTAL_ACTION_ROLE).toBe("sweeper");
+    expect(Object.keys(sweeperEnvironment).sort()).toEqual(
+      ["PORTAL_ACTION_ROLE", "PORTAL_AUDIT_TABLE", "PORTAL_CELLS", "PORTAL_ENV", "PORTAL_REGISTRY_REGION"].sort(),
+    );
+    // The functions a person calls verify that person's token themselves; the sweeper has no caller.
+    const containmentVariables = (containment.Environment as { Variables: Record<string, unknown> }).Variables;
+    expect(JSON.stringify(containmentVariables.PORTAL_JWT_ISSUER)).toContain("cognito-idp.");
+    expect(containmentVariables.PORTAL_JWT_AUDIENCE).toBeDefined();
+    expect(sweeperEnvironment.PORTAL_JWT_ISSUER).toBeUndefined();
+    expect(JSON.stringify(of("AWS::ApiGatewayV2::Integration"))).not.toContain(sweeperId);
+
+    // Only the queue invokes it, one message at a time.
+    const mappings = of("AWS::Lambda::EventSourceMapping");
+    expect(mappings).toHaveLength(1);
+    expect(JSON.stringify(mappings[0][1].EventSourceArn)).toContain(queueId);
+    expect(JSON.stringify(mappings[0][1].FunctionName)).toContain(sweeperId);
+    expect(mappings[0][1].BatchSize).toBe(1);
+    expect(mappings[0][1].ScalingConfig).toEqual({ MaximumConcurrency: 2 });
+
+    // The containment function knows the queue; the role may use that queue and no other.
+    const containmentEnvironment = (containment.Environment as { Variables: Record<string, unknown> }).Variables;
+    expect(JSON.stringify(containmentEnvironment.PORTAL_SWEEP_QUEUE_URL)).toContain(queueId);
+    const sweep = statements.find((s) => s.Sid === "SweepQueue")!;
+    expect([...actions([sweep])].sort()).toEqual([...PORTAL_SWEEP_QUEUE_ACTIONS].sort());
+    expect(JSON.stringify(sweep.Resource)).toContain(queueId);
+    expect(JSON.stringify(sweep.Resource)).not.toContain("*");
+
+    // A sweep that could not be processed raises an alarm, and so do sweeps that wait: a message
+    // that outlives the queue's retention is discarded without reaching the dead-letter queue.
+    const alarms = of("AWS::CloudWatch::Alarm").map(([, a]) => a);
+    expect(alarms).toHaveLength(2);
+    for (const alarm of alarms) expect(alarm.Namespace).toBe("AWS/SQS");
+    const stuck = alarms.find((a) => a.MetricName === "ApproximateNumberOfMessagesVisible")!;
+    const waiting = alarms.find((a) => a.MetricName === "ApproximateAgeOfOldestMessage")!;
+    expect(JSON.stringify(stuck.Dimensions)).not.toContain(queueId);
+    expect(JSON.stringify(waiting.Dimensions)).toContain(queueId);
+    expect(waiting.Threshold).toBe(PORTAL_SWEEP_BACKLOG_SECONDS);
+    expect(waiting.Threshold as number).toBeLessThan(queue.MessageRetentionPeriod as number);
+  });
+
+  it("lets the containment function and the sweeper write containment histories and nothing else in the audit table", () => {
+    const audit = statements.find((s) => s.Sid === "AuditTrail")!;
+    expect(audit.Condition).toEqual({
+      "ForAllValues:StringLike": { "dynamodb:LeadingKeys": [...PORTAL_CONTAINMENT_AUDIT_KEYS] },
+    });
+    expect(PORTAL_CONTAINMENT_AUDIT_KEYS).toEqual(["CONTAINMENT#*"]);
+    // No statement gives the role the table without that condition.
+    for (const statement of statements.filter((s) => actions([s]).some((a) => a.startsWith("dynamodb:")))) {
+      expect(statement.Sid).toBe("AuditTrail");
+    }
+  });
+
+  it("gives contain and release a request budget that traffic on other routes cannot use up", () => {
+    const json = template.toJSON() as {
+      Resources: Record<string, { Type: string; Properties: Record<string, unknown>; DependsOn?: string[] }>;
+    };
+    const [stage] = Object.values(json.Resources).filter((r) => r.Type === "AWS::ApiGatewayV2::Stage");
+    const settings = stage.Properties.RouteSettings as Record<string, Record<string, unknown>>;
+    for (const action of ["contain", "release"]) {
+      const key = `POST /api/v1/agents/{agent_id}/containment/${action}`;
+      expect(settings[key]).toEqual({
+        ThrottlingRateLimit: PORTAL_CONTAINMENT_ROUTE_THROTTLE.rateLimit,
+        ThrottlingBurstLimit: PORTAL_CONTAINMENT_ROUTE_THROTTLE.burstLimit,
+        DetailedMetricsEnabled: true,
+      });
+      // The stage is created after the route it names.
+      const [routeId] = Object.entries(json.Resources).find(
+        ([, r]) => r.Type === "AWS::ApiGatewayV2::Route" && r.Properties.RouteKey === key,
+      )!;
+      expect(stage.DependsOn).toContain(routeId);
+    }
+    // The unauthenticated liveness route cannot use up the budget of the signed-in routes either.
+    expect(settings["GET /api/v1/health"]).toEqual({
+      ThrottlingRateLimit: PORTAL_HEALTH_ROUTE_THROTTLE.rateLimit,
+      ThrottlingBurstLimit: PORTAL_HEALTH_ROUTE_THROTTLE.burstLimit,
+      DetailedMetricsEnabled: true,
+    });
+    expect(settings["GET /api/v1/{proxy+}"]).toBeUndefined();
+  });
+
   it("gives the containment function more reserved concurrency than the registration functions", () => {
     const functions = Object.values(template.findResources("AWS::Lambda::Function")).map(
       (f) => (f as { Properties: { Handler: string; ReservedConcurrentExecutions?: number } }).Properties,
@@ -379,8 +517,10 @@ describe("Phase 29 — containment function (Platform account)", () => {
     ).toThrow(/containment, which needs governed actions/);
   });
 
-  it("creates no containment function, role or route when no cell opted in", () => {
+  it("creates no containment function, role, route, queue or sweeper when no cell opted in", () => {
     const none = Template.fromStack(portal([cell()]));
+    none.resourceCountIs("AWS::SQS::Queue", 0);
+    none.resourceCountIs("AWS::Lambda::EventSourceMapping", 0);
     expect(
       Object.keys(none.findResources("AWS::IAM::Role", { Properties: { RoleName: "AgenticAI-PortalContainment-nonprod" } })),
     ).toHaveLength(0);

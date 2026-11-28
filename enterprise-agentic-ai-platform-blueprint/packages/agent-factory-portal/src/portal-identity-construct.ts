@@ -6,6 +6,7 @@ import { Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
 import {
   AccountRecovery,
   CfnUserPoolGroup,
+  ClientAttributes,
   FeaturePlan,
   Mfa,
   OAuthScope,
@@ -126,6 +127,13 @@ export class PortalCognitoIdentity extends Construct {
       userPoolClientName: `agenticai-portal-web-${props.environment}`,
       generateSecret: false,
       authFlows: { userSrp: !federated },
+      // A local user signs in with SRP and so holds a token that can change that user's own
+      // attributes, as far as this client may write them. The portal shows people by their
+      // email, so the client may write none of the attributes the portal reads. Amazon Cognito
+      // reads an empty list as "every standard attribute", so one attribute the portal never
+      // reads is named. With a workforce identity provider the mapped attributes must stay
+      // writable for sign-in to work, and no SRP sign-in exists.
+      writeAttributes: federated ? undefined : new ClientAttributes().withStandardAttributes({ locale: true }),
       preventUserExistenceErrors: true,
       enableTokenRevocation: true,
       accessTokenValidity: Duration.minutes(60),
@@ -168,10 +176,12 @@ export interface PortalEntraIdentityProps {
 
 const GUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-/** Validates Entra settings and derives the issuer; creates no AWS resource. */
+/** Validates Entra settings and derives the issuer and its signing keys' location; creates no AWS resource. */
 export function resolvePortalEntraIdentity(props: PortalEntraIdentityProps): {
   readonly issuer: string;
   readonly audience: readonly string[];
+  /** Where the tenant publishes its token signing keys. */
+  readonly jwksUrl: string;
 } {
   if (!GUID.test(props.tenantId)) {
     throw new Error("Portal identity: Entra tenantId must be a GUID.");
@@ -190,5 +200,6 @@ export function resolvePortalEntraIdentity(props: PortalEntraIdentityProps): {
   return {
     issuer: `https://login.microsoftonline.com/${props.tenantId}/v2.0`,
     audience: [props.apiAudience],
+    jwksUrl: `https://login.microsoftonline.com/${props.tenantId}/discovery/v2.0/keys`,
   };
 }

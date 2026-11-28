@@ -4,11 +4,13 @@
  */
 import { Aws, Duration, RemovalPolicy, Stack } from "aws-cdk-lib";
 import {
+  CfnRoute,
   CfnStage,
   CorsHttpMethod,
   HttpApi,
   HttpMethod,
   HttpNoneAuthorizer,
+  HttpRoute,
   IHttpRouteAuthorizer,
 } from "aws-cdk-lib/aws-apigatewayv2";
 import { ITable } from "aws-cdk-lib/aws-dynamodb";
@@ -42,6 +44,39 @@ import {
 } from "./naming";
 
 /** One Workstream cell the portal reads. */
+/** A request budget for one route: sustained requests per second, and the burst above it. */
+export interface PortalRouteThrottle {
+  readonly rateLimit: number;
+  readonly burstLimit: number;
+}
+
+/** The unauthenticated liveness route. */
+export const PORTAL_HEALTH_ROUTE_THROTTLE: PortalRouteThrottle = { rateLimit: 5, burstLimit: 10 };
+
+/**
+ * Gives routes a request budget of their own.
+ *
+ * The stage's default budget is shared by every route that has no setting of
+ * its own (measured: a flood of reads by one signed-in user also throttled an
+ * action route). A route named here is counted separately, so traffic on the
+ * other routes cannot use up its budget.
+ */
+export function throttlePortalRoute(httpApi: HttpApi, routes: HttpRoute[], throttle: PortalRouteThrottle): void {
+  const stage = httpApi.defaultStage?.node.defaultChild as CfnStage;
+  const settings = { ...((stage.routeSettings as Record<string, unknown> | undefined) ?? {}) };
+  for (const route of routes) {
+    const resource = route.node.defaultChild as CfnRoute;
+    settings[resource.routeKey] = {
+      ThrottlingRateLimit: throttle.rateLimit,
+      ThrottlingBurstLimit: throttle.burstLimit,
+      DetailedMetricsEnabled: true,
+    };
+    // A stage cannot name a route that does not exist yet.
+    stage.addDependency(resource);
+  }
+  stage.routeSettings = settings;
+}
+
 export interface PortalCell {
   readonly tenantId: string;
   readonly agentId: string;
@@ -459,6 +494,8 @@ export class PortalApi extends Construct {
       throttlingRateLimit: 25,
       detailedMetricsEnabled: true,
     };
+    // The one route that reaches the function without a token gets a small budget of its own.
+    throttlePortalRoute(this.httpApi, healthRoutes, PORTAL_HEALTH_ROUTE_THROTTLE);
     accessLogs.grantWrite(new ServicePrincipal("apigateway.amazonaws.com"));
 
     this.apiBaseUrl = `${this.httpApi.apiEndpoint}/api/v1`;

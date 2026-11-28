@@ -214,6 +214,11 @@ class Inventory:
     def tables(self) -> list[str]:
         return [t for t in paged(self.client("dynamodb"), "list_tables", "TableNames") if is_project_name(t)]
 
+    def queues(self) -> list[str]:
+        """SQS queues by name (the last path segment of the queue URL)."""
+        names = [url.rsplit("/", 1)[-1] for url in paged(self.client("sqs"), "list_queues", "QueueUrls")]
+        return [name for name in names if is_project_name(name)]
+
     def user_pools(self) -> list[str]:
         items = paged(self.client("cognito-idp"), "list_user_pools", "UserPools", MaxResults=60)
         return [p["Name"] for p in items if is_project_name(p["Name"])]
@@ -307,6 +312,7 @@ class Inventory:
         s("kms keys PendingDeletion", self.kms_keys("PendingDeletion"))
         s("ssm parameters /agenticai/", self.ssm_parameters)
         s("dynamodb tables", self.tables)
+        s("sqs queues", self.queues)
         s("cognito user pools", self.user_pools)
         s("bedrock guardrails", self.guardrails)
         s("cloudwatch alarms", self.alarms)

@@ -28,6 +28,9 @@ export const PORTAL_CONTAINMENT_TARGET_ACTIONS: readonly string[] = [
   "bedrock-agentcore:DeleteResourcePolicy",
   "bedrock-agentcore:StopRuntimeSession",
   "bedrock-agentcore:ListAgentRuntimeEndpoints",
+  // In an account that several tenants share, the Runtime's tenant tag (set by the cell's
+  // pipeline) says whose it is. A registration never does.
+  "bedrock-agentcore:ListTagsForResource",
 ];
 
 /**
@@ -139,7 +142,7 @@ export class PortalContainmentTargetRole extends Construct {
         {
           id: "AwsSolutions-IAM5",
           reason:
-            "SEC-050: containment must reach any Runtime of this cell, including ones deployed after this role; the Runtime statement is scoped to this account and Region's Runtimes and to five actions; log stream names are listed only in the log groups of those Runtimes; with the optional spans source, Logs Insights results have no resource type and are pinned to the Region.",
+            "SEC-050: containment must reach any Runtime of this cell, including ones deployed after this role; the Runtime statement is scoped to this account and Region's Runtimes and to six actions; log stream names are listed only in the log groups of those Runtimes; with the optional spans source, Logs Insights results have no resource type and are pinned to the Region.",
         },
       ],
       true,

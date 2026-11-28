@@ -168,11 +168,32 @@ def test_every_key_description_the_code_emits_is_recognised():
         ("AgenticAI-RegistryApprover-prod", True),
         ("agenticai-portal-nonprod", True),
         ("agenticai-portal-nonprod-ipv4", True),
+        # The queue of background containment sweeps and its dead-letter queue (generated names).
+        ("AgenticAI-AgentFactoryPortal-nonprod-ActionsSweepQueue1A2B3C4D-AbCdEfGhIjKl", True),
+        ("AgenticAI-AgentFactoryPortal-nonprod-ActionsSweepDeadLetters9Z8Y7X6W-MnOpQrStUvWx", True),
         ("portal-of-another-team", False),
     ],
 )
 def test_agent_factory_portal_resources_are_recognised(name, expected):
     assert inv.is_project_name(name) is expected
+
+
+def test_queues_are_listed_by_name_and_only_this_projects():
+    class Sqs:
+        def can_paginate(self, operation):
+            return False
+
+        def list_queues(self, **_kwargs):
+            return {
+                "QueueUrls": [
+                    "https://sqs.eu-west-1.amazonaws.com/111111111111/AgenticAI-AgentFactoryPortal-nonprod-ActionsSweepQueue1A2B3C4D-AbCdEfGhIjKl",
+                    "https://sqs.eu-west-1.amazonaws.com/111111111111/orders-of-another-team",
+                ]
+            }
+
+    inventory = inv.Inventory.__new__(inv.Inventory)
+    inventory.client = lambda _service: Sqs()
+    assert inventory.queues() == ["AgenticAI-AgentFactoryPortal-nonprod-ActionsSweepQueue1A2B3C4D-AbCdEfGhIjKl"]
 
 
 @pytest.mark.parametrize(

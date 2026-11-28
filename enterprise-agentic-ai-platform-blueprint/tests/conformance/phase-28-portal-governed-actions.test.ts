@@ -25,7 +25,9 @@ import { Annotations, Match, Template } from "aws-cdk-lib/assertions";
 import { AwsSolutionsChecks, NIST80053R5Checks } from "cdk-nag";
 
 import {
+  PORTAL_APPROVER_AUDIT_KEYS,
   PORTAL_APPROVER_REGISTRY_ACTIONS,
+  PORTAL_REGISTRAR_AUDIT_KEYS,
   PORTAL_REGISTRAR_REGISTRY_ACTIONS,
 } from "@agenticai/agent-factory-portal";
 import { AgentFactoryPortalStack } from "../../apps/platform-account/lib/agent-factory-portal-stack";
@@ -123,6 +125,27 @@ describe("Phase 28 — separation of duties in IAM", () => {
     expect(reader.filter((a) => a.startsWith("dynamodb:"))).toEqual(["dynamodb:Query"]);
   });
 
+  it("each function can write only its own kind of entry in the audit trail", () => {
+    type Conditioned = { Sid?: string; Condition?: Record<string, Record<string, string[]>> };
+    const keysOf = (roleName: string): string[] => {
+      const roles = template.findResources("AWS::IAM::Role", { Properties: { RoleName: roleName } });
+      const roleId = Object.keys(roles)[0];
+      const audit = Object.values(template.findResources("AWS::IAM::ManagedPolicy") as Record<string, Policy>)
+        .filter((p) => JSON.stringify(p.Properties.Roles).includes(roleId))
+        .flatMap((p) => p.Properties.PolicyDocument.Statement as Conditioned[])
+        .filter((s) => s.Sid === "AuditTrail");
+      expect(audit).toHaveLength(1);
+      expect(Object.keys(audit[0].Condition!)).toEqual(["ForAllValues:StringLike"]);
+      return audit[0].Condition!["ForAllValues:StringLike"]["dynamodb:LeadingKeys"];
+    };
+    // The registrar writes the history of a registration. It cannot attest a review, which is
+    // the approver's decision, and neither can write into a containment history.
+    expect(keysOf("AgenticAI-RegistryRegistrar-nonprod")).toEqual([...PORTAL_REGISTRAR_AUDIT_KEYS]);
+    expect(keysOf("AgenticAI-RegistryApprover-nonprod")).toEqual([...PORTAL_APPROVER_AUDIT_KEYS]);
+    expect(PORTAL_REGISTRAR_AUDIT_KEYS).toEqual(["RECORD#*"]);
+    expect(PORTAL_APPROVER_AUDIT_KEYS).toEqual(["RECORD#*", "REVIEWS"]);
+  });
+
   it("the read API role still holds no mutating Registry action", () => {
     for (const action of reader.filter((a) => a.startsWith("agent-registry:"))) {
       expect(action).toMatch(/:(Get|List)/);
@@ -211,8 +234,50 @@ describe("Phase 28 — write routes", () => {
     ["POST /api/v1/registrations/{record_id}/submit", "registrar_handler.handler"],
     ["POST /api/v1/registrations/{record_id}/approve", "approver_handler.handler"],
     ["POST /api/v1/registrations/{record_id}/reject", "approver_handler.handler"],
+    // Life after approval: retiring a registration and attesting its review are decisions.
+    ["POST /api/v1/registrations/{record_id}/retire", "approver_handler.handler"],
+    ["POST /api/v1/registrations/{record_id}/review", "approver_handler.handler"],
   ])("%s is authorized and served by %s", (routeKey, handler) => {
     expect(functionOfRoute(routeKey)).toBe(handler);
+  });
+
+  it("gives each action function what it needs to verify the caller's token and to check a registration's cell", () => {
+    const functions = Object.values(json.Resources)
+      .filter((r) => r.Type === "AWS::Lambda::Function")
+      .map((r) => r.Properties as { Handler: string; Environment?: { Variables: Record<string, unknown> } });
+    for (const handler of ["registrar_handler.handler", "approver_handler.handler"]) {
+      const variables = functions.find((f) => f.Handler === handler)!.Environment!.Variables;
+      // The same issuer and audience the API's JWT authorizer checks: the function verifies the
+      // bearer token itself, so claims handed to it directly carry no weight.
+      expect(JSON.stringify(variables.PORTAL_JWT_ISSUER)).toContain("cognito-idp.");
+      expect(JSON.stringify(variables.PORTAL_JWT_AUDIENCE)).toMatch(/Ref|Fn::/);
+      // Configuration only: a registration's Runtime must run in a cell of its own tenant.
+      expect(variables.PORTAL_CELLS).toBeDefined();
+    }
+    const read = functions.find((f) => f.Handler === "handler.handler")!.Environment!.Variables;
+    expect(read.PORTAL_JWT_ISSUER).toBeUndefined();
+  });
+
+  it("no decision route reaches the registrar function, and every write route is one of the known ones", () => {
+    const writes = Object.values(json.Resources)
+      .filter((r) => r.Type === "AWS::ApiGatewayV2::Route")
+      .map((r) => String(r.Properties.RouteKey))
+      .filter((key) => !key.startsWith("GET "));
+    expect(writes.sort()).toEqual(
+      [
+        "DELETE /api/v1/registrations/{record_id}",
+        "POST /api/v1/registrations",
+        "POST /api/v1/registrations/{record_id}/approve",
+        "POST /api/v1/registrations/{record_id}/reject",
+        "POST /api/v1/registrations/{record_id}/retire",
+        "POST /api/v1/registrations/{record_id}/review",
+        "POST /api/v1/registrations/{record_id}/submit",
+        "PUT /api/v1/registrations/{record_id}",
+      ].sort(),
+    );
+    for (const decision of ["approve", "reject", "retire", "review"]) {
+      expect(functionOfRoute(`POST /api/v1/registrations/{record_id}/${decision}`)).not.toBe("registrar_handler.handler");
+    }
   });
 
   it("the read function serves GET only", () => {

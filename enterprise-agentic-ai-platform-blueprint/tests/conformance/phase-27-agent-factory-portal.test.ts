@@ -316,6 +316,8 @@ describe("Phase 27 — portal stack (Platform account)", () => {
     template.hasResourceProperties("AWS::Cognito::UserPoolClient", {
       GenerateSecret: false,
       AllowedOAuthFlows: ["code"],
+      // A signed-in user cannot change the email the portal shows them by.
+      WriteAttributes: ["locale"],
     });
     template.resourceCountIs("AWS::Cognito::UserPoolGroup", Object.keys(PORTAL_COGNITO_GROUPS).length);
   });
