@@ -36,7 +36,7 @@ export default function AgentToolSubscriptionsTab({ agent }: { agent: Agent }) {
     return computeDrift(agent.declared_mcp_server_ids, grants.map((g) => g.mcp_id)).map((row) => ({
       ...row,
       name: byId.get(row.id)?.mcp_name ?? row.id,
-      role: byId.get(row.id)?.role ?? '—',
+      role: byId.get(row.id)?.role ?? 'Not set',
     }));
   }, [data, agent.declared_mcp_server_ids]);
 

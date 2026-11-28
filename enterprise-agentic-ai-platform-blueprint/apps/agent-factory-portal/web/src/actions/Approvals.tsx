@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT-0
 import { Link } from 'react-router-dom';
+import { BreakableName } from '../components/governance/agentUi';
 import { useUser } from '../contexts/UserContext';
 import { Badge, CARD, EmptyCard, ErrorCard, Loading, Page, PageHeader, TABLE_HEAD, TD, TH, formatDate } from '../components/shared/ui';
 import { useAsync } from '../components/shared/useAsync';
@@ -60,12 +61,12 @@ export default function Approvals() {
             <tbody className="divide-y divide-slate-100">
               {(queue.data ?? []).map((r) => (
                 <tr key={r.record_id}>
-                  <td className={`${TD} font-medium text-slate-800 break-all`}>{r.agent_id || r.name || r.record_id}</td>
-                  <td className={`${TD} text-slate-600`}>{r.tenant_id || '—'}</td>
-                  <td className={`${TD} text-slate-600`}>{r.environment || '—'}</td>
-                  <td className={`${TD} text-slate-600`}>{typeof r.document?.risk_class === 'string' ? r.document.risk_class : '—'}</td>
+                  <td className={`${TD} font-medium text-slate-800`}><BreakableName name={r.agent_id || r.name || r.record_id} /></td>
+                  <td className={`${TD} text-slate-600`}>{r.tenant_id || 'None'}</td>
+                  <td className={`${TD} text-slate-600`}>{r.environment || 'Not set'}</td>
+                  <td className={`${TD} text-slate-600`}>{typeof r.document?.risk_class === 'string' ? r.document.risk_class : 'Not set'}</td>
                   <td className={`${TD} text-slate-600`}>
-                    {r.submitted_by_label || '—'}
+                    {r.submitted_by_label || 'Not recorded'}
                     {r.submitted_by_me && <Badge cls="ml-2 bg-slate-100 text-slate-700" label="You" title={OWN_SUBMISSION_NOTE} />}
                   </td>
                   <td className={`${TD} text-slate-600 whitespace-nowrap`}>{formatDate(r.submitted_at)}</td>

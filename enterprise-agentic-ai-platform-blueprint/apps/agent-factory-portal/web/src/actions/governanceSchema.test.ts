@@ -20,8 +20,11 @@ import {
   fieldForDocumentPath,
   fieldForMessage,
   inputFromDraft,
+  isCalendarDate,
   validateDraft,
   type RegistrationDraft,
+  REVIEW_BY_MAX_DAYS,
+  latestReviewBy,
 } from './governanceSchema';
 
 /** The schema this module copies. Read here, in a test, so production code never crosses the package boundary. */
@@ -70,10 +73,11 @@ describe('the copied constraints match the schema file', () => {
     expect(PATTERNS.runtimeArn).toBe(prop.runtimeArn.pattern);
     expect(PATTERNS.gatewayArn).toBe(prop.gatewayArn.pattern);
     expect(PATTERNS.recordVersion).toBe(prop.recordVersion.pattern);
+    expect(PATTERNS.reviewBy).toBe(prop.reviewBy.pattern);
   });
 
   it('has the same length limits', () => {
-    for (const field of ['applicationId', 'ownerGroup', 'contact', 'businessPurpose', 'costCentre', 'framework'] as const) {
+    for (const field of ['applicationId', 'ownerGroup', 'contact', 'businessPurpose', 'costCentre', 'framework', 'sponsor'] as const) {
       expect({ field, ...LENGTHS[field] }).toEqual({ field, min: prop[field].minLength ?? 0, max: prop[field].maxLength });
     }
     const goldenPath = prop.goldenPath.properties!;
@@ -92,6 +96,8 @@ describe('the copied constraints match the schema file', () => {
       ...VALID,
       applicationId: 'app-1',
       contact: 'retail-platform@example.com',
+      sponsor: 'Example Sponsor',
+      reviewBy: '2027-01-31',
       framework: 'strands',
       goldenPathName: 'python-agent',
       goldenPathVersion: '2.1.0',
@@ -151,6 +157,36 @@ describe('validateDraft', () => {
     expect(validateDraft({ ...VALID, ownerGroup: '   ' }).ownerGroup).toBeDefined();
   });
 
+  it('accepts an empty sponsor and review date, and checks them when given', () => {
+    expect(validateDraft({ ...VALID, sponsor: '', reviewBy: '' })).toEqual({});
+    expect(validateDraft({ ...VALID, sponsor: 'x'.repeat(257) }).sponsor).toBeDefined();
+    expect(validateDraft({ ...VALID, sponsor: 'x'.repeat(256) }).sponsor).toBeUndefined();
+    for (const bad of ['31-01-2027', '2027-1-31', '2027/01/31', '2027-02-30', '2027-13-01', 'soon']) {
+      expect(validateDraft({ ...VALID, reviewBy: bad }).reviewBy).toBeDefined();
+    }
+    expect(validateDraft({ ...VALID, reviewBy: '2028-02-29' }).reviewBy).toBeUndefined();
+    expect(isCalendarDate('2027-02-29')).toBe(false);
+  });
+
+  it('accepts a review date at most 366 days ahead, counted in UTC, as the API does', () => {
+    const now = new Date('2026-11-28T06:30:00Z');
+    expect(REVIEW_BY_MAX_DAYS).toBe(366);
+    expect(latestReviewBy(now)).toBe('2027-11-29');
+    // Just before midnight UTC and just after: the day is the UTC day.
+    expect(latestReviewBy(new Date('2026-11-28T23:59:59Z'))).toBe('2027-11-29');
+    expect(latestReviewBy(new Date('2026-11-29T00:00:01Z'))).toBe('2027-11-30');
+    expect(validateDraft({ ...VALID, reviewBy: '2027-11-29' }, null, now).reviewBy).toBeUndefined();
+    expect(validateDraft({ ...VALID, reviewBy: '2027-11-30' }, null, now).reviewBy).toBe(
+      'Choose 2027-11-29 or an earlier date: a review can be at most 366 days ahead.',
+    );
+    // A date in the past is allowed: it records a review that is already due.
+    expect(validateDraft({ ...VALID, reviewBy: '2026-01-31' }, null, now).reviewBy).toBeUndefined();
+    // A date that is not a date keeps its own message.
+    expect(validateDraft({ ...VALID, reviewBy: '2027-02-30' }, null, now).reviewBy).toMatch(/year-month-day/);
+    // Without a clock the rule is not applied.
+    expect(validateDraft({ ...VALID, reviewBy: '2999-12-31' }).reviewBy).toBeUndefined();
+  });
+
   it('requires both halves of the golden path, or neither', () => {
     expect(validateDraft({ ...VALID, goldenPathName: 'python-agent' }).goldenPathVersion).toBeDefined();
     expect(validateDraft({ ...VALID, goldenPathVersion: '2.1.0' }).goldenPathName).toBeDefined();
@@ -196,6 +232,14 @@ describe('inputFromDraft and draftFromDocument', () => {
   it('drops an optional field that was cleared, even if the base had it', () => {
     const base = inputFromDraft({ ...VALID, contact: 'retail-platform@example.com' });
     expect(inputFromDraft(VALID, base)).not.toHaveProperty('contact');
+  });
+
+  it('sends the sponsor and review date under their request names', () => {
+    const input = inputFromDraft({ ...VALID, sponsor: ' Example Sponsor ', reviewBy: '2027-01-31' });
+    expect(input.sponsor).toBe('Example Sponsor');
+    expect(input.review_by).toBe('2027-01-31');
+    expect(fieldForDocumentPath(['body', 'review_by'])).toBe('reviewBy');
+    expect(fieldForDocumentPath(['body', 'sponsor'])).toBe('sponsor');
   });
 
   it('never sends the schema version, which the server sets', () => {

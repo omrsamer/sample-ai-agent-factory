@@ -1,5 +1,6 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT-0
+import { nodeContext } from './enrich';
 import type { FlowEdge, FlowNode } from './layout';
 
 const TYPE_LABEL: Record<FlowNode['data']['nodeType'], string> = {
@@ -31,7 +32,13 @@ export default function AccessTable({
   onSelectNode: (id: string) => void;
   onSelectEdge: (id: string) => void;
 }) {
-  const label = new Map(nodes.map((n) => [n.id, n.data.label]));
+  // An agent is named with its tenant and account, because two agents can carry one name.
+  const label = new Map(
+    nodes.map((n) => {
+      const context = nodeContext(n.data.metadata);
+      return [n.id, context ? `${n.data.label} · ${context}` : n.data.label];
+    }),
+  );
   return (
     <div className="space-y-6 overflow-y-auto h-full pr-1">
       <section aria-labelledby="access-relationships">
@@ -60,8 +67,8 @@ export default function AccessTable({
                       <td className={`${TD} text-slate-700 break-words`}>{from}</td>
                       <td className={`${TD} text-slate-600`}>{e.data?.edgeType === 'can_call' ? 'can call' : 'has access to'}</td>
                       <td className={`${TD} text-slate-700 break-words`}>{to}</td>
-                      <td className={`${TD} text-slate-600`}>{e.data?.role || '—'}</td>
-                      <td className={`${TD} text-slate-600`}>{e.data?.hasPolicy ? 'Enforced' : '—'}</td>
+                      <td className={`${TD} text-slate-600`}>{e.data?.role || 'Not set'}</td>
+                      <td className={`${TD} text-slate-600`}>{e.data?.hasPolicy ? 'Enforced' : 'None'}</td>
                       <td className={`${TD} text-right`}>
                         <button type="button" className={DETAILS} onClick={() => onSelectEdge(e.id)} aria-label={`Details of ${from} to ${to}`}>
                           Details
@@ -90,10 +97,15 @@ export default function AccessTable({
             <tbody className="divide-y divide-slate-100">
               {nodes.map((n) => (
                 <tr key={n.id}>
-                  <td className={`${TD} text-slate-700 break-words`}>{n.data.label}</td>
+                  <td className={`${TD} text-slate-700 break-words`}>
+                    {label.get(n.id) ?? n.data.label}
+                    {n.data.metadata.contained === true && (
+                      <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-red-700 text-white">Contained</span>
+                    )}
+                  </td>
                   <td className={`${TD} text-slate-600`}>{TYPE_LABEL[n.data.nodeType]}</td>
                   <td className={`${TD} text-right`}>
-                    <button type="button" className={DETAILS} onClick={() => onSelectNode(n.id)} aria-label={`Details of ${n.data.label}`}>
+                    <button type="button" className={DETAILS} onClick={() => onSelectNode(n.id)} aria-label={`Details of ${label.get(n.id) ?? n.data.label}`}>
                       Details
                     </button>
                   </td>

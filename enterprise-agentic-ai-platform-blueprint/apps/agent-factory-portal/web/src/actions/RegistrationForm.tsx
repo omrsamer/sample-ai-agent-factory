@@ -17,9 +17,11 @@ import {
   IDENTITY_FIELDS,
   LENGTHS,
   PATTERNS,
+  REVIEW_BY_MAX_DAYS,
   RISK_CLASSES,
   draftFromDocument,
   inputFromDraft,
+  latestReviewBy,
   validateDraft,
   type DraftField,
   type FieldErrors,
@@ -196,6 +198,8 @@ function RegistrationEditor({
   const navigate = useNavigate();
   const tools = useAsync(() => catalogApi.tools(), [], 'Failed to load the tools catalog.');
   const [draft, setDraft] = useState<RegistrationDraft>(initial);
+  // The latest review date the API accepts, counted from the day the form was opened.
+  const [latestReview] = useState(() => latestReviewBy(new Date()));
   const [errors, setErrors] = useState<FieldErrors>({});
   const [failure, setFailure] = useState<ActionFailure | null>(null);
   const [saving, setSaving] = useState(false);
@@ -222,7 +226,7 @@ function RegistrationEditor({
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     setFailure(null);
-    const found = validateDraft(draft, currentVersion);
+    const found = validateDraft(draft, currentVersion, new Date());
     setErrors(found);
     if (Object.keys(found).length > 0) {
       summaryRef.current?.focus();
@@ -373,7 +377,22 @@ function RegistrationEditor({
         <fieldset className={`${CARD} p-5`}>
           <legend className="text-sm font-semibold text-slate-900 px-1">Ownership and purpose</legend>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {text('ownerGroup', { required: true, maxLength: LENGTHS.ownerGroup.max })}
+            {text('ownerGroup', { required: true, maxLength: LENGTHS.ownerGroup.max, hint: 'The team that owns and operates the agent. It is the agent’s accountable owner.' })}
+            {text('sponsor', { maxLength: LENGTHS.sponsor.max, hint: 'The accountable person, by name or email. Optional.' })}
+            <FieldShell field="reviewBy" errors={errors} hint={`The date by which this registration must be reviewed again, at most ${REVIEW_BY_MAX_DAYS} days ahead.`}>
+              {({ id, describedBy, invalid }) => (
+                <input
+                  id={id}
+                  type="date"
+                  className={INPUT}
+                  max={latestReview}
+                  value={draft.reviewBy}
+                  aria-invalid={invalid || undefined}
+                  aria-describedby={describedBy}
+                  onChange={(e) => set('reviewBy', e.target.value)}
+                />
+              )}
+            </FieldShell>
             {text('contact', { maxLength: LENGTHS.contact.max, hint: 'A team mailbox or channel, not a personal address.' })}
             {text('costCentre', { required: true, maxLength: LENGTHS.costCentre.max })}
             <div className="sm:col-span-2">

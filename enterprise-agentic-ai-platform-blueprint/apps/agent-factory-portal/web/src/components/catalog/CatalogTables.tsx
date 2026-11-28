@@ -42,7 +42,7 @@ export function CatalogModels() {
             <tr key={m.model_id}>
               <td className={`${TD} font-mono text-xs text-slate-800 break-all`}>{m.model_id}</td>
               <td className={`${TD} text-slate-600`}>{m.provider}</td>
-              <td className={`${TD} text-slate-600`}>{(m.regions ?? []).join(', ') || '—'}</td>
+              <td className={`${TD} text-slate-600`}>{(m.regions ?? []).join(', ') || 'None'}</td>
               <td className={TD}><Badge cls={statusCls(m.status)} label={m.status} /></td>
             </tr>
           ))}
@@ -80,9 +80,9 @@ export function CatalogTools() {
                 {t.description && <div className="text-xs text-slate-600 mt-0.5 max-w-md">{t.description}</div>}
                 <div className="text-[11px] font-mono text-slate-600 mt-0.5 break-all">{t.tool_id}</div>
               </td>
-              <td className={`${TD} text-slate-600`}>{t.owner || '—'}</td>
-              <td className={`${TD} text-slate-600`}>{t.cost_centre || '—'}</td>
-              <td className={`${TD} text-slate-600`}>{t.version || '—'}</td>
+              <td className={`${TD} text-slate-600`}>{t.owner || 'Not set'}</td>
+              <td className={`${TD} text-slate-600`}>{t.cost_centre || 'Not set'}</td>
+              <td className={`${TD} text-slate-600`}>{t.version || 'Not set'}</td>
               <td className={TD}><Badge cls={statusCls(t.status)} label={t.status} /></td>
               <td className={TD}><CodeValue value={t.target_arn} copyLabel="target ARN" /></td>
             </tr>

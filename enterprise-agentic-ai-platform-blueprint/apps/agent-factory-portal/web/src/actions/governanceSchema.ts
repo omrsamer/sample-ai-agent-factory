@@ -23,6 +23,7 @@ export const PATTERNS = {
   runtimeArn: '^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:runtime/[A-Za-z0-9_-]+$',
   gatewayArn: '^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:gateway/[A-Za-z0-9_-]+$',
   recordVersion: '^[0-9]+\\.[0-9]+\\.[0-9]+$',
+  reviewBy: '^[0-9]{4}-[0-9]{2}-[0-9]{2}$',
 } as const;
 
 /** Maximum lengths. A field with `min: 1` may not be empty when it is present. */
@@ -35,6 +36,7 @@ export const LENGTHS = {
   framework: { min: 0, max: 64 },
   goldenPathName: { min: 1, max: 128 },
   goldenPathVersion: { min: 1, max: 64 },
+  sponsor: { min: 1, max: 256 },
 } as const;
 
 /** Top-level fields the schema requires. */
@@ -73,6 +75,8 @@ export interface RegistrationDocument {
   record_version?: string;
   application_id?: string | null;
   contact?: string | null;
+  sponsor?: string | null;
+  review_by?: string | null;
   framework?: string | null;
   golden_path?: { name?: string; version?: string } | null;
   runtime_arn?: string | null;
@@ -90,6 +94,8 @@ export interface RegistrationDraft {
   agentId: string;
   environment: string;
   ownerGroup: string;
+  sponsor: string;
+  reviewBy: string;
   contact: string;
   businessPurpose: string;
   riskClass: string;
@@ -112,6 +118,8 @@ export const EMPTY_DRAFT: RegistrationDraft = {
   agentId: '',
   environment: 'nonprod',
   ownerGroup: '',
+  sponsor: '',
+  reviewBy: '',
   contact: '',
   businessPurpose: '',
   riskClass: '',
@@ -132,6 +140,8 @@ export const FIELD_LABEL: Record<DraftField, string> = {
   agentId: 'Agent id',
   environment: 'Environment',
   ownerGroup: 'Owner group',
+  sponsor: 'Sponsor',
+  reviewBy: 'Review by',
   contact: 'Contact',
   businessPurpose: 'Business purpose',
   riskClass: 'Risk class',
@@ -176,6 +186,8 @@ export function draftFromDocument(doc: RegistrationDocument | null | undefined):
     agentId: text(doc.agent_id),
     environment: text(doc.environment) || EMPTY_DRAFT.environment,
     ownerGroup: text(doc.owner_group),
+    sponsor: text(doc.sponsor),
+    reviewBy: text(doc.review_by),
     contact: text(doc.contact),
     businessPurpose: text(doc.business_purpose),
     riskClass: text(doc.risk_class),
@@ -197,7 +209,8 @@ export function draftFromDocument(doc: RegistrationDocument | null | undefined):
 /** Keys of the request body this form owns. Everything else in `base` is carried through. */
 const EDITED_KEYS = [
   'schema_version', 'tenant_id', 'agent_id', 'environment', 'owner_group', 'business_purpose', 'risk_class',
-  'data_classification', 'cost_centre', 'record_version', 'application_id', 'contact', 'framework', 'golden_path',
+  'data_classification', 'cost_centre', 'record_version', 'application_id', 'contact', 'sponsor', 'review_by',
+  'framework', 'golden_path',
   'runtime_arn', 'gateway_arn', 'subscribed_tool_ids',
 ];
 
@@ -243,6 +256,8 @@ export function inputFromDraft(
   if (version && version !== (currentVersion ?? '')) input.record_version = version;
   if (t(draft.applicationId)) input.application_id = t(draft.applicationId);
   if (t(draft.contact)) input.contact = t(draft.contact);
+  if (t(draft.sponsor)) input.sponsor = t(draft.sponsor);
+  if (t(draft.reviewBy)) input.review_by = t(draft.reviewBy);
   if (t(draft.framework)) input.framework = t(draft.framework);
   if (t(draft.goldenPathName) || t(draft.goldenPathVersion)) {
     input.golden_path = { name: t(draft.goldenPathName), version: t(draft.goldenPathVersion) };
@@ -255,6 +270,23 @@ export function inputFromDraft(
 
 export type FieldErrors = Partial<Record<DraftField, string>>;
 
+/** How far ahead a registration's review date may be. The API refuses a later one on create and update. */
+export const REVIEW_BY_MAX_DAYS = 366;
+
+/** The latest review date a registration may name: that many days after today, counted in UTC as the API counts. */
+export function latestReviewBy(now: Date): string {
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return new Date(today + REVIEW_BY_MAX_DAYS * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** True for a `YYYY-MM-DD` string that names a real day. */
+export function isCalendarDate(value: string): boolean {
+  if (!new RegExp(PATTERNS.reviewBy).test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}
+
 function matches(pattern: string, value: string): boolean {
   return new RegExp(pattern).test(value);
 }
@@ -264,8 +296,9 @@ const ID_HINT = 'Use lower-case letters, digits and hyphens, starting with a let
 /**
  * Validates the form against the copied schema constraints. An empty result means valid.
  * `currentVersion` is the record's version when editing: a changed version must be higher.
+ * `now` is the clock for the one rule that needs it: a review date at most 366 days ahead.
  */
-export function validateDraft(draft: RegistrationDraft, currentVersion?: string | null): FieldErrors {
+export function validateDraft(draft: RegistrationDraft, currentVersion?: string | null, now?: Date): FieldErrors {
   const errors: FieldErrors = {};
   const value = (field: Exclude<DraftField, 'subscribedToolIds'>) => draft[field].trim();
 
@@ -274,7 +307,7 @@ export function validateDraft(draft: RegistrationDraft, currentVersion?: string 
     if (!v) errors[field] = `${FIELD_LABEL[field]} is required.`;
     else if (v.length > max) errors[field] = `${FIELD_LABEL[field]} must be ${max} characters or fewer.`;
   };
-  const optionalText = (field: 'applicationId' | 'contact' | 'framework', max: number) => {
+  const optionalText = (field: 'applicationId' | 'contact' | 'framework' | 'sponsor', max: number) => {
     if (value(field).length > max) errors[field] = `${FIELD_LABEL[field]} must be ${max} characters or fewer.`;
   };
 
@@ -294,6 +327,12 @@ export function validateDraft(draft: RegistrationDraft, currentVersion?: string 
   optionalText('applicationId', LENGTHS.applicationId.max);
   optionalText('contact', LENGTHS.contact.max);
   optionalText('framework', LENGTHS.framework.max);
+  optionalText('sponsor', LENGTHS.sponsor.max);
+  const reviewBy = value('reviewBy');
+  if (reviewBy && !isCalendarDate(reviewBy)) errors.reviewBy = 'Enter a date as year-month-day, for example 2027-01-31.';
+  else if (reviewBy && now && reviewBy > latestReviewBy(now)) {
+    errors.reviewBy = `Choose ${latestReviewBy(now)} or an earlier date: a review can be at most ${REVIEW_BY_MAX_DAYS} days ahead.`;
+  }
 
   const name = value('goldenPathName');
   const version = value('goldenPathVersion');

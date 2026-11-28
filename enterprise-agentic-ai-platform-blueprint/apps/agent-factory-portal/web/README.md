@@ -8,25 +8,38 @@ Tailwind CSS.
 catalog. No screen offers an action that changes an agent, a tool gateway, a policy or a
 Workstream cell: those change through code, descriptors and pipelines.
 
-**Governed registration and approval** is an optional feature, off unless
-`features.governedActions` is `true` in `/config.json`. It records an agent's governance
-document and the decision on it; it deploys nothing. Every write goes through one module,
-`src/actions/registrationsClient.ts`, to `/registrations` only. A test (`src/hygiene.test.ts`)
-fails the build if a write is added anywhere else, or if anything outside `src/actions/`
-imports that folder other than through the one flagged dynamic import.
+**Governed actions** are optional and off unless `features.governedActions` is `true` in
+`/config.json`. There are two groups:
+
+- **Registration, approval and what follows.** A registration records an agent's governance
+  document and the decision on it. Once it is approved, an approver can confirm its periodic
+  review (with the date of the next one) and can retire it. Retiring is permanent. None of
+  this deploys or removes anything: a retired agent's runtime stays until its pipeline removes
+  it, and the page says so.
+- **Containment** denies invocation of an agent and stops its running sessions, and releases it
+  again. It deletes nothing, and the person who contained an agent cannot release it. Sessions
+  that are left are stopped by background sweeps, and the page says how many have run and
+  since when no session is running. Who contained an agent and why is shown to the security,
+  platform and SRE roles only.
+
+Every write goes through one of two modules, `src/actions/registrationsClient.ts` (to
+`/registrations` only) and `src/actions/containmentClient.ts` (to an agent's `/containment`
+only). A test (`src/hygiene.test.ts`) fails the build if a write is added anywhere else, or if
+anything outside `src/actions/` imports that folder other than through the dynamic imports in
+`App.tsx` and on the agent page, each of which is rendered only when the flag is on.
 
 ## Screens
 
 | Plane | Screen | Route |
 |-------|--------|-------|
-| Assurance and operations | Fleet (home): counts, cell health, recent agents | `/` |
-| | Agents: list and detail (Overview, Tool subscriptions, Deployment, Traces, Cost, Release evidence) | `/agents`, `/agents/:id` |
-| | Tool gateways: list and detail (Overview, Tools, Policies, Connected agents) | `/tool-gateways`, `/tool-gateways/:id` |
+| Assurance and operations | Fleet (home): inventory and risk counts, what needs attention, cell health, the agents telemetry observes | `/` |
+| | Agents: one inventory with state, risk, flags, filters, a "My tenants" switch and export; detail (Overview, Tool subscriptions, Deployment, Traces, Cost, Release evidence, and Containment with the feature flag), with "Download evidence" for an auditor | `/agents`, `/agents/:id` |
+| | Tool gateways: list (with account, tools, policy mode and whether a reader read it) and detail (Overview, Tools, Policies, Connected agents) | `/tool-gateways`, `/tool-gateways/:id` |
 | | Access graph | `/access-graph` |
 | | Observability | `/observability` |
 | | Release evidence | `/release-evidence`, `/release-evidence/:agentId` |
 | Platform control | Governance catalog: Agents, Tools, Guardrail profiles, Models | `/catalog/:section` |
-| | Registrations: list, register, record page with history (feature flag) | `/registrations`, `/registrations/new`, `/registrations/:id`, `/registrations/:id/edit` |
+| | Registrations: list, register, record page with history, review and retirement (feature flag) | `/registrations`, `/registrations/new`, `/registrations/:id`, `/registrations/:id/edit` |
 | | Approvals queue (feature flag, approver authority) | `/approvals` |
 | Resources | Documentation | `/docs` |
 
@@ -56,8 +69,10 @@ infrastructure next to the bundle, and the application loads it before it render
 - `apiBaseUrl`: an `https` URL or a same-origin path. It includes `/api/v1`.
 - `authProvider`: `cognito` or `entra`. Only the matching block is required.
 - `environment`: `nonprod` or `prod`; shown in the sidebar.
-- `features.governedActions`: `true` enables the registration and approval screens. Anything
-  else leaves them off, and then their code is never downloaded and only `GET` requests are made.
+- `features.governedActions`: `true` enables the registration and approval screens, the review
+  and retirement of a registration (also from the agent page), and the Containment tab.
+  Anything else leaves them off, and then their code is never downloaded and only `GET`
+  requests are made.
 - A missing file, invalid JSON, or a value that is empty or still a `<placeholder>` shows a
   configuration error page that names each problem. The application never starts half
   configured.
@@ -118,11 +133,49 @@ npm run build       # typecheck, then vite build into dist/
 must answer unknown paths with `index.html`. The application calls only the configured API and
 identity provider; it loads no font, script or image from a third party.
 
+## Inventory, risk and hand-off to CloudWatch Omni
+
+- The agents list is one inventory: registered agents and runtimes that were only detected
+  ("Registered", "Not registered", "Registered, not running"). State, risk level and flags are
+  always written in words; colour only supports them. On the fleet page every agent is counted
+  once as approved, awaiting approval or not registered.
+- The owner group is an agent's accountable owner; the sponsor (the accountable person) is
+  optional. An agent in an account where the portal has no reader role is still listed, marked
+  "No reader role in this account", and each panel that needs the role says so instead of
+  asking the API. A fact that a reader could not read is shown as unknown, never as clear. An
+  empty answer that comes with a note from the API is shown with that note, not as "nothing
+  recorded".
+- A tool gateway that only the organization registry detected is listed the same way: with its
+  account, Region, authorizer and protocol, marked "No reader role in this account" (or
+  "Reader role unreachable", "Not listed by the reader"). Its tools, tenant, policy engine and
+  policies read "Not readable", never "none" or "0", and those panels do not ask the API. On
+  the fleet page such gateways are counted as "whose policy cannot be read", and in the access
+  graph they stand alone, because who can call them is not known.
+- No page shows an account id in full: an account is shown by its alias, or masked to its last
+  four digits. Empty values are written in words, not as a dash.
+- The filters are kept in the address (`/agents?lifecycle=awaiting`, `?account=`, `?risk=high`,
+  `?state=registered_only`), which is how the fleet tiles link to the agents they count.
+- Export fetches the file with the bearer token and saves it under the name the server gave.
+  "Download evidence" on an agent page does the same for one JSON document about that agent:
+  its registration and decisions, reviews, containment, risk, tool gateway policy hashes, the
+  latest release, and what could not be read. Every role that can read the agent can download
+  it, with the feature flag on or off.
+- "My tenants" on the agents list keeps the agents of the tenants the signed-in person holds.
+  It is shown only to someone who holds some tenants and not all of them, is off by default,
+  and is remembered for the browser session.
+- A retired registration reads "Retired" everywhere. The fleet page counts retired
+  registrations in a tile of their own, shown only when there is one. While its runtime is
+  still deployed the agent's page says so and what is left to do. Once nothing is deployed the
+  API closes its obligations: the agent then has no risk badge and no flag chips, and nothing
+  about it is worded as unknown.
+- Where the API supplies a CloudWatch Omni URL, the portal links to it in a new tab. Nothing
+  from Omni is embedded.
+
 ## Accessibility
 
 `axe-core` is a development dependency so the same version can be run against the built site
 from a headless browser. Every route was checked with it in a signed-in state, with governed
-actions on, and reported no violation. Things to keep when changing the UI:
+actions on, at 1280 and 1024 pixels wide, and reported no violation. Things to keep when changing the UI:
 
 - every control has a visible focus ring (`:focus-visible` in `src/index.css`) and a name;
 - the first Tab stop is a "Skip to main content" link;
@@ -145,7 +198,8 @@ src/
     cognito/               Amazon Cognito provider (the only importer of oidc-client-ts)
     entra/                 Microsoft Entra ID provider (the only importer of MSAL)
   api/                     typed read-only client and 401 handling
-  actions/                 governed registration and approval (loaded only when enabled)
+  actions/                 governed actions: registration, approval, review, retirement and
+                           containment (loaded only when enabled)
   components/              screens, grouped as in the navigation
 ```
 

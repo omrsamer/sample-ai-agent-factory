@@ -160,6 +160,10 @@ export interface CurrentUser {
   name: string | null;
   /** Label to show for the caller (name, then email). Never the token subject. */
   display_name?: string | null;
+  /** May contain an agent. The action endpoints enforce it. */
+  can_contain?: boolean;
+  /** May release a contained agent, unless they are the person who contained it. */
+  can_release?: boolean;
   /** May create, edit, submit and delete registrations. The action endpoints enforce it. */
   can_register?: boolean;
   /** May approve and reject registrations. The action endpoints enforce it. */
@@ -181,8 +185,49 @@ export type LifecycleState = 'proposed' | 'pending_approval' | 'approved' | 'rej
 export type Platform = string;
 export type DataClassification = 'Public' | 'Internal' | 'Confidential' | 'Restricted';
 export type Origin = 'Deployed' | 'Registered';
-export type AuthType = 'none' | 'entra' | 'api_key';
+/** How callers are authorised at the runtime, in the console's own words. Other values are shown as recorded. */
+export type AuthType = 'none' | 'aws_iam' | 'custom_jwt' | (string & {});
 export type IdentityStatus = 'none' | 'pending' | 'provisioned' | 'failed';
+
+/** How an agent is known: registered, running, or both. */
+export type InventoryState = 'registered_and_detected' | 'detected_only' | 'registered_only';
+
+/** Attention flags. `null` means the flag could not be evaluated, which is not the same as false. */
+export interface AgentFlags {
+  unmanaged?: boolean | null;
+  ownerless?: boolean | null;
+  review_overdue?: boolean | null;
+  inactive?: boolean | null;
+  contained?: boolean | null;
+}
+
+export type RiskLevel = 'critical' | 'high' | 'medium' | 'low';
+
+/** One reason behind a risk level. `detail` is a plain-language sentence. */
+export interface RiskReason {
+  code: string;
+  severity: string;
+  detail: string;
+}
+
+export interface AgentRisk {
+  level: RiskLevel | string;
+  reasons: RiskReason[];
+}
+
+/** The parts of an agent's governance document the read screens show. */
+export interface AgentGovernance {
+  /** The group that owns the agent: its accountable owner. */
+  owner_group?: string | null;
+  /** A team mailbox or channel. */
+  contact?: string | null;
+  /** The accountable person (name or email). Optional. */
+  sponsor?: string | null;
+  /** Date (YYYY-MM-DD) by which the registration must be reviewed again. */
+  review_by?: string | null;
+  risk_class?: string | null;
+  cost_centre?: string | null;
+}
 
 /** `GET /agents` (array) and `GET /agents/{id}`. */
 export interface Agent {
@@ -204,12 +249,6 @@ export interface Agent {
   /** Tool gateways the agent's descriptor declares; compared with its subscriptions. */
   declared_mcp_server_ids?: string[];
   origin: Origin;
-  entra_app_id?: string | null;
-  entra_api_app_id?: string | null;
-  entra_sp_id?: string | null;
-  entra_app_audience?: string | null;
-  invoker_role_id?: string | null;
-  admin_role_id?: string | null;
   identity_status: IdentityStatus;
   lifecycle_state: LifecycleState;
   endpoint_url?: string | null;
@@ -221,6 +260,50 @@ export interface Agent {
   runtime_handle?: string | null;
   runtime_kind?: string | null;
   tenant_id?: string | null;
+  /** `registered` when a registry record stands behind the agent, `discovered` when none does. */
+  registration?: 'registered' | 'discovered' | (string & {}) | null;
+  /** Whether the agent is registered, detected running, or both. Absent on an older API. */
+  inventory_state?: InventoryState | string | null;
+  /** Where the agent was seen, for example the registry or a runtime. Shown as recorded. */
+  detection_sources?: string[] | null;
+  flags?: AgentFlags | null;
+  risk?: AgentRisk | null;
+  /**
+   * True for a retired registration with nothing deployed: no risk rule applies, and the flags
+   * `unmanaged`, `ownerless`, `review_overdue` and `inactive` are null because they do not
+   * apply, not because they could not be read.
+   */
+  obligations_closed?: boolean | null;
+  /** The governance document behind a registered agent. Null for an agent that is only detected. */
+  governance?: AgentGovernance | null;
+  /** The accountable person, from the registration. */
+  sponsor?: string | null;
+  /**
+   * The effective review date (YYYY-MM-DD): the latest review attestation's, else the
+   * registration's own. `governance.review_by` stays the document's date.
+   */
+  review_by?: string | null;
+  /** When the registration was last attested as reviewed, and by whom. Null when never. */
+  last_reviewed_at?: string | null;
+  last_reviewed_by?: string | null;
+  /** The configured alias of the agent's account. Null when none is configured. */
+  account_alias?: string | null;
+  /** The agent's account id. Used only to derive a masked label; never shown in full. */
+  account_id?: string | null;
+  /**
+   * `ok`, `unreachable` (a reader is configured but could not be used) or `none` (no reader in
+   * the agent's account, so its status, traces, metrics and containment state cannot be read).
+   */
+  reader_status?: string | null;
+  /** The registry's own status of the record, for a registered agent. */
+  registry_status?: string | null;
+  environment?: string | null;
+  /** How callers are authorised at the runtime, for example `AWS_IAM`. Null when not known. */
+  inbound_authorizer?: string | null;
+  /** Last day with an invocation inside the inactivity window. */
+  last_invoked_on?: string | null;
+  /** Link to this agent in CloudWatch Omni. Opened in a new tab, never embedded. */
+  omni_url?: string | null;
   created_at: string;
   updated_at: string;
   created_by?: string | null;
@@ -231,11 +314,37 @@ export interface AgentListFilters {
   lifecycle_state?: LifecycleState;
 }
 
+export type ExportFormat = 'csv' | 'json';
+
+export interface ExportedFile {
+  blob: Blob;
+  /** The `Content-Disposition` header as sent, or null when the browser may not read it. */
+  contentDisposition: string | null;
+}
+
 export const agentsApi = {
   list: async (filters?: AgentListFilters): Promise<Agent[]> =>
     (await client.get<Agent[]>('/agents', { params: filters })).data,
+  /**
+   * The inventory as a file. Fetched with the bearer token like every other request, because
+   * a token cannot be put in a link; the caller turns the result into a download.
+   */
+  exportInventory: async (format: ExportFormat): Promise<ExportedFile> => {
+    const response = await client.get<Blob>('/agents/export', { params: { format }, responseType: 'blob' });
+    const header = response.headers?.['content-disposition'];
+    return { blob: response.data, contentDisposition: typeof header === 'string' ? header : null };
+  },
   get: async (id: string): Promise<Agent> =>
     (await client.get<Agent>(`/agents/${encodeURIComponent(id)}`)).data,
+  /**
+   * One JSON document about one agent, for an auditor. A download like the inventory export:
+   * fetched with the bearer token, then saved under the name the server gave.
+   */
+  evidence: async (id: string): Promise<ExportedFile> => {
+    const response = await client.get<Blob>(`/agents/${encodeURIComponent(id)}/evidence`, { responseType: 'blob' });
+    const header = response.headers?.['content-disposition'];
+    return { blob: response.data, contentDisposition: typeof header === 'string' ? header : null };
+  },
 };
 
 // --- Runtime status, deployment history, release evidence --------------------
@@ -366,6 +475,10 @@ export interface McpTool {
   input_schema: Record<string, unknown>;
 }
 
+/**
+ * The modes this build words. The API also sends `unknown` for a gateway no reader read; that
+ * and any other value are shown as unknown, never as `none`.
+ */
 export type CedarEnforcementMode = 'none' | 'log_only' | 'enforce';
 
 export interface CedarCondition {
@@ -394,7 +507,8 @@ export interface CedarPolicyRow {
 
 /** `GET /mcp-servers/{id}/policies`. */
 export interface CedarPolicySet {
-  enforcement_mode: CedarEnforcementMode;
+  /** `none`, `log_only`, `enforce`, or `unknown` for a gateway no reader read. */
+  enforcement_mode: string;
   engine_id?: string | null;
   policies: CedarPolicyRow[];
   /** Short, safe notes about gaps in the policy read. */
@@ -403,7 +517,10 @@ export interface CedarPolicySet {
 
 /** `GET /mcp-servers/{id}/policy-enforcement`. */
 export interface CedarEnforcement {
-  enforcement_mode: CedarEnforcementMode;
+  /** `none`, `log_only`, `enforce`, or `unknown` for a gateway no reader read. */
+  enforcement_mode: string;
+  /** Why the mode is unknown, as a sentence to show. */
+  detail?: string | null;
 }
 
 /** `GET /mcp-servers` (array) and `GET /mcp-servers/{id}`. */
@@ -425,12 +542,8 @@ export interface McpServer {
   repo_id?: string | null;
   cedar_policy_engine_id?: string | null;
   cedar_policy_engine_arn?: string | null;
-  cedar_enforcement_mode?: CedarEnforcementMode;
-  entra_app_id?: string | null;
-  entra_sp_id?: string | null;
-  entra_app_audience?: string | null;
-  invoker_role_id?: string | null;
-  admin_role_id?: string | null;
+  /** `none`, `log_only`, `enforce`, or `unknown` for a gateway no reader read. */
+  cedar_enforcement_mode?: string;
   gateway_id?: string | null;
   gateway_url?: string | null;
   runtime_arn?: string | null;
@@ -439,13 +552,29 @@ export interface McpServer {
   tenant_id?: string | null;
   /** True when every tenant may subscribe to this gateway. */
   shared?: boolean;
+  /** The epoch when the API could not know the time. */
   created_at: string;
   updated_at: string;
   created_by?: string | null;
-}
-
-export interface McpServerListFilters {
-  lifecycle_state?: LifecycleState;
+  /** The gateway's account, and its configured alias when there is one. */
+  account_id?: string | null;
+  account_alias?: string | null;
+  environment?: string | null;
+  /** `AWS_IAM`, `CUSTOM_JWT` or `NONE`; null when the detection does not carry it. */
+  authorizer_type?: string | null;
+  /** For example `MCP`. */
+  protocol?: string | null;
+  /** `cell_reader`, `organization_registry`, or both. */
+  detection_sources?: string[] | null;
+  /**
+   * `ok` when a cell reader read the gateway. Otherwise it is known from the organization
+   * registry only, and nothing of its tools, tenant, policy engine or policies is known:
+   * `none` (no reader role in its account), `unreachable` (the reader role could not be used)
+   * or `not_listed` (the reader works but did not list it).
+   */
+  reader_status?: string | null;
+  /** For a gateway no reader read: why its tools and policy are not shown, as a sentence. */
+  detail?: string | null;
 }
 
 /** One row of `GET /mcp-servers/{id}/grants`: an agent connected to the gateway. */
@@ -458,8 +587,7 @@ export interface Grant {
 }
 
 export const mcpServersApi = {
-  list: async (filters?: McpServerListFilters): Promise<McpServer[]> =>
-    (await client.get<McpServer[]>('/mcp-servers', { params: filters })).data,
+  list: async (): Promise<McpServer[]> => (await client.get<McpServer[]>('/mcp-servers')).data,
   get: async (id: string): Promise<McpServer> =>
     (await client.get<McpServer>(`/mcp-servers/${encodeURIComponent(id)}`)).data,
   policies: async (id: string): Promise<CedarPolicySet> =>
@@ -593,6 +721,8 @@ export interface FleetCell {
   reachable: boolean;
   /** Optional short, safe explanation of the state. */
   detail?: string | null;
+  /** Link to this cell's agent in CloudWatch Omni. */
+  omni_url?: string | null;
 }
 
 /** Cell counts per state. The API may add further counters; the UI reads these four. */
@@ -605,8 +735,99 @@ export interface FleetHealth {
   totals: FleetTotals;
 }
 
+/**
+ * `GET /fleet/summary`: counts across the whole inventory. For each flag, `flags` counts the
+ * agents that have it set and `flags_unknown` those for which it could not be evaluated.
+ */
+export interface FleetSummary {
+  generated_at?: string | null;
+  agents_total: number;
+  by_inventory_state?: Record<string, number> | null;
+  by_lifecycle?: Record<string, number> | null;
+  by_risk_level?: Record<string, number> | null;
+  flags?: Record<string, number> | null;
+  flags_unknown?: Record<string, number> | null;
+  gateways_total?: number | null;
+  /** Tool gateways per policy mode: `enforce`, `log_only`, `none`. */
+  gateways_by_policy_mode?: Record<string, number> | null;
+  /** `ok`, `disabled` when no discovery registry is configured, or an error code. */
+  organization_registry?: string | null;
+  /** `ok`, `disabled` when there is no audit table, or an error code: then each review date is the registration's own. */
+  review_attestations?: string | null;
+  /** Cells whose inventory could not be read, so the counts may be incomplete. */
+  unreachable_cells?: number | null;
+  /** Days without an invocation after which an agent counts as inactive. */
+  inactive_days?: number | null;
+  /** CloudWatch Omni domain to link out to, when the fleet has exactly one. */
+  omni_url?: string | null;
+  /** Every CloudWatch Omni domain of the configured cells. */
+  omni_domains?: OmniDomain[] | null;
+  /**
+   * The agents at high or critical risk, at most 20. The fleet page does not read it: it builds
+   * its own list from `GET /agents` so that flagged agents at a lower level are listed too.
+   */
+  needs_attention?: unknown[] | null;
+  warnings?: string[] | null;
+}
+
+/** A CloudWatch Omni domain of a configured cell. */
+export interface OmniDomain {
+  account_alias: string;
+  region?: string | null;
+  url?: string | null;
+}
+
 export const fleetApi = {
   health: async (): Promise<FleetHealth> => (await client.get<FleetHealth>('/fleet/health')).data,
+  summary: async (): Promise<FleetSummary> => (await client.get<FleetSummary>('/fleet/summary')).data,
+};
+
+// --- CloudWatch Omni hand-off ----------------------------------------------------------
+
+/** An agent the CloudWatch Omni Context Graph observes in telemetry. Only agents are listed. */
+export interface ObservedService {
+  name: string;
+  /** `SERVICE` or `RESOURCE`. Not displayed. */
+  node_type?: string | null;
+  /** Always `GEN_AI_AGENT`. Not displayed. */
+  category?: string | null;
+  /** The runtime ARN and the endpoint it was called through. Used only as a row key. */
+  resource_id?: string | null;
+  runtime_arn?: string | null;
+  region?: string | null;
+  last_observed_at?: string | null;
+  /** For example `LOGS`, `METRICS`, `TRACES`. */
+  signals?: string[] | null;
+  /** True when the node is a registered agent's runtime. */
+  registered?: boolean;
+  /** True when the node is a runtime the inventory knows, registered or not. */
+  detected?: boolean;
+  /** `Agent.id` to link to, or null when it matches no agent in the inventory. */
+  matched_agent_id?: string | null;
+  /** The matched agent's inventory state, or `observed_only`: seen in telemetry and nowhere else. */
+  inventory_state?: string | null;
+  /** The Region of the CloudWatch Omni domain that observed it, and the account it belongs to. */
+  omni_region?: string | null;
+  account_alias?: string | null;
+}
+
+/** `GET /omni/observed-services`. */
+export interface ObservedServices {
+  checked_at?: string | null;
+  /** How many hours of telemetry were looked at. */
+  window_hours?: number | null;
+  services: ObservedService[];
+  /** The CloudWatch Omni domain these were read from, to link out to. */
+  omni_url?: string | null;
+  /** The CloudWatch Omni domains that were read. */
+  domains?: OmniDomain[] | null;
+  warnings?: string[] | null;
+}
+
+export const omniApi = {
+  /** `hours` is the telemetry window, 1 to 168. Without it the API uses 24. */
+  observedServices: async (hours?: number): Promise<ObservedServices> =>
+    (await client.get<ObservedServices>('/omni/observed-services', { params: hours ? { hours } : undefined })).data,
 };
 
 // --- Governance catalog (new in the portal) ----------------------------------------

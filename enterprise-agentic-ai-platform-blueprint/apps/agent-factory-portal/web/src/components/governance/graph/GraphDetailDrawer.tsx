@@ -2,10 +2,12 @@
 // Derived from Agentic Governance Platform (Apache-2.0); modified for the Agent Factory Portal.
 import { useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
+import { nodeContext } from './enrich';
 import type { FlowNode, FlowEdge } from './layout';
 import { governanceGraphApi, mcpServersApi } from '../../../api/client';
 import type { PrincipalDetail, CedarPolicySet, McpServerKind } from '../../../api/client';
 import { enforcementLabel } from '../cedarPosture';
+import { NOT_READABLE, gatewayNotRead, policyCell } from '../gatewayView';
 import { identityStatusLabel, platformLabel } from '../platformLabels';
 import { useAsync } from '../../shared/useAsync';
 import { AgentAvatar, kindBadge, lifecycleBadge } from '../agentUi';
@@ -189,6 +191,13 @@ function AgentNodeBody({ node }: { node: FlowNode }) {
     <section>
       <h2 className={SECTION_TITLE}>Agent</h2>
       <div className="space-y-1.5">
+        {node.data.metadata.contained === true && (
+          <div className={ROW}>
+            <span className={ROW_KEY}>Containment</span>
+            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-red-700 text-white">Contained</span>
+          </div>
+        )}
+        <Row label="Tenant and account" value={nodeContext(node.data.metadata)} />
         <Row label="Origin" value={meta(node, 'origin')} />
         {badge && (
           <div className={ROW}>
@@ -208,16 +217,24 @@ function AgentNodeBody({ node }: { node: FlowNode }) {
 }
 
 function McpNodeBody({ node }: { node: FlowNode }) {
-  const enforcementRaw = meta(node, 'cedar_enforcement_mode');
+  // The graph API calls the field `enforcement_mode`; the older name is still read.
+  const enforcementRaw = meta(node, 'enforcement_mode') || meta(node, 'cedar_enforcement_mode');
+  const gateway = { reader_status: meta(node, 'reader_status'), cedar_enforcement_mode: enforcementRaw, detail: null };
+  // A gateway that only the organization registry detected: nothing of it was read.
+  const notRead = gatewayNotRead(gateway);
+  const tools = meta(node, 'tool_count');
 
   return (
     <section>
       <h2 className={SECTION_TITLE}>Tool gateway</h2>
       <div className="space-y-1.5">
         <Row label="Kind" value={meta(node, 'kind')} />
-        <Row label="Cedar enforcement" value={enforcementRaw ? enforcementLabel(enforcementRaw) : ''} />
+        <Row label="Reader" value={notRead ? notRead.title : ''} />
+        <Row label="Cedar enforcement" value={notRead || enforcementRaw ? policyCell(gateway) : ''} />
+        <Row label="Tools" value={notRead ? NOT_READABLE : tools} />
         <Row label="Workload identity" value={meta(node, 'identity_status') ? identityStatusLabel(meta(node, 'identity_status')) : ''} />
       </div>
+      {notRead && <p className="text-xs text-slate-600 mt-2">{notRead.sentence} No connection to it is drawn, because who can call it is not known.</p>}
     </section>
   );
 }

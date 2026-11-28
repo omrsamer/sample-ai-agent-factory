@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import { agentOpsApi, isNotFound } from '../../../api/client';
 import type { EvalRun } from '../../../api/client';
 import { useAsync } from '../../shared/useAsync';
+import { maskAccountIds } from '../../shared/arnDisplay';
 import { formatDate } from '../../shared/ui';
 import { currentBuild, gateCard, judgeLabel, runLabels, type GateCardState } from './evaluationsLogic';
 import { DataNotes, ObsEmptyCard } from './ObsEmptyCard';
@@ -61,6 +62,20 @@ export default function EvaluationsTab({ agentId }: { agentId: string }) {
     return <ObsEmptyCard title="Couldn't load release evidence" body={error ?? 'No data was returned.'} tone="amber" />;
   }
 
+  // An agent that belongs to no configured cell has no pipeline. The API says so in a sentence,
+  // which is shown as the plain fact it is rather than as a warning above an empty gate.
+  const explanations = runs.warnings ?? [];
+  if ((runs.runs ?? []).length === 0 && !runs.current_run && explanations.length > 0) {
+    return (
+      <div className={`${CARD} p-5`}>
+        <h2 className="text-sm font-semibold text-slate-900">No release evidence</h2>
+        {explanations.map((sentence) => (
+          <p key={sentence} className="text-sm text-slate-700 mt-1 max-w-2xl">{sentence}</p>
+        ))}
+      </div>
+    );
+  }
+
   const card = gateCard({ currentBuild: currentBuild(runs), currentRun: runs.current_run, now });
   const recent = (runs.runs ?? []).slice(0, RECENT);
   const overrides = (runs.overrides ?? []).slice(0, RECENT);
@@ -109,20 +124,20 @@ export default function EvaluationsTab({ agentId }: { agentId: string }) {
                   return (
                     <tr key={run.run_id} className="border-b border-slate-50 hover:bg-slate-50/40 align-top">
                       <td className="py-2.5 text-slate-700 whitespace-nowrap tabular-nums" title={`${run.run_id} · ${formatDate(run.started_at)}`}>
-                        <time dateTime={run.started_at}>{labels.get(run.run_id) ?? '—'}</time>
+                        <time dateTime={run.started_at}>{labels.get(run.run_id) ?? 'Not set'}</time>
                       </td>
-                      <td className="py-2.5 pl-4 text-slate-600">{run.stage || '—'}</td>
+                      <td className="py-2.5 pl-4 text-slate-600">{run.stage || 'Not set'}</td>
                       <td className="py-2.5 pl-4">
                         <span className={`inline-flex px-2 py-0.5 rounded-full border text-[11px] font-semibold capitalize ${STATUS_CLS[run.status] ?? STATUS_CLS.running}`}>
                           {run.status}
                         </span>
                       </td>
                       <td className="py-2.5 pl-4 text-slate-600 tabular-nums whitespace-nowrap">
-                        {run.summary ? `${run.summary.checks_passed} passed · ${run.summary.checks_failed} failed` : '—'}
+                        {run.summary ? `${run.summary.checks_passed} passed · ${run.summary.checks_failed} failed` : 'None'}
                       </td>
                       <td className="py-2.5 pl-4 text-slate-600 tabular-nums">
                         {judges.length === 0
-                          ? '—'
+                          ? 'None'
                           : judges.map(([id, m]) => (
                               <div key={id} className="whitespace-nowrap">
                                 {judgeLabel(id)} <span className="text-slate-900 font-medium">{m === null ? 'not scored' : m.toFixed(2)}</span>
@@ -147,7 +162,7 @@ export default function EvaluationsTab({ agentId }: { agentId: string }) {
             {overrides.map((o) => (
               <li key={`${o.at}-${o.by}`} className="py-2 text-sm">
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
-                  <span className="font-medium text-slate-800" title={o.by}>{o.by_name || o.by}</span>
+                  <span className="font-medium text-slate-800" >{o.by_name || maskAccountIds(o.by)}</span>
                   <span className="text-xs text-slate-600 tabular-nums">{formatDate(o.at)}</span>
                 </div>
                 <p className="text-slate-600 mt-0.5 break-words">{o.reason}</p>

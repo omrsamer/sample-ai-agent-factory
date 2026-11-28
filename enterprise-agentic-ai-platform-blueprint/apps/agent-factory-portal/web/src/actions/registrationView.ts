@@ -35,7 +35,8 @@ const STATUS_VIEW: Record<RegistrationStatus, { label: string; cls: string }> = 
   PENDING_APPROVAL: { label: 'Pending approval', cls: 'bg-amber-50 text-amber-800' },
   APPROVED: { label: 'Approved', cls: 'bg-emerald-50 text-emerald-800' },
   REJECTED: { label: 'Rejected', cls: 'bg-red-50 text-red-800' },
-  DEPRECATED: { label: 'Deprecated', cls: 'bg-slate-100 text-slate-700' },
+  // The registry calls it DEPRECATED; the portal calls such a registration retired.
+  DEPRECATED: { label: 'Retired', cls: 'bg-slate-200 text-slate-800' },
   CREATING: { label: 'Creating', cls: 'bg-slate-100 text-slate-700' },
   UPDATING: { label: 'Updating', cls: 'bg-slate-100 text-slate-700' },
   CREATE_FAILED: { label: 'Create failed', cls: 'bg-red-50 text-red-800' },
@@ -76,6 +77,8 @@ export const RETURNS_TO_DRAFT_NOTE =
   'Saving a change returns this record to Draft. It must then be submitted and approved again.';
 
 const EDITABLE = new Set(['DRAFT', 'PENDING_APPROVAL', 'REJECTED', 'APPROVED']);
+// A retired record is final: it can only be deleted, like any record that is not approved.
+const RETIRED = 'DEPRECATED';
 
 /**
  * Which controls to offer. This only decides what is shown: the server enforces every rule
@@ -107,7 +110,7 @@ export function offeredActions(
     ...none,
     edit: who.registrar && EDITABLE.has(status),
     submit: who.registrar && status === 'DRAFT',
-    remove: who.registrar && EDITABLE.has(status) && status !== 'APPROVED',
+    remove: who.registrar && ((EDITABLE.has(status) && status !== 'APPROVED') || status === RETIRED),
     decide: who.approver && pending && !ownSubmission,
     note,
   };
@@ -129,6 +132,8 @@ const ACTION_LABEL: Record<string, string> = {
   approve: 'Approve',
   reject: 'Reject',
   delete: 'Delete',
+  retire: 'Retire',
+  review: 'Confirm review',
 };
 
 export function historyActionLabel(action: string): string {
@@ -139,9 +144,15 @@ export function outcomeView(outcome: string): { label: string; cls: string } {
   if (outcome === 'allowed') return { label: 'Allowed', cls: 'bg-emerald-50 text-emerald-800' };
   if (outcome === 'denied') return { label: 'Denied', cls: 'bg-red-50 text-red-800' };
   if (outcome === 'failed') return { label: 'Failed', cls: 'bg-red-50 text-red-800' };
+  if (outcome === 'unchanged') return { label: 'No change', cls: 'bg-slate-100 text-slate-700' };
+  // A background sweep that found its agent released, and so stopped nothing.
+  if (outcome === 'skipped') return { label: 'Skipped', cls: 'bg-slate-100 text-slate-700' };
   if (outcome === 'incomplete') return { label: 'No result recorded', cls: 'bg-amber-50 text-amber-800' };
   return { label: outcome || 'Unknown', cls: 'bg-slate-100 text-slate-700' };
 }
+
+/** Shown under a history whose older entries the API did not list. */
+export const HISTORY_TRUNCATED_NOTE = 'Only the newest entries are listed. Older entries exist and are not shown here.';
 
 export interface HistoryRow {
   key: string;
@@ -153,18 +164,25 @@ export interface HistoryRow {
   outcome: string;
   reason: string;
   statusChange: string;
+  /** The date a review, or an approval that recorded one, set for the next review. */
+  nextReviewBy: string;
 }
 
 /**
  * One row per action. An allowed action is written as an intent and a result that share a
  * request id: the result is the row. An intent whose result never arrived is kept and marked,
  * because an action that may have happened without a recorded result is worth seeing.
+ *
+ * A result answers the intent of the same request and the same action. A background sweep
+ * carries the request id of the contain that scheduled it, and is a row of its own: it never
+ * stands in for that contain's result.
  */
 export function historyRows(events: readonly AuditEvent[] | null | undefined): HistoryRow[] {
   const list = events ?? [];
-  const withResult = new Set(list.filter((e) => e.phase === 'result').map((e) => e.request_id));
+  const answered = (e: AuditEvent) => `${e.request_id}\u0000${e.action}`;
+  const withResult = new Set(list.filter((e) => e.phase === 'result').map(answered));
   return list
-    .filter((e) => e.phase === 'result' || !withResult.has(e.request_id))
+    .filter((e) => e.phase === 'result' || !withResult.has(answered(e)))
     .map((e) => ({
       key: e.event_id,
       at: e.at,
@@ -177,5 +195,6 @@ export function historyRows(events: readonly AuditEvent[] | null | undefined): H
         e.status_before && e.status_after && e.status_before !== e.status_after
           ? `${statusView(e.status_before).label} → ${statusView(e.status_after).label}`
           : '',
+      nextReviewBy: e.next_review_by ?? '',
     }));
 }

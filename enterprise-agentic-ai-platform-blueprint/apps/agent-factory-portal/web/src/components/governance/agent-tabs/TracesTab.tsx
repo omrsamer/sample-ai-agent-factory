@@ -3,7 +3,7 @@
 import { useMemo, useState } from 'react';
 import { observabilityApi } from '../../../api/client';
 import type { Agent } from '../../../api/client';
-import { mapTraceRows, totalPages } from './agentObservability';
+import { emptyState, mapTraceRows, totalPages } from './agentObservability';
 import { useAsync } from '../../shared/useAsync';
 import { DataNotes, ObsEmptyCard } from './ObsEmptyCard';
 
@@ -30,11 +30,17 @@ export default function TracesTab({ agent }: { agent: Agent }) {
   }
 
   if (!loading && rows.length === 0 && page === 1) {
+    // An empty answer with a note from the API is not "no traces": they may not be readable.
+    const warnings = data?.warnings ?? [];
+    const empty = emptyState(warnings, 'traces', {
+      title: 'No traces recorded yet',
+      body: 'Once this agent is invoked, each run appears here with its latency, cost and caller, newest first.',
+    });
     return (
-      <ObsEmptyCard
-        title="No traces recorded yet"
-        body="Once this agent is invoked, each run appears here with its latency, cost and caller, newest first."
-      />
+      <div className="space-y-3">
+        <DataNotes notes={warnings} />
+        <ObsEmptyCard title={empty.title} body={empty.body} />
+      </div>
     );
   }
 

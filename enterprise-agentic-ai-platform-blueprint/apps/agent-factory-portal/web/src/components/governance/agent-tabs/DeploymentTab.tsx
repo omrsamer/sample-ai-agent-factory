@@ -65,10 +65,10 @@ export default function DeploymentTab({ agent }: { agent: Agent }) {
           )}
           <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">
             <Field label="Status"><Badge cls={status.cls} label={status.label} title={runtime.data?.detail ?? undefined} /></Field>
-            <Field label="Environment">{runtime.data?.stage || '—'}</Field>
-            <Field label="Image tag"><span className="font-mono text-xs break-all">{runtime.data?.image_tag || '—'}</span></Field>
+            <Field label="Environment">{runtime.data?.stage || 'Not set'}</Field>
+            <Field label="Image tag"><span className="font-mono text-xs break-all">{runtime.data?.image_tag || 'Not set'}</span></Field>
             <Field label="Platform">{platformLabel(agent.platform)}</Field>
-            <Field label="Region">{agent.region ?? '—'}</Field>
+            <Field label="Region">{agent.region ?? 'Not set'}</Field>
             <Field label="Checked">{formatDate(runtime.data?.checked_at)}</Field>
             <Field className="sm:col-span-2 lg:col-span-3" label="Runtime ARN"><CodeValue value={runtime.data?.runtime_arn} copyLabel="runtime ARN" /></Field>
             {runtime.data?.detail && (

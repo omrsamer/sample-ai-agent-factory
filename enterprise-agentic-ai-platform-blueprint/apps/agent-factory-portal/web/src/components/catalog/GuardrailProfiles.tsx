@@ -23,10 +23,10 @@ function ProfileDetail({ templateId }: { templateId: string }) {
       </div>
     <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4">
       <Field className="sm:col-span-2" label="Guardrail ARN"><CodeValue value={data.guardrail_arn} copyLabel="guardrail ARN" /></Field>
-      <Field label="Guardrail version">{data.guardrail_version ?? '—'}</Field>
+      <Field label="Guardrail version">{data.guardrail_version ?? 'Not set'}</Field>
       <Field label="Updated">{formatDate(data.updated_at)}</Field>
       <Field label="Content filters">
-        {(data.content_filters ?? []).length === 0 ? '—' : (
+        {(data.content_filters ?? []).length === 0 ? 'None' : (
           <ul className="space-y-0.5">
             {data.content_filters.map((f) => (
               <li key={f.type}>{f.type}: input {f.input_strength}, output {f.output_strength}</li>
@@ -35,18 +35,18 @@ function ProfileDetail({ templateId }: { templateId: string }) {
         )}
       </Field>
       <Field label="Denied topics">
-        {(data.denied_topics ?? []).length === 0 ? '—' : data.denied_topics.map((t) => t.name).join(', ')}
+        {(data.denied_topics ?? []).length === 0 ? 'None' : data.denied_topics.map((t) => t.name).join(', ')}
       </Field>
       <Field label="Sensitive information types">
-        {(data.pii_entities ?? []).length === 0 ? '—' : data.pii_entities.map((p) => `${p.type} (${p.action.toLowerCase()})`).join(', ')}
+        {(data.pii_entities ?? []).length === 0 ? 'None' : data.pii_entities.map((p) => `${p.type} (${p.action.toLowerCase()})`).join(', ')}
       </Field>
       <Field label="Custom patterns">
-        {(data.sensitive_regexes ?? []).length === 0 ? '—' : data.sensitive_regexes.map((r) => r.name).join(', ')}
+        {(data.sensitive_regexes ?? []).length === 0 ? 'None' : data.sensitive_regexes.map((r) => r.name).join(', ')}
       </Field>
       <Field label="Word filters">
         {data.word_filter
           ? `${data.word_filter.enable_profanity ? 'Profanity filter on' : 'Profanity filter off'}, ${data.word_filter.blocked_words?.length ?? 0} blocked words`
-          : '—'}
+          : 'None'}
       </Field>
       <Field label="Contextual grounding">
         {data.contextual_grounding?.enabled

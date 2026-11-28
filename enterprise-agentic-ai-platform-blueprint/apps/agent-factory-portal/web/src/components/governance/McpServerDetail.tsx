@@ -4,15 +4,27 @@ import { useParams, Link, useSearchParams } from 'react-router-dom';
 import { isNotFound, mcpServersApi } from '../../api/client';
 import type { McpServer } from '../../api/client';
 import { useUser } from '../../contexts/UserContext';
-import { AgentAvatar, lifecycleBadge, emailAlias, kindBadge, tenantBadge } from './agentUi';
-import { enforcementLabel } from './cedarPosture';
+import { NoReaderCard } from './agent-tabs/ObsEmptyCard';
+import { AgentAvatar, BreakableName, kindBadge, tenantBadge } from './agentUi';
+import {
+  CONNECTED_NOT_KNOWN,
+  gatewayAccount,
+  gatewayChip,
+  gatewayDetectedBy,
+  gatewayLifecycle,
+  gatewayNotRead,
+  knownTime,
+  policyCell,
+} from './gatewayView';
 import { mcpEndpoint, visibleMcpTabs } from './mcpServerDetailTabs';
-import { identityStatusLabel } from './platformLabels';
+import { identityStatusLabel, inboundAuthorizerLabel } from './platformLabels';
 import { resolveTenantName } from './tenantUi';
 import CedarPoliciesTab from './CedarPoliciesTab';
 import McpConnectedAgentsTab from './McpConnectedAgentsTab';
-import { Badge, CARD, CodeValue, ErrorCard, Field, Loading, Page, TabBar, formatDate } from '../shared/ui';
+import { Badge, CARD, CodeValue, ErrorCard, Field, formatDate, Loading, MaskedText, NOT_SET, Page, TabBar } from '../shared/ui';
 import { useAsync } from '../shared/useAsync';
+
+const NOT_RECORDED = 'Not recorded';
 
 const BACK_LINK = 'text-xs text-slate-600 hover:text-slate-700';
 
@@ -53,8 +65,14 @@ export default function McpServerDetail() {
 
   const tabs = visibleMcpTabs(mcp.kind);
   const active = tabs.find((t) => t.id === searchParams.get('tab')) ?? tabs[0];
-  const lifecycle = lifecycleBadge(mcp.lifecycle_state);
+  const state = gatewayLifecycle(mcp);
   const kind = kindBadge(mcp.kind);
+  // A gateway that only the organization registry detected: nothing of its tools, its tenant,
+  // its policy engine or its policies is known, so each panel says so and asks the API nothing.
+  const notRead = gatewayNotRead(mcp);
+  const chip = gatewayChip(mcp);
+  // Two gateways can carry one name: the account and the Region tell them apart.
+  const where = [gatewayAccount(mcp), mcp.region ?? ''].filter(Boolean).join(' · ');
 
   return (
     <Page>
@@ -62,12 +80,14 @@ export default function McpServerDetail() {
       <div className="mt-2 mb-5 flex items-center gap-3 min-w-0">
         <AgentAvatar name={mcp.name} size="lg" />
         <div className="min-w-0">
-          <h1 className="text-xl font-semibold text-slate-900 truncate">{mcp.name}</h1>
+          <h1 className="text-xl font-semibold text-slate-900"><BreakableName name={mcp.name} /></h1>
+          {where && <p className="text-sm text-slate-600">{where}</p>}
           <div className="flex flex-wrap items-center gap-1.5 mt-1">
-            <Badge cls={lifecycle.cls} label={lifecycle.label} />
-            <Badge cls={kind.cls} label={kind.label} />
+            <Badge cls={state.cls} label={state.label} />
+            {chip ? <Badge cls={chip.cls} label={chip.label} title={chip.hint} /> : <Badge cls={kind.cls} label={kind.label} />}
             {mcp.shared && <Badge cls="bg-violet-50 text-violet-700" label="Shared with all tenants" />}
-            <span className="text-xs text-slate-600">v{mcp.version}</span>
+            {/* The version of a gateway no reader read is not known. */}
+            {!notRead && <span className="text-xs text-slate-600">v{mcp.version}</span>}
           </div>
         </div>
       </div>
@@ -79,7 +99,14 @@ export default function McpServerDetail() {
         onSelect={(tab) => setSearchParams(tab === tabs[0].id ? {} : { tab }, { replace: true })}
       />
 
-      {active.id === 'overview' ? (
+      {notRead ? (
+        active.id === 'overview' ? (
+          <DetectedOverview mcp={mcp} title={notRead.title} sentence={notRead.sentence} />
+        ) : (
+          // Tools, Policies and Connected agents: not empty, not readable. Nothing is asked of the API.
+          <NoReaderCard title={notRead.title} body={notRead.sentence} more={active.id === 'connected-agents' ? CONNECTED_NOT_KNOWN : undefined} />
+        )
+      ) : active.id === 'overview' ? (
         <OverviewTab mcp={mcp} tenantName={resolveTenantName(mcp.tenant_id, user?.tenants)} />
       ) : active.id === 'tools' ? (
         <ToolsTab mcp={mcp} />
@@ -92,10 +119,42 @@ export default function McpServerDetail() {
   );
 }
 
+/** A value the detection may not carry, in words when it does not. */
+function Recorded({ value }: { value: string | null | undefined }) {
+  return value ? <>{value}</> : <span className="text-slate-600">{NOT_RECORDED}</span>;
+}
+
+/**
+ * The Overview of a gateway no reader read: why, and what the organization registry's detection
+ * says. No description, endpoint, tenant, policy engine or version is shown, because none is known.
+ */
+function DetectedOverview({ mcp, title, sentence }: { mcp: McpServer; title: string; sentence: string }) {
+  return (
+    <div className="space-y-5">
+      <NoReaderCard title={title} body={sentence} />
+      <div className={`${CARD} p-5`}>
+        <h2 className="text-sm font-semibold text-slate-800 mb-3">What was detected</h2>
+        <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">
+          <Field className="sm:col-span-2 lg:col-span-3" label="Gateway ARN"><CodeValue value={mcp.gateway_arn} copyLabel="gateway ARN" /></Field>
+          <Field label="Account"><Recorded value={gatewayAccount(mcp)} /></Field>
+          <Field label="Region"><Recorded value={mcp.region} /></Field>
+          <Field label="Detected by"><Recorded value={gatewayDetectedBy(mcp)} /></Field>
+          <Field label="Inbound authorizer"><Recorded value={mcp.authorizer_type ? inboundAuthorizerLabel(mcp.authorizer_type) : ''} /></Field>
+          <Field label="Protocol"><Recorded value={mcp.protocol} /></Field>
+          <Field label="Detected">{formatDate(knownTime(mcp.created_at), NOT_RECORDED)}</Field>
+          <Field label="Gateway id"><span className="font-mono text-xs break-all">{mcp.id}</span></Field>
+        </dl>
+      </div>
+    </div>
+  );
+}
+
 function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string | null }) {
   const endpoint = mcpEndpoint(mcp);
   const tenant = tenantBadge(tenantName ?? mcp.tenant_id);
   const isGateway = mcp.kind === 'gateway' || !!mcp.gateway_arn || !!mcp.gateway_url;
+  const account = gatewayAccount(mcp);
+  const detectedBy = gatewayDetectedBy(mcp);
 
   return (
     <div className="space-y-5">
@@ -118,7 +177,7 @@ function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string |
           {mcp.runtime_arn && (
             <Field className="lg:col-span-2" label="Runtime ARN"><CodeValue value={mcp.runtime_arn} copyLabel="runtime ARN" /></Field>
           )}
-          {isGateway && <Field label="Cedar enforcement">{enforcementLabel(mcp.cedar_enforcement_mode)}</Field>}
+          {isGateway && <Field label="Cedar enforcement">{policyCell(mcp)}</Field>}
           {isGateway && (
             <Field label="Policy engine">
               {mcp.cedar_policy_engine_id ? (
@@ -128,6 +187,8 @@ function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string |
               )}
             </Field>
           )}
+          {mcp.authorizer_type && <Field label="Inbound authorizer">{inboundAuthorizerLabel(mcp.authorizer_type)}</Field>}
+          {mcp.protocol && <Field label="Protocol">{mcp.protocol}</Field>}
         </dl>
       </div>
 
@@ -141,12 +202,10 @@ function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string |
               <Badge cls={tenant.cls} label={tenant.label} title={mcp.tenant_id ?? undefined} />
             )}
           </Field>
-          <Field label="Business unit">{mcp.business_unit ?? '—'}</Field>
-          <Field label="Owner">
-            {mcp.owner_email ? <span title={mcp.owner_email}>{emailAlias(mcp.owner_email)}</span> : <span className="text-slate-600">Unassigned</span>}
-          </Field>
-          <Field label="Region">{mcp.region ?? '—'}</Field>
-          <Field label="Data classification">{mcp.data_classification ?? '—'}</Field>
+          <Field label="Account">{account || <span className="text-slate-600">{NOT_SET}</span>}</Field>
+          <Field label="Region">{mcp.region ?? <span className="text-slate-600">{NOT_SET}</span>}</Field>
+          {detectedBy && <Field label="Detected by">{detectedBy}</Field>}
+          <Field label="Data classification">{mcp.data_classification ?? <span className="text-slate-600">{NOT_SET}</span>}</Field>
           <Field label="Workload identity">{identityStatusLabel(mcp.identity_status)}</Field>
         </dl>
       </div>
@@ -154,10 +213,11 @@ function OverviewTab({ mcp, tenantName }: { mcp: McpServer; tenantName: string |
       <div className={`${CARD} p-5`}>
         <h2 className="text-sm font-semibold text-slate-800 mb-3">Record</h2>
         <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">
-          <Field label="Registry id"><span className="font-mono text-xs break-all">{mcp.id}</span></Field>
-          <Field label="Created by">{mcp.created_by ?? '—'}</Field>
-          <Field label="Created">{formatDate(mcp.created_at)}</Field>
-          <Field label="Updated">{formatDate(mcp.updated_at)}</Field>
+          <Field label="Gateway id"><span className="font-mono text-xs break-all">{mcp.id}</span></Field>
+          <Field label="Created by"><MaskedText value={mcp.created_by} /></Field>
+          {/* The API sends the epoch for a time it cannot know: that is not a date to show. */}
+          <Field label="Created">{formatDate(knownTime(mcp.created_at), NOT_RECORDED)}</Field>
+          <Field label="Updated">{formatDate(knownTime(mcp.updated_at), NOT_RECORDED)}</Field>
         </dl>
       </div>
     </div>

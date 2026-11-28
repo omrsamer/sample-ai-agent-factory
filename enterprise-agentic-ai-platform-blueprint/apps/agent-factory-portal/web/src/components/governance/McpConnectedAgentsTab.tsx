@@ -3,23 +3,25 @@
 import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { agentsApi, mcpServersApi } from '../../api/client';
-import type { McpServer } from '../../api/client';
+import type { Agent, McpServer } from '../../api/client';
+import { ContainedBadge } from './InventoryBadges';
+import { agentContext } from './inventory';
+import { resolveTenantName } from './tenantUi';
+import { useUser } from '../../contexts/UserContext';
 import { Badge, CARD, ErrorCard, Loading, TABLE_HEAD, TD, TH } from '../shared/ui';
 import { useAsync } from '../shared/useAsync';
 
 /** The agents subscribed to a tool gateway. Read-only. */
 export default function McpConnectedAgentsTab({ mcp }: { mcp: McpServer }) {
+  const { user } = useUser();
   const grants = useAsync(() => mcpServersApi.connectedAgents(mcp.id), [mcp.id], 'Failed to load connected agents.');
   // Used only to turn a connection into a link; the table still renders if this read fails.
   const agents = useAsync(() => agentsApi.list(), [], 'Failed to load agents.');
 
   const linkFor = useMemo(() => {
-    const byWorkloadId = new Map<string, string>();
-    for (const a of agents.data ?? []) {
-      byWorkloadId.set(a.id, a.id);
-      if (a.entra_sp_id) byWorkloadId.set(a.entra_sp_id, a.id);
-    }
-    return (principalId: string) => byWorkloadId.get(principalId) ?? null;
+    const byId = new Map<string, Agent>();
+    for (const a of agents.data ?? []) byId.set(a.id, a);
+    return (principalId: string) => byId.get(principalId) ?? null;
   }, [agents.data]);
 
   if (grants.loading) return <Loading label="Loading connected agents…" />;
@@ -41,17 +43,22 @@ export default function McpConnectedAgentsTab({ mcp }: { mcp: McpServer }) {
         </thead>
         <tbody className="divide-y divide-slate-100">
           {rows.map((g) => {
-            const agentId = linkFor(g.principal_id);
+            const agent = linkFor(g.principal_id);
+            const context = agent ? agentContext(agent, resolveTenantName(agent.tenant_id, user?.tenants)) : '';
             return (
               <tr key={g.assignment_id}>
                 <td className={TD}>
-                  {agentId ? (
-                    <Link to={`/agents/${encodeURIComponent(agentId)}`} className="font-medium text-blue-700 hover:underline">
-                      {g.principal_display || g.principal_id}
-                    </Link>
-                  ) : (
-                    <span className="text-slate-700">{g.principal_display || g.principal_id}</span>
-                  )}
+                  <span className="inline-flex flex-wrap items-center gap-1.5">
+                    {agent ? (
+                      <Link to={`/agents/${encodeURIComponent(agent.id)}`} className="font-medium text-blue-700 hover:underline">
+                        {g.principal_display || g.principal_id}
+                      </Link>
+                    ) : (
+                      <span className="text-slate-700">{g.principal_display || g.principal_id}</span>
+                    )}
+                    {context && <span className="text-slate-600">· {context}</span>}
+                    <ContainedBadge agent={agent} />
+                  </span>
                 </td>
                 <td className={TD}><Badge cls="bg-slate-100 text-slate-600" label={g.role} /></td>
                 <td className={`${TD} font-mono text-xs text-slate-600 break-all`}>{g.assignment_id}</td>

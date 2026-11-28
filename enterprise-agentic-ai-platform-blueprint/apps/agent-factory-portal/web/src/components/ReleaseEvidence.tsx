@@ -4,6 +4,9 @@ import { useMemo } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { agentsApi } from '../api/client';
 import EvaluationsTab from './governance/agent-tabs/EvaluationsTab';
+import { agentContext, isContained } from './governance/inventory';
+import { resolveTenantName } from './governance/tenantUi';
+import { useUser } from '../contexts/UserContext';
 import { CARD, EmptyCard, ErrorCard, Loading, Page, PageHeader } from './shared/ui';
 import { useAsync } from './shared/useAsync';
 
@@ -14,8 +17,9 @@ import { useAsync } from './shared/useAsync';
 export default function ReleaseEvidence() {
   const { agentId } = useParams();
   const navigate = useNavigate();
+  const { user } = useUser();
   const agents = useAsync(() => agentsApi.list(), [], 'Failed to load agents.');
-  const sorted = useMemo(() => [...(agents.data ?? [])].sort((a, b) => a.name.localeCompare(b.name)), [agents.data]);
+  const sorted = useMemo(() => [...(agents.data ?? [])].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)), [agents.data]);
 
   return (
     <Page>
@@ -42,9 +46,12 @@ export default function ReleaseEvidence() {
               className="w-full max-w-md px-3 py-1.5 text-sm rounded-lg border border-slate-300 bg-white"
             >
               <option value="">Select an agent…</option>
-              {sorted.map((a) => (
-                <option key={a.id} value={a.id}>{a.name}</option>
-              ))}
+              {sorted.map((a) => {
+                // Two agents can carry one name: the tenant and the account tell them apart.
+                const context = agentContext(a, resolveTenantName(a.tenant_id, user?.tenants));
+                const label = context ? `${a.name} · ${context}` : a.name;
+                return <option key={a.id} value={a.id}>{isContained(a) ? `${label} (contained)` : label}</option>;
+              })}
             </select>
           </div>
           {agentId ? (

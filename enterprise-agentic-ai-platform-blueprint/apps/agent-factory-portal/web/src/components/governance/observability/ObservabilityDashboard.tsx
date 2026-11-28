@@ -6,15 +6,17 @@ import {
   ResponsiveContainer, ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   PieChart, Pie, Cell,
 } from 'recharts';
-import { observabilityApi } from '../../../api/client';
+import { agentsApi, observabilityApi } from '../../../api/client';
 import type { MetricsScope } from '../../../api/client';
 import type { ScopeMetrics } from '../../../types';
 import { useUser } from '../../../contexts/UserContext';
 import { tooltipStyle } from '../../shared/chartTheme';
 import { resolveTenantName } from '../tenantUi';
 import { useAsync } from '../../shared/useAsync';
+import { ContainedBadge } from '../InventoryBadges';
+import { accountLabel } from '../inventory';
 import { DataNotes, ObsEmptyCard } from '../agent-tabs/ObsEmptyCard';
-import { COST_UNAVAILABLE_NOTE, costText, fmtUsd } from '../agent-tabs/agentObservability';
+import { COST_UNAVAILABLE_NOTE, costText, emptyState, fmtUsd } from '../agent-tabs/agentObservability';
 import { buildDashboardSeries, defaultDateRange } from './observabilityMetrics';
 
 type Scope = MetricsScope;
@@ -22,6 +24,11 @@ type Scope = MetricsScope;
 const CARD = 'bg-white/80 backdrop-blur-sm rounded-xl border border-slate-200/60 p-5 shadow-sm';
 
 const fmtInt = (n: number) => n.toLocaleString();
+
+const NO_ACTIVITY = {
+  title: 'No traces in this window',
+  body: 'No agent activity was recorded for the selected scope and date range. Try widening the date range.',
+};
 
 /** Fleet metrics for a scope and date range. Platform scope is offered to administrators only. */
 export default function ObservabilityDashboard({ configured }: { configured: boolean }) {
@@ -43,6 +50,9 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
 
   const costAvailable = metrics?.cost_available !== false;
   const notes = [...(costAvailable ? [] : [COST_UNAVAILABLE_NOTE]), ...(metrics?.warnings ?? [])];
+  // Read only to mark contained agents in the table; the dashboard renders without it.
+  const agents = useAsync(() => agentsApi.list(), [], 'Failed to load agents.');
+  const agentById = useMemo(() => new Map((agents.data ?? []).map((a) => [a.id, a])), [agents.data]);
   const series = useMemo(() => buildDashboardSeries(metrics, range), [metrics, range]);
 
   if (!configured) {
@@ -112,10 +122,10 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
       {error ? (
         <ObsEmptyCard title="Couldn't load metrics" body={error} tone="amber" />
       ) : series.isEmpty && !loading ? (
-        <ObsEmptyCard
-          title="No traces in this window"
-          body="No agent activity was recorded for the selected scope and date range. Try widening the date range."
-        />
+        <>
+          <DataNotes notes={metrics?.warnings ?? []} />
+          <ObsEmptyCard {...emptyState(metrics?.warnings, 'activity', NO_ACTIVITY)} />
+        </>
       ) : (
         <>
           <DataNotes notes={notes} />
@@ -190,7 +200,7 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
                 <thead>
                   <tr className="text-[11px] text-slate-600 uppercase tracking-wide border-b border-slate-100">
                     <th scope="col" className="text-left py-2 font-medium">Agent</th>
-                    <th scope="col" className="text-left py-2 font-medium pl-4">Tenant</th>
+                    <th scope="col" className="text-left py-2 font-medium pl-4">Tenant · Account</th>
                     <th scope="col" className="text-right py-2 font-medium">Traces</th>
                     <th scope="col" className="text-right py-2 font-medium">Cost</th>
                     <th scope="col" className="text-right py-2 font-medium">Tokens</th>
@@ -199,14 +209,20 @@ export default function ObservabilityDashboard({ configured }: { configured: boo
                 <tbody>
                   {series.byAgent.map((a) => {
                     const tenantName = resolveTenantName(a.tenant_id, user?.tenants);
+                    const known = agentById.get(a.agent_id);
+                    // Two agents can carry one name: the tenant and the account tell them apart.
+                    const where = [tenantName ?? a.tenant_id ?? '', known ? accountLabel(known) : ''].filter(Boolean).join(' · ');
                     return (
                       <tr key={a.agent_id} className="border-b border-slate-50 hover:bg-slate-50/40">
                         <td className="py-2.5">
-                          <Link to={`/agents/${a.agent_id}`} className="text-slate-700 font-medium hover:text-blue-600 transition-colors">
-                            {a.agent_name}
-                          </Link>
+                          <span className="inline-flex flex-wrap items-center gap-1.5">
+                            <Link to={`/agents/${encodeURIComponent(a.agent_id)}`} className="text-blue-700 font-medium hover:underline">
+                              {a.agent_name}
+                            </Link>
+                            <ContainedBadge agent={agentById.get(a.agent_id)} />
+                          </span>
                         </td>
-                        <td className="py-2.5 pl-4 text-slate-600 text-[13px]">{tenantName ?? a.tenant_id ?? '—'}</td>
+                        <td className="py-2.5 pl-4 text-slate-600 text-[13px]">{where || 'None'}</td>
                         <td className="py-2.5 text-right text-slate-700 tabular-nums">{fmtInt(a.traces)}</td>
                         <td className="py-2.5 text-right font-semibold text-slate-900 tabular-nums">{costText(a.cost, costAvailable)}</td>
                         <td className="py-2.5 text-right text-slate-600 tabular-nums">{fmtInt(a.tokens)}</td>

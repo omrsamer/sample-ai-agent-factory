@@ -15,6 +15,8 @@ export interface AsyncState<T> {
 
 interface Settled<T> {
   request: object;
+  /** The inputs the result was read for, so a reload can keep showing it. */
+  inputs: string;
   data: T | null;
   error: string | null;
   cause: unknown;
@@ -27,12 +29,15 @@ interface Settled<T> {
  *
  * Each run is identified by a request token. A result is stored with the token of the run that
  * produced it, and only the result of the current run is exposed, so a response that arrives
- * after the inputs changed can never be shown against the new inputs.
+ * after the inputs changed can never be shown against the new inputs. With
+ * `keepPreviousOnReload`, a reload of the same inputs keeps showing the last result until the
+ * new one arrives, so the screen does not blank while it refreshes.
  */
 export function useAsync<T>(
   load: () => Promise<T>,
   deps: readonly (string | number | boolean | null | undefined)[],
   fallbackError: string,
+  opts: { keepPreviousOnReload?: boolean } = {},
 ): AsyncState<T> {
   const [nonce, setNonce] = useState(0);
   // A new token whenever an input or the reload counter changes.
@@ -45,10 +50,10 @@ export function useAsync<T>(
     let cancelled = false;
     load()
       .then((data) => {
-        if (!cancelled) setSettled({ request, data, error: null, cause: null });
+        if (!cancelled) setSettled({ request, inputs, data, error: null, cause: null });
       })
       .catch((err: unknown) => {
-        if (!cancelled) setSettled({ request, data: null, error: errorMessage(err, fallbackError), cause: err });
+        if (!cancelled) setSettled({ request, inputs, data: null, error: errorMessage(err, fallbackError), cause: err });
       });
     return () => {
       cancelled = true;
@@ -59,8 +64,11 @@ export function useAsync<T>(
 
   const reload = useCallback(() => setNonce((n) => n + 1), []);
   const current = settled && settled.request === request ? settled : null;
+  // While the same inputs are read again, the last result may stay on screen. It is never kept
+  // across a change of inputs, so one record is never shown under another's address.
+  const previous = opts.keepPreviousOnReload && settled && settled.inputs === inputs ? settled.data : null;
   return {
-    data: current?.data ?? null,
+    data: current ? current.data : previous,
     loading: current === null,
     error: current?.error ?? null,
     cause: current?.cause ?? null,

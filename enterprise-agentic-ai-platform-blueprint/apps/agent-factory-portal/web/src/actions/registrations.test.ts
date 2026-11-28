@@ -41,6 +41,8 @@ describe('registrationsApi', () => {
     await registrationsApi.submit('Rec0000000A1');
     await registrationsApi.approve('Rec0000000A1', 'Evidence reviewed.', SHA);
     await registrationsApi.reject('Rec0000000A1', 'Purpose is unclear.', SHA);
+    await registrationsApi.retire('Rec0000000A1', 'The product was withdrawn.');
+    await registrationsApi.review('Rec0000000A1', 'Reviewed with the owner.', '2027-05-27');
     await registrationsApi.remove('Rec/1');
 
     expect(get.mock.calls.map((c) => c[0])).toEqual(['/registrations', '/registrations/Rec0000000A1', '/registrations/Rec0000000A1/history']);
@@ -51,6 +53,8 @@ describe('registrationsApi', () => {
       ['/registrations/Rec0000000A1/submit'],
       ['/registrations/Rec0000000A1/approve', { reason: 'Evidence reviewed.', document_sha256: SHA }],
       ['/registrations/Rec0000000A1/reject', { reason: 'Purpose is unclear.', document_sha256: SHA }],
+      ['/registrations/Rec0000000A1/retire', { reason: 'The product was withdrawn.' }],
+      ['/registrations/Rec0000000A1/review', { reason: 'Reviewed with the owner.', next_review_by: '2027-05-27' }],
     ]);
     expect(put.mock.calls).toEqual([['/registrations/Rec0000000A1', INPUT]]);
     expect(del.mock.calls).toEqual([['/registrations/Rec%2F1']]);
@@ -95,6 +99,20 @@ describe('classifyFailure', () => {
     });
   });
 
+  it('shows a request that failed part-way with the server’s account of it', () => {
+    const body = { detail: 'The deny statement could not be written (AccessDeniedException). Nothing was changed.', request_id: 'req-9' };
+    expect(classifyFailure(new ApiRequestError(body.detail, 502, body.detail, body), 'fallback')).toMatchObject({
+      kind: 'other',
+      title: 'The action failed part-way',
+      message: body.detail,
+      requestId: 'req-9',
+    });
+  });
+
+  it('words a conflict without assuming it is about a record', () => {
+    expect(CONFLICT_TITLE).toBe('This cannot be done in the current state');
+  });
+
   it('says nothing was changed when the audit trail is unavailable', () => {
     expect(classifyFailure(new ApiRequestError('The audit trail could not be written, so nothing was done', 503), 'fallback')).toMatchObject({
       kind: 'unavailable',
@@ -104,7 +122,7 @@ describe('classifyFailure', () => {
 
   it('handles a missing record, other statuses and non-API errors without throwing', () => {
     expect(classifyFailure(new ApiRequestError('gone', 404), 'fallback').kind).toBe('not_found');
-    expect(classifyFailure(new ApiRequestError('boom', 502), 'Could not save')).toMatchObject({ kind: 'other', title: 'Could not save', message: 'boom' });
+    expect(classifyFailure(new ApiRequestError('boom', 500), 'Could not save')).toMatchObject({ kind: 'other', title: 'Could not save', message: 'boom' });
     expect(classifyFailure(new Error('network'), 'Could not save')).toMatchObject({ kind: 'other', message: 'network' });
     expect(classifyFailure(undefined, 'Could not save')).toMatchObject({ kind: 'other', message: '', hint: null, requestId: null });
   });
@@ -188,9 +206,15 @@ describe('offeredActions', () => {
   });
 
   it('offers nothing while the registry is still working on the record', () => {
-    for (const status of ['CREATING', 'UPDATING', 'DEPRECATED']) {
+    for (const status of ['CREATING', 'UPDATING']) {
       expect(offeredActions({ status }, both)).toMatchObject({ edit: false, submit: false, remove: false, decide: false });
     }
+  });
+
+  it('offers no edit, submit or decision on a retired record; a registrar can still delete it', () => {
+    expect(offeredActions({ status: 'DEPRECATED' }, both)).toMatchObject({ edit: false, submit: false, decide: false, remove: true });
+    expect(offeredActions({ status: 'DEPRECATED' }, approver)).toMatchObject({ edit: false, submit: false, decide: false, remove: false });
+    expect(offeredActions({ status: 'DEPRECATED', submitted_by_me: false }, approver).decide).toBe(false);
   });
 
   it('offers nothing on a record of a tenant the caller does not act for, and says why', () => {
@@ -252,10 +276,16 @@ describe('wording', () => {
     expect(statusView('WITHDRAWN').label).toBe('WITHDRAWN');
     expect(statusView(null).label).toBe('Unknown');
     expect(STATUS_OPTIONS.map((o) => o.value)).toEqual(['DRAFT', 'PENDING_APPROVAL', 'APPROVED', 'REJECTED', 'DEPRECATED']);
+    // The registry says DEPRECATED; the portal says retired.
+    expect(statusView('DEPRECATED').label).toBe('Retired');
+    expect(STATUS_OPTIONS.find((o) => o.value === 'DEPRECATED')?.label).toBe('Retired');
+    expect(historyActionLabel('retire')).toBe('Retire');
+    expect(historyActionLabel('review')).toBe('Confirm review');
     expect(historyActionLabel('submit')).toBe('Submit for approval');
     expect(historyActionLabel('escalate')).toBe('escalate');
     expect(outcomeView('denied').label).toBe('Denied');
     expect(outcomeView('failed').label).toBe('Failed');
+    expect(outcomeView('unchanged').label).toBe('No change');
     expect(outcomeView('').label).toBe('Unknown');
   });
 });

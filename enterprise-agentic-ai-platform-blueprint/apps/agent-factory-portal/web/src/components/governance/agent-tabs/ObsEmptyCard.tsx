@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Derived from Agentic Governance Platform (Apache-2.0); modified for the Agent Factory Portal.
+import { NO_READER_TITLE } from '../inventory';
+
 /** Notes from the API about gaps in the data, plus the cost notice when cost cannot be shown. */
 export function DataNotes({ notes }: { notes: string[] }) {
   if (notes.length === 0) return null;
@@ -10,6 +12,20 @@ export function DataNotes({ notes }: { notes: string[] }) {
           <li key={n}>{n}</li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+/**
+ * What a tab shows for an agent in an account where the portal has no reader role. It states the
+ * fact plainly: nothing failed and nothing is loading.
+ */
+export function NoReaderCard({ body, title = NO_READER_TITLE, more }: { body: string; title?: string; more?: string }) {
+  return (
+    <div className="bg-white/70 backdrop-blur rounded-xl border border-slate-200/60 shadow-sm p-5">
+      <h2 className="text-sm font-semibold text-slate-900">{title}</h2>
+      <p className="text-sm text-slate-700 mt-1 max-w-2xl">{body}</p>
+      {more && <p className="text-sm text-slate-700 mt-1 max-w-2xl">{more}</p>}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Derived from Agentic Governance Platform (Apache-2.0); modified for the Agent Factory Portal.
 import { useState, type ReactNode } from 'react';
-import { maskArn } from './arnDisplay';
+import { maskAccountIds, maskArn } from './arnDisplay';
 
 /** Shared presentational pieces used by every screen. */
 
@@ -13,8 +13,13 @@ export const TD = 'px-4 py-2';
 const RETRY_BTN =
   'mt-3 px-3 py-1.5 rounded-lg bg-white border border-slate-300 text-slate-700 text-xs font-medium hover:bg-slate-50 transition-colors';
 
-export function formatDate(iso?: string | null): string {
-  if (!iso) return '—';
+/** What an empty cell says. Words, never a dash. */
+export const NOT_SET = 'Not set';
+export const NONE = 'None';
+
+/** A date and time for display. A missing value is `missing`, in words. */
+export function formatDate(iso?: string | null, missing: string = NOT_SET): string {
+  if (!iso) return missing;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString(undefined, {
@@ -135,12 +140,19 @@ export function CodeValue({ value, copyLabel }: { value?: string | null; copyLab
   if (!value) return <span className="text-sm text-slate-600">Not set</span>;
   return (
     <span className="flex items-center gap-1.5">
-      <code className="text-xs font-mono text-slate-700 break-all" title={value}>
-        {maskArn(value)}
-      </code>
+      <code className="text-xs font-mono text-slate-700 break-all">{maskArn(value)}</code>
       <CopyButton value={value} label={copyLabel} />
     </span>
   );
+}
+
+/**
+ * A value that may hold an account id, such as who created a record. The id is masked the way
+ * an ARN shows it; no page shows an account id in full.
+ */
+export function MaskedText({ value, missing = NOT_SET }: { value?: string | null; missing?: string }) {
+  if (!value) return <span className="text-slate-600">{missing}</span>;
+  return <span className="break-words">{maskAccountIds(value)}</span>;
 }
 
 export interface TabDef {

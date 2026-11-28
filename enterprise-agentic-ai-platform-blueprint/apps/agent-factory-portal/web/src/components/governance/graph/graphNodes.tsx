@@ -3,7 +3,9 @@
 import { Handle, Position } from '@xyflow/react';
 import type { NodeProps } from '@xyflow/react';
 import type { FlowNode } from './layout';
+import { nodeContext } from './enrich';
 import { kindBadge } from '../agentUi';
+import { gatewayNotRead } from '../gatewayView';
 import { platformHostLabel, mcpHostLabel } from '../platformLabels';
 import type { McpServerKind } from '../../../api/client';
 
@@ -121,9 +123,11 @@ const AGENT_TYPE_TAG = 'bg-teal-50 text-teal-700';
 
 export function AgentNode({ data }: NodeProps<FlowNode>) {
   const host = platformHostLabel(String(data.metadata.platform ?? ''));
+  // Two agents can carry one name: the tenant and the account tell them apart.
+  const context = nodeContext(data.metadata);
 
   return (
-    <div className={`${CARD} border-teal-200`} title={data.label}>
+    <div className={`${CARD} border-teal-200`} title={context ? `${data.label} · ${context}` : data.label}>
       <span className={`${RAIL} ${AGENT_RAIL}`} aria-hidden="true" />
       <IconChip tint="bg-teal-50 text-teal-600">
         <AgentGlyph className="h-5 w-5" />
@@ -132,7 +136,13 @@ export function AgentNode({ data }: NodeProps<FlowNode>) {
         <div className={LABEL}>{data.label}</div>
         <div className="mt-0.5 flex items-center gap-1 min-w-0">
           <TypeTag tint={AGENT_TYPE_TAG}>Agent</TypeTag>
-          {host && <span className={HOST_TAG}>{host}</span>}
+          {data.metadata.contained === true ? (
+            <span className={`${PILL} bg-red-700 text-white`}>Contained</span>
+          ) : context ? (
+            <span className={SUBLABEL}>{context}</span>
+          ) : (
+            host && <span className={HOST_TAG}>{host}</span>
+          )}
         </div>
       </div>
       <NodeHandles />
@@ -160,10 +170,13 @@ export function McpNode({ data }: NodeProps<FlowNode>) {
 
   const typeTint = badge ? badge.cls : 'bg-slate-100 text-slate-600';
   const kindTitle = badge ? `Tool gateway · ${badge.label}` : 'Tool gateway';
+  // A gateway that only the organization registry detected. It stands alone: who can call it,
+  // and whether a policy stands between, is not known, so the API draws no edge to it.
+  const notRead = gatewayNotRead({ reader_status: String(data.metadata.reader_status ?? ''), detail: null });
 
   return (
-    <div className={`${CARD} border-slate-200`} title={data.label}>
-      <span className={`${RAIL} ${mcpRailTint(kindRaw)}`} aria-hidden="true" />
+    <div className={`${CARD} ${notRead ? 'border-dashed border-slate-400' : 'border-slate-200'}`} title={notRead ? `${data.label}. ${notRead.title}.` : data.label}>
+      <span className={`${RAIL} ${notRead ? 'bg-slate-300' : mcpRailTint(kindRaw)}`} aria-hidden="true" />
       <IconChip tint={mcpChipTint(kindRaw)}>
         <McpGlyph className="h-5 w-5" />
       </IconChip>
@@ -171,7 +184,8 @@ export function McpNode({ data }: NodeProps<FlowNode>) {
         <div className={LABEL}>{data.label}</div>
         <div className="mt-0.5 flex items-center gap-1 min-w-0">
           <span className={`${PILL} ${typeTint}`} title={kindTitle}>Gateway</span>
-          {host && <span className={HOST_TAG}>{host}</span>}
+          {/* Short, so that it fits beside the kind on one line; the detail panel says why. */}
+          {notRead ? <span className={`${HOST_TAG} whitespace-nowrap`}>Not read</span> : host && <span className={HOST_TAG}>{host}</span>}
         </div>
       </div>
       <NodeHandles />

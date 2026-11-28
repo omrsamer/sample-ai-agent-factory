@@ -35,8 +35,8 @@ describe('deploymentActor', () => {
   });
 
   it('shows a row with no actor as a dash, not as an unknown user', () => {
-    expect(deploymentActor({ actor: null })).toBe('—');
-    expect(deploymentActor({ actor: '  ' })).toBe('—');
+    expect(deploymentActor({ actor: null })).toBe('Not recorded');
+    expect(deploymentActor({ actor: '  ' })).toBe('Not recorded');
   });
 });
 
@@ -51,6 +51,6 @@ describe('agentEnvironments', () => {
 describe('shortSha', () => {
   it('shortens a commit id and shows a missing one as a dash', () => {
     expect(shortSha('0123456789abcdef')).toBe('0123456');
-    expect(shortSha(null)).toBe('—');
+    expect(shortSha(null)).toBe('Not set');
   });
 });

@@ -6,9 +6,10 @@ import {
   PieChart, Pie, Cell,
 } from 'recharts';
 import { observabilityApi } from '../../../api/client';
+import { maskAccountIds } from '../../shared/arnDisplay';
 import { tooltipStyle } from '../../shared/chartTheme';
 import { defaultDateRange } from '../observability/observabilityMetrics';
-import { COST_UNAVAILABLE_NOTE, agentMetricsToSeries, costText, fmtUsd } from './agentObservability';
+import { COST_UNAVAILABLE_NOTE, agentMetricsToSeries, costText, emptyState, fmtUsd } from './agentObservability';
 import { useAsync } from '../../shared/useAsync';
 import { DataNotes, ObsEmptyCard } from './ObsEmptyCard';
 
@@ -17,6 +18,11 @@ const CARD = 'bg-white/70 backdrop-blur rounded-xl border border-slate-200/60 sh
 const fmtInt = (n: number) => n.toLocaleString();
 
 /** Cost, tokens and trace counts for one agent over a date range. */
+const NO_USAGE = {
+  title: 'No cost data in this window',
+  body: 'No usage was recorded for this agent in the selected dates. Cost and token usage appear here once the agent has been invoked. Try widening the date range.',
+};
+
 export default function CostTab({ agentId }: { agentId: string }) {
   const [range, setRange] = useState(() => defaultDateRange());
   const { data: metrics, loading, error } = useAsync(
@@ -67,10 +73,10 @@ export default function CostTab({ agentId }: { agentId: string }) {
       {error ? (
         <ObsEmptyCard title="Couldn't load cost metrics" body={error} tone="amber" />
       ) : series.isEmpty && !loading ? (
-        <ObsEmptyCard
-          title="No cost data in this window"
-          body="No usage was recorded for this agent in the selected dates. Cost and token usage appear here once the agent has been invoked. Try widening the date range."
-        />
+        <>
+          <DataNotes notes={metrics?.warnings ?? []} />
+          <ObsEmptyCard {...emptyState(metrics?.warnings, 'usage', NO_USAGE)} />
+        </>
       ) : (
         <>
           <DataNotes notes={notes} />
@@ -153,7 +159,7 @@ export default function CostTab({ agentId }: { agentId: string }) {
                   {metrics!.by_user.map((u) => (
                     <tr key={u.user_id || '__nouser__'} className="border-b border-slate-100 last:border-0">
                       <td className="py-2.5 text-slate-700">
-                        {u.user_id || <span className="text-slate-600">No caller identity recorded</span>}
+                        {u.user_id ? maskAccountIds(u.user_id) : <span className="text-slate-600">No caller identity recorded</span>}
                       </td>
                       <td className="py-2.5 text-right text-slate-600 tabular-nums">{fmtInt(u.traces)}</td>
                       <td className="py-2.5 text-right font-semibold text-slate-900 tabular-nums">{costText(u.cost_usd, costAvailable)}</td>

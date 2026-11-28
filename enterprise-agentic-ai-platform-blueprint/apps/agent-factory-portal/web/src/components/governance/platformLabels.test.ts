@@ -18,7 +18,7 @@ describe('platform labels', () => {
 
   it('shows an unrecognised key as recorded, and a missing one as a dash or the fallback', () => {
     expect(platformLabel('custom_host')).toBe('custom_host');
-    expect(platformLabel(null)).toBe('—');
+    expect(platformLabel(null)).toBe('Not set');
     expect(platformLabelOr(undefined, 'Platform not recorded')).toBe('Platform not recorded');
     expect(platformHostLabel('')).toBe('');
   });

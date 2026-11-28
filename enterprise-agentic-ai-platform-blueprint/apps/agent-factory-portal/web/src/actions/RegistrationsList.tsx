@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT-0
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { BreakableName } from '../components/governance/agentUi';
 import { useUser } from '../contexts/UserContext';
 import { Badge, CARD, ErrorCard, Page, PageHeader, TABLE_HEAD, TD, TH, formatDate } from '../components/shared/ui';
 import { useAsync } from '../components/shared/useAsync';
@@ -73,14 +74,14 @@ export default function RegistrationsList() {
                 return (
                   <tr key={r.record_id}>
                     <td className={TD}>
-                      <Link to={`/registrations/${encodeURIComponent(r.record_id)}`} className="font-medium text-blue-700 hover:underline break-all">
-                        {r.agent_id || r.name || r.record_id}
+                      <Link to={`/registrations/${encodeURIComponent(r.record_id)}`} className="font-medium text-blue-700 hover:underline">
+                        <BreakableName name={r.agent_id || r.name || r.record_id} />
                       </Link>
                     </td>
-                    <td className={`${TD} text-slate-600`}>{r.tenant_id || '—'}</td>
-                    <td className={`${TD} text-slate-600`}>{r.environment || '—'}</td>
+                    <td className={`${TD} text-slate-600`}>{r.tenant_id || 'None'}</td>
+                    <td className={`${TD} text-slate-600`}>{r.environment || 'Not set'}</td>
                     <td className={TD}><Badge cls={view.cls} label={view.label} /></td>
-                    <td className={`${TD} text-slate-600`}>{r.record_version || '—'}</td>
+                    <td className={`${TD} text-slate-600`}>{r.record_version || 'Not set'}</td>
                     <td className={`${TD} text-slate-600 whitespace-nowrap`}>{formatDate(r.updated_at)}</td>
                   </tr>
                 );

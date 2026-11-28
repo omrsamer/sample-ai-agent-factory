@@ -2,10 +2,12 @@
 // Derived from Agentic Governance Platform (Apache-2.0); modified for the Agent Factory Portal.
 import type { AgentMetrics, TraceRow } from '../../../types';
 import { buildDashboardSeries, type DashboardSeries, type DateRange } from '../observability/observabilityMetrics';
+import { maskAccountIds } from '../../shared/arnDisplay';
 
 /** Pure formatting for the per-agent Traces and Cost tabs. */
 
-export const EM_DASH = '—';
+/** What an empty trace cell says. */
+export const NOT_RECORDED = 'Not recorded';
 
 export interface TraceDisplayRow {
   id: string;
@@ -38,7 +40,7 @@ export function costText(n: number, costAvailable: boolean | undefined): string 
 }
 
 function fmtTimestamp(iso: string | null): string {
-  if (!iso) return EM_DASH;
+  if (!iso) return NOT_RECORDED;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString(undefined, {
@@ -51,7 +53,7 @@ function fmtTimestamp(iso: string | null): string {
 }
 
 function fmtLatency(ms: number | null): string {
-  if (ms === null || ms === undefined || Number.isNaN(ms)) return EM_DASH;
+  if (ms === null || ms === undefined || Number.isNaN(ms)) return NOT_RECORDED;
   return `${Math.round(ms).toLocaleString()} ms`;
 }
 
@@ -59,15 +61,31 @@ export function mapTraceRows(rows: TraceRow[]): TraceDisplayRow[] {
   return rows.map((r) => ({
     id: r.id,
     timestamp: fmtTimestamp(r.timestamp),
-    name: r.name ?? EM_DASH,
+    name: r.name ?? NOT_RECORDED,
     latency: fmtLatency(r.latency_ms),
-    // A zero cost on a trace means "not priced", so it is shown as a dash rather than $0.00.
-    cost: r.cost_usd ? fmtUsd(r.cost_usd) : EM_DASH,
-    tokens: typeof r.total_tokens === 'number' ? r.total_tokens.toLocaleString() : EM_DASH,
-    status: r.status ?? EM_DASH,
-    user: r.user_id ?? EM_DASH,
+    // A zero cost on a trace means "not priced", so it is said in words rather than as $0.00.
+    cost: r.cost_usd ? fmtUsd(r.cost_usd) : 'Not priced',
+    tokens: typeof r.total_tokens === 'number' ? r.total_tokens.toLocaleString() : NOT_RECORDED,
+    status: r.status ?? NOT_RECORDED,
+    // A caller can be an IAM principal; its account id is masked like every other.
+    user: r.user_id ? maskAccountIds(r.user_id) : NOT_RECORDED,
     raw: r,
   }));
+}
+
+export interface EmptyState {
+  title: string;
+  body: string;
+}
+
+/**
+ * What to say when a read came back empty. When the API sent notes with it, the data may not
+ * have been readable, so the page must not claim that nothing happened: it points at the notes.
+ */
+export function emptyState(warnings: readonly string[] | null | undefined, what: string, nothingRecorded: EmptyState): EmptyState {
+  return (warnings ?? []).length > 0
+    ? { title: `No ${what} to show`, body: 'The note above says what could not be read or is incomplete.' }
+    : nothingRecorded;
 }
 
 export function totalPages(total: number, pageSize: number): number {

@@ -15,8 +15,9 @@ import {
  *
  * It is reachable only through the screens in this folder, which the application loads only
  * when `features.governedActions` is true. Writes are POST, PUT and DELETE on `/registrations`
- * and nothing else. Registering or approving a record produces a governance record and a
- * decision; it deploys nothing. The contract is `../api/ACTIONS_CONTRACT.md`.
+ * and nothing else. Registering, approving, retiring or reviewing a record produces a governance
+ * record and a decision; it deploys and removes nothing. The contract is
+ * `../api/ACTIONS_CONTRACT.md`.
  */
 
 /** Registry status. Shown as recorded when this build does not know the value. */
@@ -36,7 +37,9 @@ export interface Registration {
   record_id: string;
   name: string;
   status: string;
-  /** The approver's reason, shortened by the registry. */
+  /** The same status in the agent lifecycle vocabulary. `deprecated` is a retired registration. */
+  lifecycle_state?: string | null;
+  /** The reason of the last approve, reject or retire, shortened by the registry. */
   status_reason?: string | null;
   record_version?: string | null;
   tenant_id?: string | null;
@@ -62,6 +65,14 @@ export interface RegistrationDetail extends Registration {
   decision_reason?: string | null;
   /** The last approved version of this record's document, when the API can supply it. */
   previous_approved?: RegistrationDocument | null;
+  /** The latest attestation: a review, or an approval of a document that names a review date. */
+  last_reviewed_at?: string | null;
+  last_reviewed_by?: string | null;
+  /**
+   * When the registration must be reviewed next (YYYY-MM-DD): the latest attestation's date,
+   * else the document's own. A review never changes the document.
+   */
+  effective_review_by?: string | null;
 }
 
 /** One event of the audit trail. */
@@ -77,18 +88,38 @@ export interface AuditEvent {
   actor_role?: string | null;
   status_before?: string | null;
   status_after?: string | null;
+  /** Set on a review, and on an approval that recorded a review date: that date. */
+  next_review_by?: string | null;
+  attested_at?: string | null;
+  detail?: string | null;
+  /** A background sweep of a contained agent (`action: "sweep"`): which one it is, 1 to 3. */
+  sweep?: number | null;
+  /**
+   * Containment events. On a sweep `sessions_found` is every session of the last eight hours,
+   * ended or not (the sweep has to try each), and `sessions_stopped` is how many were running.
+   */
+  sessions_found?: number | null;
+  sessions_stopped?: number | null;
+  /** Sweeps only: sessions that had already ended. */
+  sessions_not_active?: number | null;
+  sessions_failed?: number | null;
 }
 
 /** `GET /registrations/{record_id}/history`. */
 export interface RegistrationHistory {
   record_id: string;
+  /** Newest first. The API lists the newest events only. */
   events: AuditEvent[];
+  /** True when the history holds older events than the ones listed. */
+  events_truncated?: boolean;
 }
 
 /** The answer to every write. */
 export interface ActionResult {
   action: string;
+  /** `allowed`, or `unchanged` for the retire of a record that was already retired. */
   outcome: string;
+  /** For a retire: a sentence that says what retirement means, to show the user. */
   reason: string;
   request_id: string;
   /** Null after a delete. */
@@ -123,6 +154,12 @@ export const registrationsApi = {
     (await client.post<ActionResult>(path(recordId, '/approve'), { reason, document_sha256: documentSha256 })).data,
   reject: async (recordId: string, reason: string, documentSha256: string): Promise<ActionResult> =>
     (await client.post<ActionResult>(path(recordId, '/reject'), { reason, document_sha256: documentSha256 })).data,
+  /** Retires the registration for good. Nothing that is deployed is removed. */
+  retire: async (recordId: string, reason: string): Promise<ActionResult> =>
+    (await client.post<ActionResult>(path(recordId, '/retire'), { reason })).data,
+  /** Attests that an approved registration was reviewed, and by when it must be reviewed again. */
+  review: async (recordId: string, reason: string, nextReviewBy: string): Promise<ActionResult> =>
+    (await client.post<ActionResult>(path(recordId, '/review'), { reason, next_review_by: nextReviewBy })).data,
 };
 
 export type ActionFailureKind = 'validation' | 'forbidden' | 'conflict' | 'not_found' | 'unavailable' | 'other';
@@ -145,7 +182,7 @@ export interface ActionFailure {
 }
 
 export const FORBIDDEN_TITLE = 'You do not hold the authority for this action';
-export const CONFLICT_TITLE = 'The record is not in a state that allows this';
+export const CONFLICT_TITLE = 'This cannot be done in the current state';
 
 function stringField(body: unknown, key: string): string | null {
   if (typeof body !== 'object' || body === null) return null;
@@ -170,6 +207,9 @@ export function classifyFailure(err: unknown, fallback: string): ActionFailure {
       return { ...base, kind: 'not_found', title: 'This record no longer exists', message };
     case 503:
       return { ...base, kind: 'unavailable', title: 'Nothing was changed', message };
+    case 502:
+      // The server's sentence says what was and was not done; it is shown as sent.
+      return { ...base, ...extras, kind: 'other', title: 'The action failed part-way', message };
     case 422: {
       const fieldErrors: FieldErrors = {};
       const otherErrors: string[] = [];

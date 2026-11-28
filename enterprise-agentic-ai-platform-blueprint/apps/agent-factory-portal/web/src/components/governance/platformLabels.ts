@@ -17,7 +17,7 @@ function known(p: string): boolean {
 }
 
 export function platformLabel(p?: Platform | null): string {
-  if (!p) return '—';
+  if (!p) return 'Not set';
   return known(p) ? PLATFORM_LABEL[p].full : p;
 }
 
@@ -61,6 +61,17 @@ const IDENTITY_STATUS_LABEL: Record<IdentityStatus, string> = {
   provisioned: 'Provisioned',
   failed: 'Provisioning failed',
 };
+
+const INBOUND_AUTHORIZER: Record<string, string> = {
+  AWS_IAM: 'AWS IAM (SigV4)',
+  CUSTOM_JWT: 'JSON Web Token (custom authorizer)',
+  NONE: 'None: unauthenticated calls are accepted',
+};
+
+/** How callers are authorised at a runtime or a tool gateway. An unknown value is shown as recorded. */
+export function inboundAuthorizerLabel(value: string): string {
+  return Object.prototype.hasOwnProperty.call(INBOUND_AUTHORIZER, value) ? INBOUND_AUTHORIZER[value] : value;
+}
 
 export function identityStatusLabel(status: string | undefined): string {
   return status && Object.prototype.hasOwnProperty.call(IDENTITY_STATUS_LABEL, status)

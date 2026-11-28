@@ -3,14 +3,20 @@
 import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { isNotFound } from '../api/client';
+import { BreakableName } from '../components/governance/agentUi';
 import { useUser } from '../contexts/UserContext';
+import { maskAccountIds } from '../components/shared/arnDisplay';
 import { Badge, CARD, CodeValue, ErrorCard, Field, Loading, Page, TABLE_HEAD, TD, TH, formatDate } from '../components/shared/ui';
 import { useAsync } from '../components/shared/useAsync';
 import ActionFailurePanel from './ActionFailurePanel';
 import { documentDiff, draftFromDocument, FIELD_LABEL } from './governanceSchema';
+import LifecycleActions from './LifecycleActions';
+import { RETIRED_NOTE, RETIRED_STATUS } from './lifecycleView';
+import RetiredFollowUp from './RetiredFollowUp';
 import { classifyFailure, registrationsApi, type ActionFailure, type ActionResult, type RegistrationDetail as RegistrationRecord } from './registrationsClient';
 import {
   AUDIT_INCOMPLETE_NOTE,
+  HISTORY_TRUNCATED_NOTE,
   PIPELINE_NOTE,
   RETURNS_TO_DRAFT_NOTE,
   authoritiesOf,
@@ -28,26 +34,28 @@ const APPROVE = 'px-3.5 py-1.5 rounded-lg bg-emerald-700 text-white text-sm font
 
 function DocumentView({ record }: { record: RegistrationRecord }) {
   const d = draftFromDocument(record.document);
-  const plain = (value: string) => value || '—';
+  const plain = (value: string) => value || 'Not set';
   return (
     <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">
       <Field label={FIELD_LABEL.tenantId}>{plain(d.tenantId)}</Field>
-      <Field label={FIELD_LABEL.agentId}><span className="break-all">{plain(d.agentId)}</span></Field>
+      <Field label={FIELD_LABEL.agentId}>{d.agentId ? <BreakableName name={d.agentId} /> : plain('')}</Field>
       <Field label={FIELD_LABEL.environment}>{plain(d.environment)}</Field>
       <Field label={FIELD_LABEL.ownerGroup}><span className="break-words">{plain(d.ownerGroup)}</span></Field>
+      <Field label={FIELD_LABEL.sponsor}><span className="break-words">{d.sponsor || 'None recorded'}</span></Field>
+      <Field label={FIELD_LABEL.reviewBy}>{d.reviewBy || 'No review date'}</Field>
       <Field label={FIELD_LABEL.contact}><span className="break-all">{plain(d.contact)}</span></Field>
       <Field label={FIELD_LABEL.costCentre}>{plain(d.costCentre)}</Field>
       <Field label={FIELD_LABEL.riskClass}>{plain(d.riskClass)}</Field>
       <Field label={FIELD_LABEL.dataClassification}>{plain(d.dataClassification)}</Field>
       <Field label={FIELD_LABEL.applicationId}><span className="break-all">{plain(d.applicationId)}</span></Field>
       <Field label={FIELD_LABEL.framework}>{plain(d.framework)}</Field>
-      <Field label="Golden path">{d.goldenPathName ? `${d.goldenPathName} ${d.goldenPathVersion}` : '—'}</Field>
+      <Field label="Golden path">{d.goldenPathName ? `${d.goldenPathName} ${d.goldenPathVersion}` : 'Not set'}</Field>
       <Field label={FIELD_LABEL.recordVersion}>{plain(d.recordVersion)}</Field>
       <Field className="sm:col-span-2 lg:col-span-3" label={FIELD_LABEL.businessPurpose}><span className="whitespace-pre-wrap break-words">{plain(d.businessPurpose)}</span></Field>
       <Field className="sm:col-span-2 lg:col-span-3" label={FIELD_LABEL.runtimeArn}><CodeValue value={d.runtimeArn} copyLabel="runtime ARN" /></Field>
       <Field className="sm:col-span-2 lg:col-span-3" label={FIELD_LABEL.gatewayArn}><CodeValue value={d.gatewayArn} copyLabel="tool gateway ARN" /></Field>
       <Field className="sm:col-span-2 lg:col-span-3" label={FIELD_LABEL.subscribedToolIds}>
-          {d.subscribedToolIds.length === 0 ? '—' : <span className="font-mono text-xs break-all">{d.subscribedToolIds.join(', ')}</span>}
+          {d.subscribedToolIds.length === 0 ? 'None' : <span className="font-mono text-xs break-all">{d.subscribedToolIds.join(', ')}</span>}
         </Field>
     </dl>
   );
@@ -78,8 +86,8 @@ function DiffView({ record }: { record: RegistrationRecord }) {
               {rows.map((row) => (
                 <tr key={row.field} className="align-top">
                   <th scope="row" className={`${TD} text-left font-medium text-slate-700 whitespace-nowrap`}>{row.label}</th>
-                  <td className={`${TD} text-slate-600 break-all`}>{row.before || 'Not set'}</td>
-                  <td className={`${TD} text-slate-900 break-all`}>{row.after || 'Removed'}</td>
+                  <td className={`${TD} text-slate-600 break-all`}>{row.before ? maskAccountIds(row.before) : 'Not set'}</td>
+                  <td className={`${TD} text-slate-900 break-all`}>{row.after ? maskAccountIds(row.after) : 'Removed'}</td>
                 </tr>
               ))}
             </tbody>
@@ -105,7 +113,8 @@ function History({ recordId, refreshKey }: { recordId: string; refreshKey: numbe
           No action on this record has been recorded through the portal. A record published by a pipeline has no entries here.
         </div>
       ) : (
-        <div className={`${CARD} overflow-x-auto`}>
+        // Nothing in this table takes focus, so the region does: it can scroll sideways on a narrow screen.
+        <div className={`${CARD} overflow-x-auto`} tabIndex={0} role="region" aria-label="History entries">
           <table className="w-full text-sm">
             <thead className={TABLE_HEAD}>
               <tr>
@@ -124,13 +133,16 @@ function History({ recordId, refreshKey }: { recordId: string; refreshKey: numbe
                   <tr key={row.key} className="align-top">
                     <td className={`${TD} text-slate-700 whitespace-nowrap`}>{formatDate(row.at)}</td>
                     <td className={`${TD} text-slate-700 break-words`}>
-                      {row.actor || '—'}
+                      {row.actor || 'Not recorded'}
                       {row.role && <span className="block text-xs text-slate-600">{row.role}</span>}
                     </td>
-                    <td className={`${TD} text-slate-700`}>{historyActionLabel(row.action)}</td>
-                    <td className={TD}><Badge cls={outcome.cls} label={outcome.label} /></td>
-                    <td className={`${TD} text-slate-600 whitespace-nowrap`}>{row.statusChange || '—'}</td>
-                    <td className={`${TD} text-slate-600 break-words`}>{row.reason || '—'}</td>
+                    <td className={`${TD} text-slate-700`}>
+                      {historyActionLabel(row.action)}
+                      {row.nextReviewBy && <span className="block text-xs text-slate-600">Next review by {row.nextReviewBy}</span>}
+                    </td>
+                    <td className={`${TD} whitespace-nowrap`}><Badge cls={`${outcome.cls} whitespace-nowrap`} label={outcome.label} /></td>
+                    <td className={`${TD} text-slate-600 whitespace-nowrap`}>{row.statusChange || 'No change'}</td>
+                    <td className={`${TD} text-slate-600 break-words`}>{row.reason || 'Not recorded'}</td>
                   </tr>
                 );
               })}
@@ -138,6 +150,7 @@ function History({ recordId, refreshKey }: { recordId: string; refreshKey: numbe
           </table>
         </div>
       )}
+      {!loading && rows.length > 0 && data?.events_truncated === true && <p className="text-xs text-slate-600 mt-2">{HISTORY_TRUNCATED_NOTE}</p>}
     </section>
   );
 }
@@ -148,7 +161,9 @@ export default function RegistrationDetail() {
   const navigate = useNavigate();
   const { user } = useUser();
   const who = authoritiesOf(user);
-  const { data: record, loading, error, cause, reload } = useAsync(() => registrationsApi.get(id), [id], 'Failed to load the registration.');
+  const { data: record, loading, error, cause, reload } = useAsync(() => registrationsApi.get(id), [id], 'Failed to load the registration.', {
+    keepPreviousOnReload: true,
+  });
   const [failure, setFailure] = useState<ActionFailure | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -202,7 +217,7 @@ export default function RegistrationDetail() {
     );
   };
 
-  if (loading) {
+  if (loading && !record) {
     return (
       <Page>
         <Loading label="Loading the registration…" />
@@ -235,7 +250,7 @@ export default function RegistrationDetail() {
       <Link to="/registrations" className="text-xs text-slate-600 hover:text-slate-800">← Registrations</Link>
       <div className="mt-2 mb-4 flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
-          <h1 className="text-xl font-semibold text-slate-900 break-all">{record.agent_id || record.name || record.record_id}</h1>
+          <h1 className="text-xl font-semibold text-slate-900"><BreakableName name={record.agent_id || record.name || record.record_id} /></h1>
           <div className="flex flex-wrap items-center gap-2 mt-1 text-xs text-slate-600">
             <Badge cls={status.cls} label={status.label} />
             <span>
@@ -305,6 +320,16 @@ export default function RegistrationDetail() {
           </div>
         )}
 
+        {record.status === RETIRED_STATUS && (
+          <section aria-labelledby="registration-retired" className="rounded-xl border border-slate-300 bg-slate-50 p-5">
+            <h2 id="registration-retired" className="text-sm font-semibold text-slate-900">Retired</h2>
+            <p className="text-sm text-slate-800 mt-1">{RETIRED_NOTE}</p>
+            {record.status_reason && <p className="text-sm text-slate-700 mt-2 break-words">Reason given: {record.status_reason}</p>}
+            {/* Retiring removes nothing: if the runtime is still deployed, that is what is left to do. */}
+            <RetiredFollowUp recordId={record.record_id} />
+          </section>
+        )}
+
         {offered.note && (
           <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" role="status">
             {offered.note}
@@ -341,6 +366,9 @@ export default function RegistrationDetail() {
             </div>
           </section>
         )}
+
+        {/* After approval: the periodic review and retirement. Refusals are recorded, so the history is read again. */}
+        <LifecycleActions record={record} who={who} idPrefix="registration" onDone={refresh} onRefused={() => setHistoryKey((k) => k + 1)} />
 
         <DiffView record={record} />
 

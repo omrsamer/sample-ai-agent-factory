@@ -23,9 +23,11 @@ export default function ActionFailurePanel({ failure, onRefresh }: { failure: Ac
       )}
       {failure.hint && <p className="text-sm text-red-800 mt-1 break-words">{failure.hint}</p>}
       {failure.kind === 'unavailable' && <p className="text-sm text-red-800 mt-1">You can try again.</p>}
+      {/* The id under which the refusal is kept: in the history when the caller has a part in the
+          record or the runtime, otherwise in the service's log. The page does not know which. */}
       {failure.requestId && (
         <p className="text-xs text-red-800 mt-2">
-          Recorded in the audit trail. Reference: <span className="font-mono break-all">{failure.requestId}</span>
+          Reference: <span className="font-mono break-all">{failure.requestId}</span>
         </p>
       )}
       {failure.kind === 'conflict' && onRefresh && (

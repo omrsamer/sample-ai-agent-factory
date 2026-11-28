@@ -49,7 +49,7 @@ export function outcomeBadge(outcome: string | null | undefined): StatusBadge {
 /** Who started a deployment. A row written by the build itself has no actor, shown as a dash. */
 export function deploymentActor(row: Pick<Deployment, 'actor' | 'actor_kind'>): string {
   const actor = row.actor?.trim();
-  if (!actor) return '—';
+  if (!actor) return 'Not recorded';
   return row.actor_kind === 'github' ? `@${actor}` : actor;
 }
 
@@ -60,5 +60,5 @@ export function agentEnvironments(agentArns: Record<string, string> | null | und
 
 export function shortSha(sha: string | null | undefined): string {
   const value = sha?.trim();
-  return value ? value.slice(0, 7) : '—';
+  return value ? value.slice(0, 7) : 'Not set';
 }

@@ -17,7 +17,7 @@ import {
 import type { Node, Edge } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-import { governanceGraphApi } from '../../api/client';
+import { agentsApi, governanceGraphApi } from '../../api/client';
 import type { GovernanceGraph as GovernanceGraphData, GraphNode } from '../../api/client';
 import { toFlow, layout } from './graph/layout';
 import type { FlowNode, FlowEdge } from './graph/layout';
@@ -25,6 +25,8 @@ import { nodeTypes } from './graph/graphNodes';
 import { edgeTypes } from './graph/PolicyEdge';
 import GraphDetailDrawer from './graph/GraphDetailDrawer';
 import AccessTable from './graph/AccessTable';
+import { enrichGraph } from './graph/enrich';
+import { useUser } from '../../contexts/UserContext';
 import { useAsync } from '../shared/useAsync';
 import type { GraphSelection } from './graph/GraphDetailDrawer';
 
@@ -62,7 +64,12 @@ function usePrefersReducedMotion(): boolean {
 
 /** Read-only graph of principals, agents and tool gateways and the access between them. */
 export default function GovernanceGraph() {
-  const { data: graph, loading, error, reload } = useAsync(() => governanceGraphApi.get(), [], 'Failed to load the access graph.');
+  const { user } = useUser();
+  const { data: rawGraph, loading, error, reload } = useAsync(() => governanceGraphApi.get(), [], 'Failed to load the access graph.');
+  // Read only to mark contained agents and to tell two agents of one name apart; the graph
+  // renders without it.
+  const agents = useAsync(() => agentsApi.list(), [], 'Failed to load agents.');
+  const graph = useMemo(() => (rawGraph ? enrichGraph(rawGraph, agents.data, user?.tenants) : rawGraph), [rawGraph, agents.data, user?.tenants]);
   const [typeVisible, setTypeVisible] = useState<TypeVisibility>(ALL_VISIBLE);
   const [policyOnly, setPolicyOnly] = useState(false);
 

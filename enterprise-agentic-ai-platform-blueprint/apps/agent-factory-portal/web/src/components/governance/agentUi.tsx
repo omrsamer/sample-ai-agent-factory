@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Derived from Agentic Governance Platform (Apache-2.0); modified for the Agent Factory Portal.
-import type { ReactElement } from 'react';
-import type { LifecycleState, Origin, McpServerKind } from '../../api/client';
-
-export function emailAlias(email?: string | null): string {
-  if (!email) return 'Unassigned';
-  const trimmed = email.trim();
-  if (!trimmed) return 'Unassigned';
-  const at = trimmed.indexOf('@');
-  return at === -1 ? trimmed : trimmed.slice(0, at);
-}
+import { Fragment, type ReactElement } from 'react';
+import type { LifecycleState, McpServerKind } from '../../api/client';
 
 const LIFECYCLE_BADGE_CLS: Record<LifecycleState, string> = {
   approved: 'bg-emerald-50 text-emerald-700',
@@ -25,7 +17,8 @@ const LIFECYCLE_LABEL: Record<LifecycleState, string> = {
   proposed: 'Proposed',
   pending_approval: 'Pending approval',
   rejected: 'Rejected',
-  deprecated: 'Deprecated',
+  // The registry's word is DEPRECATED; the portal calls such a registration retired.
+  deprecated: 'Retired',
   discovered: 'Discovered, not registered',
 };
 
@@ -42,12 +35,6 @@ export function lifecycleBadge(state: LifecycleState | string): { cls: string; l
   return { cls: 'bg-slate-100 text-slate-600', label: state || 'Unknown' };
 }
 
-export function originBadge(origin: Origin): { cls: string; label: string } {
-  return origin === 'Deployed'
-    ? { cls: 'bg-emerald-50 text-emerald-700', label: 'Deployed' }
-    : { cls: 'bg-amber-50 text-amber-700', label: 'Registered' };
-}
-
 export function kindBadge(kind: McpServerKind): { cls: string; label: string } {
   if (kind === 'gateway') return { cls: 'bg-violet-50 text-violet-700', label: 'Gateway' };
   if (kind === 'runtime') return { cls: 'bg-indigo-50 text-indigo-700', label: 'Runtime' };
@@ -56,8 +43,31 @@ export function kindBadge(kind: McpServerKind): { cls: string; label: string } {
 
 export function tenantBadge(name?: string | null): { cls: string; label: string } {
   const trimmed = (name ?? '').trim();
-  if (!trimmed) return { cls: 'bg-slate-100 text-slate-600', label: '—' };
+  if (!trimmed) return { cls: 'bg-slate-100 text-slate-600', label: 'None' };
   return { cls: 'bg-teal-50 text-teal-700', label: trimmed };
+}
+
+/** The pieces of a name, each ending at a hyphen or an underscore, where a line may break. */
+export function nameSegments(name: string): string[] {
+  return name.match(/[^-_]*[-_]+|[^-_]+$/g) ?? [];
+}
+
+/**
+ * An agent or cell name that wraps only at hyphens, underscores and spaces, never in the
+ * middle of a word.
+ */
+export function BreakableName({ name }: { name: string }): ReactElement {
+  const segments = nameSegments(name);
+  return (
+    <>
+      {segments.map((segment, i) => (
+        <Fragment key={i}>
+          {segment}
+          {i < segments.length - 1 && <wbr />}
+        </Fragment>
+      ))}
+    </>
+  );
 }
 
 const AVATAR_PALETTE: string[] = [

@@ -8,6 +8,8 @@ export interface AgentTab {
   label: string;
   /** Shown only for agents the factory deployed, not for records registered by hand. */
   deployedOnly?: boolean;
+  /** Part of the governed actions feature. */
+  governedOnly?: boolean;
 }
 
 export const ALL_TABS: AgentTab[] = [
@@ -17,10 +19,17 @@ export const ALL_TABS: AgentTab[] = [
   { id: 'traces', label: 'Traces' },
   { id: 'cost', label: 'Cost' },
   { id: 'evaluations', label: 'Release evidence' },
+  { id: 'containment', label: 'Containment', governedOnly: true },
 ];
 
-export function visibleTabs(origin: Origin): AgentTab[] {
-  return ALL_TABS.filter((t) => !t.deployedOnly || origin === 'Deployed');
+/**
+ * The tabs to show. Containment exists only when governed actions are switched on; with them
+ * off it is not listed and its address resolves to the first tab.
+ */
+export function visibleTabs(origin: Origin, opts: { governedActions?: boolean } = {}): AgentTab[] {
+  return ALL_TABS.filter(
+    (t) => (!t.deployedOnly || origin === 'Deployed') && (!t.governedOnly || opts.governedActions === true),
+  );
 }
 
 /** The tab to show for a requested id, falling back to the first visible one. */
