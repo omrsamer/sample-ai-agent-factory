@@ -128,7 +128,8 @@ def gone_event_source_mappings(cloudformation: Any, functions: Any, stack_name: 
             try:
                 functions.get_event_source_mapping(UUID=resource["PhysicalResourceId"])
             except Exception as error:  # noqa: BLE001 - only "not found" means it is gone
-                if "ResourceNotFound" in str(error):
+                code = getattr(error, "response", {}).get("Error", {}).get("Code", "")
+                if code == "ResourceNotFoundException":
                     gone.append(resource["LogicalResourceId"])
     return sorted(gone)
 

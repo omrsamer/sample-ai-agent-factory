@@ -249,6 +249,7 @@ export class AgentFactoryPortalStack extends Stack {
       identityProvider,
       jwtIssuer,
       jwtAudience,
+      jwksUrl,
       groupRoleMap,
       registryId,
       registryArn,

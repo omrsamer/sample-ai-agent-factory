@@ -163,6 +163,8 @@ export interface PortalApiProps {
   readonly jwtIssuer: string;
   /** Accepted token audiences. */
   readonly jwtAudience: readonly string[];
+  /** Where the issuer publishes its signing keys, when that does not follow from the issuer (Entra). */
+  readonly jwksUrl?: string;
   readonly groupRoleMap: Readonly<Record<string, PortalRole>>;
   readonly registryId: string;
   readonly registryArn: string;
@@ -411,6 +413,11 @@ export class PortalApi extends Construct {
         ...(props.inactiveDays ? { PORTAL_INACTIVE_DAYS: String(props.inactiveDays) } : {}),
         PORTAL_CELLS: stack.toJsonString(cellsEnv),
         PORTAL_IDENTITY_PROVIDER: props.identityProvider,
+        // The function verifies the caller's token itself, as the action functions do: no
+        // function takes a person's role from the invocation event.
+        PORTAL_JWT_ISSUER: props.jwtIssuer,
+        PORTAL_JWT_AUDIENCE: stack.toJsonString(props.jwtAudience),
+        ...(props.jwksUrl ? { PORTAL_JWKS_URL: props.jwksUrl } : {}),
         PORTAL_GROUP_ROLE_MAP: JSON.stringify(props.groupRoleMap),
         PORTAL_GUARDRAIL_TAG_KEY: props.guardrailTag?.key ?? "",
         PORTAL_GUARDRAIL_TAG_VALUE: props.guardrailTag?.value ?? "",

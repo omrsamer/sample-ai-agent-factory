@@ -227,10 +227,18 @@ class FakeFunctions:
     def get_event_source_mapping(self, UUID):  # noqa: N803
         self.asked.append(UUID)
         if self.denied:
-            raise RuntimeError("AccessDeniedException")
+            raise ServiceError("AccessDeniedException")
         if UUID not in self.existing:
-            raise RuntimeError("An error occurred (ResourceNotFoundException)")
+            raise ServiceError("ResourceNotFoundException")
         return {"UUID": UUID, "State": "Enabled"}
+
+
+class ServiceError(Exception):
+    """Shaped like a botocore ClientError: the code is in ``response``, not in the text."""
+
+    def __init__(self, code: str):
+        super().__init__("the service refused the call")
+        self.response = {"Error": {"Code": code}}
 
 
 def test_a_mapping_that_is_gone_but_reported_as_failed_is_left_out_of_the_next_attempt():

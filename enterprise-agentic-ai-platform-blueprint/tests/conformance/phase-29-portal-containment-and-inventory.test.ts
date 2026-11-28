@@ -40,6 +40,7 @@ import {
   PORTAL_SWEEP_BACKLOG_SECONDS,
   PORTAL_SWEEP_MESSAGE_ACTIONS,
   PORTAL_SWEEP_QUEUE_ACTIONS,
+  PORTAL_SWEEPER_CONCURRENCY,
   PORTAL_CONTAINMENT_TARGET_ACTIONS,
   PORTAL_EXTERNAL_READER_AGENTCORE_ACTIONS,
   PORTAL_EXTERNAL_READER_METRIC_ACTIONS,
@@ -397,7 +398,9 @@ describe("Phase 29 — containment function (Platform account)", () => {
     expect(JSON.stringify(mappings[0][1].EventSourceArn)).toContain(queueId);
     expect(JSON.stringify(mappings[0][1].FunctionName)).toContain(sweeperId);
     expect(mappings[0][1].BatchSize).toBe(1);
-    expect(mappings[0][1].ScalingConfig).toEqual({ MaximumConcurrency: 2 });
+    expect(mappings[0][1].ScalingConfig).toEqual({ MaximumConcurrency: PORTAL_SWEEPER_CONCURRENCY });
+    expect(sweeper.ReservedConcurrentExecutions).toBe(PORTAL_SWEEPER_CONCURRENCY);
+    expect(PORTAL_SWEEPER_CONCURRENCY).toBeGreaterThan(1);
 
     // The containment function knows the queue; the role may use that queue and no other.
     const containmentEnvironment = (containment.Environment as { Variables: Record<string, unknown> }).Variables;
@@ -451,6 +454,12 @@ describe("Phase 29 — containment function (Platform account)", () => {
       )!;
       expect(stage.DependsOn).toContain(routeId);
     }
+    // A route's budget is one bucket for every caller and is counted before the function decides
+    // who may act, so it is far above what responders need and above the default budget.
+    expect(PORTAL_CONTAINMENT_ROUTE_THROTTLE.rateLimit).toBeGreaterThanOrEqual(100);
+    expect(PORTAL_CONTAINMENT_ROUTE_THROTTLE.rateLimit).toBeGreaterThan(
+      (stage.Properties.DefaultRouteSettings as { ThrottlingRateLimit: number }).ThrottlingRateLimit,
+    );
     // The unauthenticated liveness route cannot use up the budget of the signed-in routes either.
     expect(settings["GET /api/v1/health"]).toEqual({
       ThrottlingRateLimit: PORTAL_HEALTH_ROUTE_THROTTLE.rateLimit,

@@ -77,8 +77,15 @@ export const PORTAL_SWEEP_MESSAGE_ACTIONS: readonly string[] = [
   "sqs:ChangeMessageVisibility",
   "sqs:PurgeQueue",
 ];
-/** Contain and release are emergency actions: each has a request budget no other route can use up. */
-export const PORTAL_CONTAINMENT_ROUTE_THROTTLE: PortalRouteThrottle = { rateLimit: 5, burstLimit: 10 };
+/**
+ * Contain and release are emergency actions: each has a request budget no other route can use up.
+ * A route's budget is one bucket for every caller, and a request is counted before the function
+ * decides who may act, so the budget is far above what responders need: a refusal costs the
+ * function a few milliseconds, and a small budget would let any signed-in user use it up.
+ */
+export const PORTAL_CONTAINMENT_ROUTE_THROTTLE: PortalRouteThrottle = { rateLimit: 100, burstLimit: 200 };
+/** Sweeps run side by side, so one Runtime with very many sessions does not hold up every other. */
+export const PORTAL_SWEEPER_CONCURRENCY = 5;
 /** A sweep waits at most 15 minutes and runs at most 15; one that is an hour old is not being processed. */
 export const PORTAL_SWEEP_BACKLOG_SECONDS = 3600;
 /**
@@ -483,7 +490,7 @@ export class PortalActions extends Construct {
         role: containment.role.withoutPolicyUpdates(),
         memorySize: 512,
         timeout: PORTAL_SWEEPER_TIMEOUT,
-        reservedConcurrentExecutions: 2,
+        reservedConcurrentExecutions: PORTAL_SWEEPER_CONCURRENCY,
         tracing: Tracing.ACTIVE,
         logGroup: sweeperLogs,
         environment: {
@@ -495,7 +502,9 @@ export class PortalActions extends Construct {
         },
       });
       sweeper.node.addDependency(containment.policy);
-      sweeper.addEventSource(new SqsEventSource(sweepQueue, { batchSize: 1, maxConcurrency: 2 }));
+      sweeper.addEventSource(
+        new SqsEventSource(sweepQueue, { batchSize: 1, maxConcurrency: PORTAL_SWEEPER_CONCURRENCY }),
+      );
       const stuckSweeps = new Alarm(this, "SweepDeadLettersAlarm", {
         alarmDescription:
           "A background containment sweep of the Agent Factory Portal could not be processed twice and was set aside. Sessions of a contained agent may still be running: contain it again, and look at the sweeper's log.",

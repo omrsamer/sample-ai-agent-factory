@@ -241,21 +241,22 @@ describe("Phase 28 — write routes", () => {
     expect(functionOfRoute(routeKey)).toBe(handler);
   });
 
-  it("gives each action function what it needs to verify the caller's token and to check a registration's cell", () => {
+  it("gives every function a caller reaches what it needs to verify the caller's token, and the action functions the cells", () => {
     const functions = Object.values(json.Resources)
       .filter((r) => r.Type === "AWS::Lambda::Function")
       .map((r) => r.Properties as { Handler: string; Environment?: { Variables: Record<string, unknown> } });
-    for (const handler of ["registrar_handler.handler", "approver_handler.handler"]) {
+    // The read function too: no function takes a person's role from the invocation event.
+    for (const handler of ["registrar_handler.handler", "approver_handler.handler", "handler.handler"]) {
       const variables = functions.find((f) => f.Handler === handler)!.Environment!.Variables;
       // The same issuer and audience the API's JWT authorizer checks: the function verifies the
       // bearer token itself, so claims handed to it directly carry no weight.
       expect(JSON.stringify(variables.PORTAL_JWT_ISSUER)).toContain("cognito-idp.");
       expect(JSON.stringify(variables.PORTAL_JWT_AUDIENCE)).toMatch(/Ref|Fn::/);
+      // With the built-in user pool the key set address follows from the issuer.
+      expect(variables.PORTAL_JWKS_URL).toBeUndefined();
       // Configuration only: a registration's Runtime must run in a cell of its own tenant.
       expect(variables.PORTAL_CELLS).toBeDefined();
     }
-    const read = functions.find((f) => f.Handler === "handler.handler")!.Environment!.Variables;
-    expect(read.PORTAL_JWT_ISSUER).toBeUndefined();
   });
 
   it("no decision route reaches the registrar function, and every write route is one of the known ones", () => {
