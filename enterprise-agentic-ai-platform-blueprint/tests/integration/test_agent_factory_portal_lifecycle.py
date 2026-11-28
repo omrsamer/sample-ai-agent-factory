@@ -204,7 +204,11 @@ def test_a_review_is_attested_by_an_approver_inside_the_date_window(session):
         assert status == 422, (bad, body)
     assert _call("POST", path, tokens["approver"], {"reason": "", "next_review_by": inside})[0] == 422
     before = _call("GET", f"/registrations/{record_id}", tokens["approver"])[1]
-    assert before["last_reviewed_at"] is None or before["status"] == "APPROVED"
+    # The registration names no review date. Its approval set one all the same, a year from the
+    # approval, so that an approved registration is always due at some point.
+    assert before["status"] == "APPROVED" and before["last_reviewed_at"], before
+    due = dt.date.fromisoformat(before["effective_review_by"])
+    assert dt.timedelta(days=365) <= due - TODAY <= dt.timedelta(days=367), before["effective_review_by"]
 
     status, result = _call(
         "POST", path, tokens["approver"], {"reason": f"Reviewed in the live run {MARKER}.", "next_review_by": inside}
@@ -269,6 +273,11 @@ def test_retirement_is_decided_by_an_approver_and_is_permanent(session):
     for action, (method, token, payload) in refused.items():
         status, body = _call(method, f"/registrations/{record_id}/{action}", token, payload)
         assert status == 409, (action, body)
+    # Asking again changes nothing in the history: a refusal of someone who has a part in the
+    # record is written once, so repeating it cannot push the record's decisions out of reach.
+    for _ in range(6):
+        method, token, payload = refused["approve"]
+        assert _call(method, f"/registrations/{record_id}/approve", token, payload)[0] == 409
     status, body = _call("PUT", f"/registrations/{record_id}", tokens["developer"], _document(f"live-{RUN}-review"))
     assert status == 409 and "RET-03-N" in json.dumps(body), body
     assert _call("GET", f"/registrations/{record_id}", tokens["approver"])[1]["status"] == "DEPRECATED"
@@ -279,6 +288,8 @@ def test_retirement_is_decided_by_an_approver_and_is_permanent(session):
     # before the record was read, is not.
     assert {("retire", "allowed"), ("retire", "unchanged"), ("approve", "denied")} <= outcomes, outcomes
     assert ("retire", "denied") not in outcomes, outcomes
+    refused_approvals = [e for e in history if e["phase"] == "result" and (e["action"], e["outcome"]) == ("approve", "denied")]
+    assert len(refused_approvals) == 1, f"seven refused approvals left {len(refused_approvals)} entries"
 
 
 def test_the_evidence_document_holds_the_decisions_and_no_secret(session):
@@ -331,6 +342,57 @@ def test_a_review_date_is_at_most_a_year_ahead_wherever_it_is_set(session):
     # An approval of a registration that names a review date counts as a review, with that date.
     assert detail["effective_review_by"] == near, detail
     assert detail["last_reviewed_at"] and MARKER in (detail["last_reviewed_by"] or ""), detail
+
+
+def test_a_record_has_one_latest_attestation_however_often_it_is_approved(session, platform_session):
+    """The review dates of the whole fleet are read from one place. It holds one entry for a
+    record, its latest attestation, so that approving one record again and again cannot push the
+    entries of other records out of that read."""
+    tokens = session["tokens"]
+    record_id = session["dated"]
+    stack = os.environ.get("PORTAL_STACK_NAME") or f"AgenticAI-AgentFactoryPortal-{os.environ.get('PORTAL_ENVIRONMENT', 'nonprod')}"
+    table = next(
+        resource["PhysicalResourceId"]
+        for page in platform_session.client("cloudformation", region_name=REGION)
+        .get_paginator("list_stack_resources")
+        .paginate(StackName=stack)
+        for resource in page["StackResourceSummaries"]
+        if resource["ResourceType"] == "AWS::DynamoDB::Table"
+    )
+    dynamodb = platform_session.client("dynamodb", region_name=REGION)
+
+    def latest() -> list[dict]:
+        items = dynamodb.query(
+            TableName=table,
+            KeyConditionExpression="pk = :pk AND begins_with(sk, :sk)",
+            ExpressionAttributeValues={":pk": {"S": "REVIEWS"}, ":sk": {"S": f"RECORD#{record_id}"}},
+            ConsistentRead=True,
+        )["Items"]
+        return [{name: next(iter(value.values())) for name, value in item.items()} for item in items]
+
+    first = latest()
+    assert len(first) == 1, first
+    # Change the record, submit it and approve it again, three times: a new attestation each time.
+    stamps = [first[0]["at"]]
+    for round_number in range(3):
+        nearer = (TODAY + dt.timedelta(days=150 - round_number)).isoformat()
+        document = _document(f"live-{RUN}-dated", review_by=nearer, business_purpose=f"Live validation record {MARKER}, round {round_number}.")
+        status, body = _call("PUT", f"/registrations/{record_id}", tokens["developer"], document)
+        assert status == 200, body
+        assert _call("POST", f"/registrations/{record_id}/submit", tokens["developer"])[0] == 200
+        detail = _call("GET", f"/registrations/{record_id}", tokens["approver"])[1]
+        status, body = _call(
+            "POST",
+            f"/registrations/{record_id}/approve",
+            tokens["approver"],
+            {"reason": "Approved again for the live lifecycle run.", "document_sha256": detail["document_sha256"]},
+        )
+        assert status == 200, body
+        now = latest()
+        assert len(now) == 1, f"round {round_number}: {len(now)} entries for one record"
+        assert now[0]["at"] > stamps[-1], "the entry was not replaced by the later attestation"
+        stamps.append(now[0]["at"])
+        assert _call("GET", f"/registrations/{record_id}", tokens["approver"])[1]["effective_review_by"] == nearer
 
 
 def test_one_attestation_a_day_and_never_by_the_person_who_submitted(session):

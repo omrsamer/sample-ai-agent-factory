@@ -761,6 +761,16 @@ def test_containment_finishes_in_the_background(live, platform_session):
         "agent_id": AGENT_ID,
         "request_id": result["request_id"],
     }
+    two_records = {
+        "Records": [
+            {"messageId": str(uuid.uuid4()), "receiptHandle": "forged", "body": json.dumps(message), "eventSource": "aws:sqs"}
+            for _ in range(2)
+        ]
+    }
+    response = functions.invoke(FunctionName=by_handler["sweep_handler.handler"], Payload=json.dumps(two_records).encode())
+    assert "FunctionError" not in response and json.loads(response["Payload"].read()) == {"handled": 0}, (
+        "an invocation with more than one record must run nothing"
+    )
     answers = {
         "not a sweep request": sweeper("portal live validation: not a sweep request"),
         "an extra field": sweeper({**message, "role_arn": f"arn:aws:iam::{CELL_ACCOUNT}:role/Admin"}),
@@ -772,6 +782,52 @@ def test_containment_finishes_in_the_background(live, platform_session):
     assert answers["the third sweep before it is due"] == "error", answers
     for name in ("not a sweep request", "an extra field", "a request id no contain has", "a replay of the sweep that ran"):
         assert answers[name] != "error", (name, answers)
+
+    # A release must find who holds the containment however much happens after the contain. So
+    # only what can change the holder is written where a release reads: the contain's intent and
+    # result. A contain asked for again, a sweep and a refused release are written beside it.
+    status, repeated = _contain(tokens["platform"], "Live validation: contain asked for again.")
+    assert status == 200 and repeated["outcome"] == "unchanged", repeated
+    for _ in range(3):
+        status, body = _release(tokens["security"])
+        assert status == 403 and "CON-03-N" in json.dumps(body), body
+    table = next(
+        resource["PhysicalResourceId"]
+        for page in platform_session.client("cloudformation", region_name=REGION)
+        .get_paginator("list_stack_resources")
+        .paginate(StackName=os.environ.get("PORTAL_STACK_NAME") or f"AgenticAI-AgentFactoryPortal-{ENVIRONMENT}")
+        for resource in page["StackResourceSummaries"]
+        if resource["ResourceType"] == "AWS::DynamoDB::Table"
+    )
+    dynamodb = platform_session.client("dynamodb", region_name=REGION)
+
+    def stored(prefix: str) -> list[dict]:
+        items = dynamodb.query(
+            TableName=table,
+            KeyConditionExpression="pk = :pk AND begins_with(sk, :prefix)",
+            ExpressionAttributeValues={":pk": {"S": f"CONTAINMENT#{RUNTIME_ARN}"}, ":prefix": {"S": prefix}},
+            ScanIndexForward=False,
+            Limit=100,
+            ConsistentRead=True,
+        )["Items"]
+        return [{name: next(iter(value.values())) for name, value in item.items()} for item in items]
+
+    deciding = stored("EVENT#")
+    mine = [e for e in deciding if e.get("request_id") == result["request_id"]]
+    assert sorted(e["phase"] for e in mine) == ["intent", "result"], mine
+    assert deciding[0]["request_id"] == result["request_id"], "something after the contain was written where a release reads"
+    beside = stored("OTHER#")
+    kinds = {(e.get("action"), e.get("outcome")) for e in beside}
+    assert ("sweep", "allowed") in kinds and ("contain", "unchanged") in kinds, kinds
+    # Refused releases of earlier containments in this run are in the same history: count the
+    # ones that came after this contain.
+    contained_at = max(e["at"] for e in mine)
+    refusals = [
+        e
+        for e in beside
+        if e.get("action") == "release" and e.get("outcome") == "denied" and e["at"] > contained_at and MARKER in e.get("actor_label", "")
+    ]
+    assert len(refusals) == 1, f"three refused releases by the same person left {len(refusals)} entries"
     print(
         f"sweeps: scheduled {scheduled}; sessions that started after the contain: {len(late)}; "
         f"sweep 2 found {sweep.get('sessions_found')}, stopped {sweep.get('sessions_stopped')}, "
@@ -824,6 +880,14 @@ def test_another_spelling_of_the_runtimes_arn_is_the_same_runtime(live):
             assert status in (200, 409, 422), (spelling, status, body)
         view = _view(tokens["security"])
         assert view["contained_by_me"] is True, "another spelling of the ARN changed who holds the containment"
+        if CELL_TENANT:
+            # A registration is refused the same spelling, so that no record names a Runtime the
+            # portal could not act on under the record's id.
+            document = {**_registration(CELL_TENANT, "spelling"), "runtime_arn": spellings[0]}
+            status, body = _call("POST", "/registrations", tokens["developer"], document)
+            if status == 201:
+                live["records"].append(body["registration"]["record_id"])
+            assert status == 422, body
     finally:
         status, released = _release(tokens["platform"])
         assert status == 200, released
@@ -987,7 +1051,9 @@ def _functions_by_handler(platform_session) -> tuple[object, dict[str, str]]:
     return functions, by_handler
 
 
-def _forged_event(route: str, path: str, parameters: dict, body: dict, token: str | None = None) -> dict:
+def _forged_event(
+    route: str, path: str, parameters: dict, body: dict | None, token: str | None = None, method: str = "POST"
+) -> dict:
     """What Amazon API Gateway hands a function once its authorizer has accepted a token, written
     by hand: the claims say the caller holds every authority."""
     now = int(time.time())
@@ -1008,7 +1074,7 @@ def _forged_event(route: str, path: str, parameters: dict, body: dict, token: st
         headers["authorization"] = f"Bearer {token}"
     return {
         "version": "2.0",
-        "routeKey": f"POST {route}",
+        "routeKey": f"{method} {route}",
         "rawPath": path,
         "rawQueryString": "",
         "headers": headers,
@@ -1017,16 +1083,16 @@ def _forged_event(route: str, path: str, parameters: dict, body: dict, token: st
             "apiId": "forged",
             "domainName": "forged.invalid",
             "domainPrefix": "forged",
-            "http": {"method": "POST", "path": path, "protocol": "HTTP/1.1", "sourceIp": "192.0.2.1", "userAgent": "forged"},
+            "http": {"method": method, "path": path, "protocol": "HTTP/1.1", "sourceIp": "192.0.2.1", "userAgent": "forged"},
             "requestId": f"forged-{uuid.uuid4()}",
-            "routeKey": f"POST {route}",
+            "routeKey": f"{method} {route}",
             "stage": "$default",
             "time": "01/Jan/2026:00:00:00 +0000",
             "timeEpoch": now * 1000,
             "authorizer": {"jwt": {"claims": claims, "scopes": None}},
         },
         "pathParameters": parameters,
-        "body": json.dumps(body),
+        **({"body": json.dumps(body)} if body is not None else {}),
         "isBase64Encoded": False,
     }
 
@@ -1110,6 +1176,20 @@ def test_a_function_invoked_directly_trusts_nothing_in_the_event(live, platform_
     assert status == 401, (status, body[:300])
     listed = _call("GET", "/registrations", tokens["platform"])[1]
     assert not [r for r in listed if f"forged-{RUN}" in json.dumps(r)], "a forged request created a registration"
+
+    # The read function: the claims in the event say platform, security and approver. Without a
+    # token it answers nothing; beside a developer's real token it answers as the developer.
+    def read(path: str, token: str | None) -> tuple[int, str]:
+        proxy = path.removeprefix("/api/v1/")
+        return invoke("handler.handler", _forged_event("/api/v1/{proxy+}", path, {"proxy": proxy}, None, token, "GET"))
+
+    for path in ("/api/v1/users/me", f"/api/v1/agents/{AGENT_ID}/containment", "/api/v1/agents"):
+        status, body = read(path, None)
+        assert status == 401, (path, status, body[:200])
+    status, body = read("/api/v1/users/me", tokens["developer"])
+    assert status == 200, (status, body[:300])
+    me = json.loads(body)
+    assert me["portal_role"] == "developer" and not me.get("can_contain") and not me.get("can_release"), me
 
 
 def test_another_principal_cannot_assume_the_cells_containment_role():
