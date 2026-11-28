@@ -255,10 +255,13 @@ def test_register_submit_and_decide_with_separation_of_duties(session):
     )
     assert status == 409, body
 
-    # The audit trail shows the refused attempts as well as the decisions.
+    # The audit trail shows the decisions, and the refusals about a record that was resolved.
     history_a = _call("GET", f"/registrations/{record_a}/history", tokens["platform"])[1]["events"]
     outcomes_a = {(e["action"], e["outcome"]) for e in history_a if e["phase"] == "result"}
-    assert {("create", "allowed"), ("submit", "allowed"), ("approve", "denied"), ("reject", "allowed")} <= outcomes_a
+    assert {("create", "allowed"), ("submit", "allowed"), ("reject", "allowed")} <= outcomes_a
+    # The developer's approval attempt was refused before the record was read. That refusal is in
+    # the function's log, not here: a history must not be writable by someone with no authority.
+    assert ("approve", "denied") not in outcomes_a
     history_b = _call("GET", f"/registrations/{record_b}/history", tokens["platform"])[1]["events"]
     denied_b = [e for e in history_b if e["action"] == "approve" and e["outcome"] == "denied"]
     assert denied_b and "REG-11-N" in denied_b[0]["reason"]
