@@ -139,6 +139,20 @@ describe('reviewState', () => {
     expect(reviewState(record({}), NOW)).toMatchObject({ due: '2026-06-30', overdue: true, lastReviewedAt: null });
   });
 
+  it('shows the date an approval recorded for a document that names none, and the approver as the last reviewer', () => {
+    // Every approval records a review date: the document's own, or a year from the approval
+    // when it names none or a later one. The page reads it from the API and computes nothing.
+    const approved = { status: 'APPROVED', document: {} as never, effective_review_by: '2027-11-29', last_reviewed_at: '2026-11-28T13:00:00Z', last_reviewed_by: 'approver@example.com' };
+    expect(reviewState(approved, NOW)).toEqual({ due: '2027-11-29', overdue: false, lastReviewedAt: '2026-11-28T13:00:00Z', lastReviewedBy: 'approver@example.com' });
+    // The document section says what the document names, in the words of its other fields, and
+    // not that the registration has no review date: the date in force is the review card's.
+    expect(detailSrc).toContain("<Field label={FIELD_LABEL.reviewBy}>{d.reviewBy || 'Not set'}</Field>");
+    expect(detailSrc).not.toContain('No review date');
+    // The card's own empty words are for a registration that has no date on record at all.
+    expect(actionsSrc).toContain('{review.due || <span className="text-slate-600">No review date</span>}');
+    expect(actionsSrc).toContain('<span className="text-slate-600">Not reviewed yet</span>');
+  });
+
   it('is overdue only for an approved registration whose date has passed', () => {
     expect(reviewState(record({ effective_review_by: '2026-11-26' }), NOW).overdue).toBe(true);
     // Due today is not overdue yet.

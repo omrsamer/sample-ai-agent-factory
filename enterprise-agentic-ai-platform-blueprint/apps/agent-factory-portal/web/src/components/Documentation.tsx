@@ -113,8 +113,9 @@ export default function Documentation() {
               A registration is the governance record of an agent: who owns it, what it is for, its risk class and data
               classification, and the runtime, tool gateway and tools it uses. A registrar saves a draft and submits it; an
               approver who did not submit it approves or rejects it with a reason. Every action is kept in the record’s
-              history, and so is the refusal of a person who holds the authority and the record’s tenant. Any other refusal
-              is answered with a reference and kept in the service’s log.
+              history, and so is the refusal of a person who holds the authority and the record’s tenant: once, however
+              often the same request is repeated while the record stays as it is. Any other refusal is answered with a
+              reference and kept in the service’s log.
             </p>
             <p>
               Registering or approving a record deploys nothing. Deployment still happens only through the Workload pipeline
@@ -122,11 +123,11 @@ export default function Documentation() {
               data classification cannot be edited; a change to any of them needs a new registration.
             </p>
             <p>
-              An approved registration has a review date. An approver who did not submit the registration confirms the
+              A registration approved through the portal has a review date: the one it names, or a year from the
+              approval when it names none or a later one. An approver who did not submit the registration confirms the
               review with a reason and the date of the next one, at most 366 days ahead, and no more than once in 24
-              hours; the registration itself is not changed. Approving a registration that
-              names a review date counts as a review too. The agent’s page and its registration show when it was last
-              reviewed, by whom, and when the next review is due.
+              hours; the registration itself is not changed. Approving a registration counts as a review too. The
+              agent’s page and its registration show when it was last reviewed, by whom, and when the next review is due.
             </p>
             <p>
               An approver can retire a registration, with a reason. Retiring is permanent: the registration cannot be

@@ -86,8 +86,9 @@ build never ships a local configuration.
 The provider is chosen by `authProvider`, and only that provider's library is downloaded.
 
 - **Amazon Cognito** (`oidc-client-ts`): authorization code flow with PKCE against the hosted UI.
-  The ID token is sent to the API as the bearer token, because the API's JWT authorizer checks
-  the app client id as the audience. Sign-out goes to
+  The ID token is sent to the API as the bearer token, because the API checks the app client
+  id as the audience: at its gateway, and again in each of its functions, which verify the
+  token themselves. Sign-out goes to
   `<domain>/logout?client_id=…&logout_uri=…`. Groups from the `cognito:groups` claim are shown in
   the profile menu for reference; the API decides the role.
 - **Microsoft Entra ID** (MSAL): the access token for `entra.apiScope` is sent to the API.

@@ -23,9 +23,9 @@ export interface ContainmentView {
   enabled?: boolean;
   /**
    * A sentence to show with the state. Why it is unknown; or, with a known state, something the
-   * reader must know about it: a statement that carries the portal's identifier but does not
-   * deny invocation (the agent is not contained), or that who contained the agent could not be
-   * established.
+   * reader must know about it: a statement that carries the portal's identifier and is not the
+   * one the portal writes (the agent is not contained by the portal; that statement may or may
+   * not deny invocation), or that who contained the agent could not be established.
    */
   detail?: string | null;
   /**

@@ -25,6 +25,14 @@ every request the front end makes. The source of truth for the types is
   is also refused it reloads the page once; a further 401 is reported to the user as a sign-in
   configuration problem. An API must therefore answer 401 only for a missing, expired or
   invalid token, and 403 for a valid token that lacks permission.
+- **503 when the caller cannot be verified.** The API verifies the caller's token in its
+  functions as well as at its gateway. When the identity provider's signing keys cannot be
+  fetched, any endpoint answers 503 with a sentence in `detail` and nothing was read or done.
+  A page shows that sentence in its error state with Retry, like any failed read, and an
+  action shows it under "Nothing was changed". Two limits: the export (endpoint 37) and the
+  evidence document (endpoint 41) ask for a file, so their error body is not read and the
+  page names the status only; and if the read of `/users/me` fails when the app starts, the
+  session has no roles until the page is loaded again.
 - **Errors.** A non-2xx response should carry `{ "detail": string }` (type `ApiError`). `detail`
   may also be a list of `{ loc: (string | number)[], msg: string, type?: string }`. The text is
   shown to the user as is, so it must not contain a token, an ARN with an account id, or a
@@ -1022,7 +1030,7 @@ interface RegistrationDetail extends Registration {
   decided_at?: string | null;
   decision_reason?: string | null;
   previous_approved?: RegistrationDocument | null;   // the document at the latest approval made through the portal; null when there was none
-  last_reviewed_at?: string | null;    // "Last reviewed": the latest review, or approval that named a review date
+  last_reviewed_at?: string | null;    // "Last reviewed": the latest review or approval (every approval records a review date)
   last_reviewed_by?: string | null;
   effective_review_by?: string | null; // "Review due"; falls back to document.review_by
 }
@@ -1035,7 +1043,7 @@ interface RegistrationHistory {
     phase: 'intent' | 'result'; action: string; outcome: 'allowed' | 'denied' | 'failed' | 'unchanged';
     reason: string; actor_label: string; actor_role?: string | null;
     status_before?: string | null; status_after?: string | null;
-    next_review_by?: string | null;  // shown under the action of a review, and of an approval that recorded a review date
+    next_review_by?: string | null;  // shown under the action of a review and of an approval (every approval records a review date)
     attested_at?: string | null;     // not displayed
     detail?: string | null;          // not displayed
   }[];
@@ -1078,8 +1086,11 @@ interface ActionResult {
   newest entries are listed. Older entries exist and are not shown here.".
 - **Errors:** a 422 is a list of `{ loc, msg, type }` and is mapped to form fields by the name
   after `"body"` in `loc` (`risk_class`, or `golden_path` then `name`); an item that names no
-  form field is shown above the form; 403 is shown as "You do not hold the
-  authority for this action" with `detail`; 409 as a state conflict with `detail` and a Refresh
+  form field is shown above the form (for example `policy_engine_arn`, which the form carries
+  through unchanged and has no field for, when it begins with another partition than its
+  cell's; the same refusal for `runtime_arn` or `gateway_arn` is shown at that field); 403 is
+  shown as "You do not hold the authority for this action" with `detail`; 409 as a state
+  conflict with `detail` and a Refresh
   button (this also covers the second or so a record spends in `CREATING` or `UPDATING`); 503
   as "Nothing was changed", with an invitation to try again. `hint` and `request_id` are shown
   when present. `request_id` is shown as "Reference:" and nothing more: the API keeps a refusal
@@ -1106,6 +1117,10 @@ Read from `RegistrationDetail` (endpoint 25): `status`, `status_reason`, `effect
 
 - **Status wording.** `DEPRECATED` is shown as "Retired" everywhere (registration status,
   agent `lifecycle_state: "deprecated"`, filters, history). The word "Deprecated" is not used.
+- **The document's own review date.** The "Governance document" section shows `document.review_by`
+  under "Review by", and "Not set" when the document names none. It does not say that the
+  registration has no review date: every approval records one, and the date in force is the
+  one under "Review due".
 - **Periodic review**, on an `APPROVED` registration: "Review due" (`effective_review_by`,
   else `document.review_by`), "Review overdue" when that date is before today in UTC, and "Last
   reviewed" (`last_reviewed_at` by `last_reviewed_by`, else "Not reviewed yet"). "Confirm
@@ -1134,7 +1149,12 @@ Read from `RegistrationDetail` (endpoint 25): `status`, `status_reason`, `effect
   still offered to a registrar.
 - **History** (endpoint 26): `retire` is labelled "Retire" and `review` "Confirm review". An
   event's `next_review_by` is shown under the action ("Next review by 2027-05-27"), for a
-  review and for an approval that recorded a review date.
+  review and for an approval. Every approval records a review date: the one the document
+  names, or the approval date plus 366 days when it names a later one or none. The page reads
+  the date from the API and does not compute it. A refusal of the same person by the same
+  rule is listed once while the record stays as it is, however often it was repeated, and so
+  is the `unchanged` result of a retirement asked for again; each answer still carries its
+  own `request_id`, which the page shows as the reference.
 - **One more read after an action.** What an action changes elsewhere on the agent (its risk
   and reasons, `obligations_closed`) is assessed by the API only once its cache of the agent
   has expired. After a review, a retirement, a contain or a release made on the agent page,
@@ -1228,10 +1248,10 @@ interface ContainmentResult {
   (a registration that names its runtime by another spelling of its ARN): the note about the
   cell not having given the portal the authority is kept for a state that was read.
 - **`detail` with a known state** is shown under the state, as sent: with `not_contained`, that
-  a statement carrying the portal's identifier is in the policy but does not deny invocation
-  (Contain is still offered, and replaces it); with `contained`, that who contained the agent
-  could not be established. In the second case the page does not also say that the agent was
-  contained by other means.
+  a statement carrying the portal's identifier is in the policy and is not the one the portal
+  writes, so it may or may not deny invocation (Contain is still offered, and replaces it);
+  with `contained`, that who contained the agent could not be established. In the second case
+  the page does not also say that the agent was contained by other means.
 - **Confirmation.** Before sending, the page names the agent with its tenant and account, lists
   what will happen ("New invocations of this agent are denied. An occasional call can still get
   through for about 90 seconds.", from the view's `enforcement_delay_seconds`; running sessions
@@ -1242,7 +1262,11 @@ interface ContainmentResult {
   no release delay the page uses 300 seconds, the measured value, and not the contain delay,
   which would promise a faster release than the service gives.
 - **State card.** A contained agent reads "Contained" and "Invocations of this agent are
-  denied. Nothing was deleted, and it can be released.".
+  denied. Nothing was deleted, and it can be released.". An agent that is not contained reads
+  "Not contained" and "Invocations of this agent are not denied by the portal.". That is what
+  the portal knows: its own statement is not in the policy. The page does not say that the
+  agent can be invoked, because a statement in another shape, or one written by other means,
+  may deny invocation.
 - **Delays in words.** A delay below two minutes is given in seconds and a longer one in
   minutes. After an action the headline uses the result's `enforcement_delay_seconds`:
   "Contained. Invocations are blocked within about 90 seconds." and "Released. Some calls can
@@ -1263,7 +1287,9 @@ interface ContainmentResult {
   errors, what was incomplete) only when the `sessions` step carries no `detail`.
 - **`outcome: "unchanged"`.** For a contain: "The agent was already contained. Its policy was
   not changed." It does not say that nothing happened, because a repeated contain still stops
-  the sessions it finds. For a release: "The agent was not contained. Nothing was changed."
+  the sessions it finds. For a release: "This agent was not contained by the portal. Nothing
+  was changed." The API's step under it says what it found, for example that a statement with
+  the portal's identifier is there in another shape.
   For the contain sent again by "Stop remaining sessions": "Sessions swept again.", followed
   by what did not complete when something did not.
 - **Background sweeps.** A contain can leave sweeps on a queue that run after the request, for
@@ -1289,22 +1315,36 @@ interface ContainmentResult {
   background sweep has still not reported 30 minutes after its contain, and none confirmed
   that no session is still running." A role that is not sent them is not told: the page would
   have to count from `contained_at`, and the sweeps of a later contain could still be due.
+- **Quiet, and then a sweep that failed or never reported.** `quiet_at` is the first time the
+  agent was known to be quiet (normally sweep 2) and the API keeps it for the whole
+  containment. The sweep after it is there for a session that started late. When the newest
+  sweep of the containment has outcome `failed`, or a sweep never reported, "No running
+  session since" would say more than is known, so a role that is sent the events reads
+  instead "A background sweep at <time> left no session running." and, under the sweeps,
+  "The newest background sweep did not complete. A session that started later may still be
+  running." or "A later background sweep has still not reported 30 minutes after its contain.
+  A session that started later may still be running." A role that is not sent the events
+  cannot tell and reads what `quiet_at` says.
 - **Stop remaining sessions.** The API's remedy for sessions that may be left is to contain
   again. The tab shows "Stop remaining sessions" to a caller with `can_contain`, on a
-  contained agent with `enabled` not false, when `quiet_at` is null and one of these holds:
-  `partial` is true; the newest sweep of this containment has outcome `failed`; every
-  scheduled sweep has run; or a sweep never reported (`sweeps.done` is still below
-  `sweeps.scheduled` 30 minutes after the newest contain of this containment that did its
-  work, which is when the API gives such a sweep up). That contain is the newest `contain`
-  result at or after `contained_at` with outcome `allowed` or `unchanged` and session counts;
-  a contain that was answered at once carries no counts and does not move the time. Without
-  such an event the time is counted from `contained_at`. The page's clock is read when the
-  tab opens, at every re-read, when a confirmation opens and after an action; it is the
-  browser's clock, so a clock that is behind shows the button later. It is also offered right
-  after a contain on this page whose `background` step failed, which the view does not show
-  afterwards. It sends endpoint 34 with a reason, through a confirmation that says the agent
-  stays contained, that its policy is not changed, and that who may release it does not
-  change. It is shown to the person who contained the agent as well.
+  contained agent with `enabled` not false, in four cases. Two hold whatever `quiet_at`
+  says: the newest sweep of this containment has outcome `failed`; or a sweep never reported
+  (`sweeps.done` is still below `sweeps.scheduled` 30 minutes after the newest contain of
+  this containment that did its work, which is when the API gives such a sweep up). Two hold
+  only while `quiet_at` is null: `partial` is true; or at least one sweep was scheduled and
+  every scheduled sweep has run. The contain that the 30 minutes are counted from is the
+  newest `contain` result at or after `contained_at` with outcome `allowed` or `unchanged`
+  and session counts; a contain that was answered at once carries no counts and does not
+  move the time. Without such an event the time is counted from `contained_at`. The page's
+  clock is read when the tab opens, at every re-read, when a confirmation opens and after an
+  action; it is the browser's clock, so a clock that is behind shows the button later. It is
+  also offered right after a contain on this page whose `background` step failed. The view
+  does not show that afterwards (`partial` is about sessions only, and `sweeps.scheduled` is
+  0 as in a portal without a sweep queue), so after a reload, or to another person, the
+  button is not offered for that reason. It sends endpoint 34 with a reason, through a
+  confirmation that says the agent stays contained, that its policy is not changed, and that
+  who may release it does not change. It is shown to the person who contained the agent as
+  well.
 - **The button does not wait for the sweeps.** Whether `sweeps.done` is below
   `sweeps.scheduled` does not disable it: a sweep that was lost never reports, and the counts
   then stay "1 of 2 done" for good. The page does not guard against a contain that comes too

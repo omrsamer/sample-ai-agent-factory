@@ -21,7 +21,10 @@ export const STATE_VIEW: Record<ContainmentState, { heading: string; body: strin
     body: 'Invocations of this agent are denied. Nothing was deleted, and it can be released.',
     cls: 'border-red-300 bg-red-50',
   },
-  not_contained: { heading: 'Not contained', body: 'This agent can be invoked.', cls: 'border-slate-200 bg-white' },
+  // What the portal knows, and no more: its own statement is not in the policy. It does not say
+  // that the agent can be invoked. A statement with the portal's identifier in another shape,
+  // or one written by other means, may deny invocation, and the API says so in `detail`.
+  not_contained: { heading: 'Not contained', body: 'Invocations of this agent are not denied by the portal.', cls: 'border-slate-200 bg-white' },
   unknown: {
     heading: 'Containment state unknown',
     body: 'The runtime’s resource policy could not be read.',
@@ -50,8 +53,8 @@ export function stateCard(
   const state = containmentState(view);
   const detail = view.detail?.trim();
   // With a known state the API's sentence is something to know about it, shown as sent: a
-  // statement with the portal's identifier that does not deny invocation, or a holder that
-  // could not be established.
+  // statement with the portal's identifier that is not the one the portal writes (it may or may
+  // not deny invocation), or a holder that could not be established.
   if (state !== 'unknown') return { ...STATE_VIEW[state], note: detail || null };
   if (hasNoRuntime(view)) {
     return { heading: 'No runtime to contain', body: detail || 'This agent has no runtime.', cls: STATE_VIEW.unknown.cls, note: null };
@@ -174,8 +177,18 @@ export const SWEEP_POLL_SECONDS = 20;
 export const SWEEP_POLL_LIMIT = 120;
 
 export interface SessionsStatus {
-  /** Set once a complete sweep has run. It is the later and stronger statement, so it replaces the partial warning. */
+  /**
+   * Set once a complete sweep has run and nothing later takes its certainty away. It is the later
+   * and stronger statement, so it replaces the partial warning.
+   */
   quiet: string | null;
+  /**
+   * Said in its place when a later sweep failed or never reported: what that complete sweep
+   * found at the time, and no more. The API keeps `quiet_at` for the whole containment.
+   */
+  quietOnce: string | null;
+  /** What came after that complete sweep: the newest sweep failed, or one never reported. Null otherwise. */
+  later: 'failed' | 'overdue' | null;
   /** The contain request did not stop every session it found, and no sweep has since confirmed that none is running. */
   partial: boolean;
   /** For example "Background sweeps: 1 of 2 done." Null when none was scheduled. */
@@ -192,19 +205,30 @@ export interface SessionsStatus {
  * to say here.
  */
 export function sessionsStatus(view: SessionFacts | null | undefined, formatTime: (iso: string) => string, nowMs = 0): SessionsStatus {
-  if (!view || containmentState(view) !== 'contained') return { quiet: null, partial: false, sweeps: null, unconfirmed: false, overdue: false };
+  if (!view || containmentState(view) !== 'contained') {
+    return { quiet: null, quietOnce: null, later: null, partial: false, sweeps: null, unconfirmed: false, overdue: false };
+  }
   const { scheduled, done } = sweepCounts(view);
   const quietAt = (view.quiet_at ?? '').trim();
+  // Said only on the evidence of the contain's own event: without it the page counts from when
+  // the containment began, and a later contain's sweeps could still be due.
+  const overdue = !!lastWorkingContain(view) && sweepsOverdue(view, nowMs);
+  // `quiet_at` is the first time the agent was known to be quiet and stays set. A sweep that
+  // failed after it, or one that never reported, was there to catch a session that started
+  // late: "no running session since" would then say more than is known. Only a role that is
+  // sent the events can tell.
+  const later = !quietAt ? null : lastSweepFailed(view) ? 'failed' : overdue ? 'overdue' : null;
   return {
-    quiet: quietAt
-      ? `No running session since ${formatTime(quietAt)}. Every session the portal could find has ended or was stopped.`
-      : null,
+    quiet:
+      quietAt && !later
+        ? `No running session since ${formatTime(quietAt)}. Every session the portal could find has ended or was stopped.`
+        : null,
+    quietOnce: quietAt && later ? `A background sweep at ${formatTime(quietAt)} left no session running.` : null,
+    later,
     partial: !quietAt && view.partial === true,
     sweeps: scheduled > 0 ? `Background sweeps: ${done} of ${scheduled} done.` : null,
     unconfirmed: !quietAt && scheduled > 0 && done >= scheduled,
-    // Said only on the evidence of the contain's own event: without it the page counts from when
-    // the containment began, and a later contain's sweeps could still be due.
-    overdue: !quietAt && !!lastWorkingContain(view) && sweepsOverdue(view, nowMs),
+    overdue: !quietAt && overdue,
   };
 }
 
@@ -258,6 +282,10 @@ function lastWorkingContainAt(view: Partial<Pick<ContainmentView, 'contained_at'
 /** Said in the state card when a sweep never reported: why the remedy is offered for a containment that was not partial. */
 export const SWEEPS_OVERDUE_NOTE = `A background sweep has still not reported ${SWEEPS_GIVEN_UP_SECONDS / 60} minutes after its contain, and none confirmed that no session is still running.`;
 
+/** The same two facts when an earlier sweep did leave no session running: what came later, and what it can mean. */
+export const SWEEP_FAILED_LATER_NOTE = 'The newest background sweep did not complete. A session that started later may still be running.';
+export const SWEEPS_OVERDUE_LATER_NOTE = `A later background sweep has still not reported ${SWEEPS_GIVEN_UP_SECONDS / 60} minutes after its contain. A session that started later may still be running.`;
+
 /**
  * True when a sweep of this containment has not reported long after it was due: it was lost,
  * or its run was cut short, and it never will. The counts then stay "1 of 2 done" for good.
@@ -286,15 +314,21 @@ export function repeatMayComeTooSoon(
 }
 
 /**
- * True when sessions of a contained agent may still be running: the contain request was
- * partial, the newest sweep failed, every sweep ran without confirming quiet, or a sweep never
- * reported. Once a sweep has confirmed quiet none of that matters. The API's remedy is to
- * contain the agent again, which leaves the policy alone and sweeps the sessions once more.
+ * True when sessions of a contained agent may still be running. The API's remedy is to contain
+ * the agent again, which leaves the policy alone and sweeps the sessions once more.
+ *
+ * Two reasons hold whatever `quiet_at` says: the newest sweep failed, or a sweep never
+ * reported. `quiet_at` is set by the first complete sweep and stays set; the sweep after it is
+ * there for a session that started late, so its failure or its silence is news. The other two
+ * reasons (the contain request was partial, every sweep ran) are settled once a sweep has
+ * confirmed quiet.
  */
 export function sessionsMayRemain(view: SessionFacts | null | undefined, nowMs = 0): boolean {
-  if (!view || containmentState(view) !== 'contained' || (view.quiet_at ?? '').trim()) return false;
+  if (!view || containmentState(view) !== 'contained') return false;
+  if (lastSweepFailed(view) || sweepsOverdue(view, nowMs)) return true;
+  if ((view.quiet_at ?? '').trim()) return false;
   const { scheduled, done } = sweepCounts(view);
-  return view.partial === true || lastSweepFailed(view) || (scheduled > 0 && done >= scheduled) || sweepsOverdue(view, nowMs);
+  return view.partial === true || (scheduled > 0 && done >= scheduled);
 }
 
 export interface SweepLine {
@@ -528,7 +562,9 @@ export function resultHeadline(action: string, result: ContainmentResult, repeat
   }
   const incomplete = contain ? incompleteWords(result) : '';
   if (result.outcome === 'unchanged') {
-    if (!contain) return 'The agent was not contained. Nothing was changed.';
+    // The portal's statement was not there to remove. Another statement may still deny
+    // invocation; the API's step says so when it found one, and the headline claims no more.
+    if (!contain) return 'This agent was not contained by the portal. Nothing was changed.';
     // Contained a moment ago: the API answered at once and did nothing. The step says when it will.
     if (retryAfterSeconds(result) > 0) return 'The agent was already contained. Nothing more was done.';
     // The sessions were swept again when the answer carries a session result.

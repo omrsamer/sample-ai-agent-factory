@@ -32,5 +32,10 @@ describe('operatingRules', () => {
 
   it('is what the Documentation page lists, by the feature flag', () => {
     expect(docsSrc).toContain('{operatingRules(governedActions).map((rule) => (');
+    // Every approval records a review date, so the page does not say that only some approvals count as a review.
+    expect(docsSrc).toContain('A registration approved through the portal has a review date: the one it names, or a year from the');
+    expect(docsSrc).toContain('approval when it names none or a later one.');
+    expect(docsSrc).toContain('Approving a registration counts as a review too.');
+    expect(docsSrc).not.toContain('names a review date counts as a review');
   });
 });

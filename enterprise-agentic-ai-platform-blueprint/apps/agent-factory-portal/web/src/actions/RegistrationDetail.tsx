@@ -42,7 +42,8 @@ function DocumentView({ record }: { record: RegistrationRecord }) {
       <Field label={FIELD_LABEL.environment}>{plain(d.environment)}</Field>
       <Field label={FIELD_LABEL.ownerGroup}><span className="break-words">{plain(d.ownerGroup)}</span></Field>
       <Field label={FIELD_LABEL.sponsor}><span className="break-words">{d.sponsor || 'None recorded'}</span></Field>
-      <Field label={FIELD_LABEL.reviewBy}>{d.reviewBy || 'No review date'}</Field>
+      {/* What the document names. Every approval records a review date (the document's, or a year from the approval when it names none or a later one), so "no review date" would be untrue of an approved registration: the date in force is under "Periodic review". */}
+      <Field label={FIELD_LABEL.reviewBy}>{d.reviewBy || 'Not set'}</Field>
       <Field label={FIELD_LABEL.contact}><span className="break-all">{plain(d.contact)}</span></Field>
       <Field label={FIELD_LABEL.costCentre}>{plain(d.costCentre)}</Field>
       <Field label={FIELD_LABEL.riskClass}>{plain(d.riskClass)}</Field>

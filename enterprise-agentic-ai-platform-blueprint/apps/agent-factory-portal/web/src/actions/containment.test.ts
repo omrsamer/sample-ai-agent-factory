@@ -13,7 +13,9 @@ import {
   REPEAT_AFTER_SECONDS,
   REPEAT_TOO_SOON_CAVEAT,
   SAME_PERSON_NOTE,
+  SWEEPS_OVERDUE_LATER_NOTE,
   SWEEPS_OVERDUE_NOTE,
+  SWEEP_FAILED_LATER_NOTE,
   SWEEP_POLL_LIMIT,
   SWEEP_POLL_SECONDS,
   UNKNOWN_STATE_NOTE,
@@ -248,6 +250,64 @@ describe('offeredContainment', () => {
       expect(tabSrc).toContain('{sessions.overdue && <p className="mt-2 text-sm font-medium text-amber-900">{SWEEPS_OVERDUE_NOTE}</p>}');
     });
 
+    it('offers it after a sweep confirmed quiet, when a later sweep failed or never reported', () => {
+      // `quiet_at` is set by the first complete sweep, normally sweep 2, and stays set. Sweep 3 is
+      // there for a session that started late: if it fails or is lost, containing again is the way on.
+      const began = '2026-11-28T01:00:00.000000Z';
+      const at = (minutes: number) => Date.parse(began) + minutes * 60_000;
+      const event = (over: Partial<AuditEvent>): AuditEvent => ({
+        event_id: 'e', request_id: 'r1', at: began, phase: 'result', action: 'contain', outcome: 'allowed', reason: '', actor_label: 'sam@example.com', ...over,
+      });
+      const contain = event({ event_id: 'c1', sessions_found: 2 });
+      const sweep2 = event({ event_id: 's2', action: 'sweep', sweep: 2, at: '2026-11-28T01:02:05.000000Z', sessions_found: 0 });
+      const sweep3failed = event({ event_id: 's3', action: 'sweep', sweep: 3, outcome: 'failed', at: '2026-11-28T01:15:10.000000Z', sessions_found: 3, sessions_failed: 1 });
+      const quiet = { state: 'contained', partial: false, quiet_at: '2026-11-28T01:02:05.000000Z', contained_at: began };
+
+      // Quiet, and the last sweep still to come or complete: nothing to offer.
+      expect(offeredContainment({ ...quiet, sweeps: { scheduled: 2, done: 1 }, events: [sweep2, contain] }, both, at(10)).repeat).toBe(false);
+      const sweep3 = event({ event_id: 's3', action: 'sweep', sweep: 3, at: '2026-11-28T01:15:10.000000Z', sessions_found: 0 });
+      expect(offeredContainment({ ...quiet, sweeps: { scheduled: 2, done: 2 }, events: [sweep3, sweep2, contain] }, both, at(40)).repeat).toBe(false);
+
+      // The newest sweep failed after it.
+      const failed = { ...quiet, sweeps: { scheduled: 2, done: 2 }, events: [sweep3failed, sweep2, contain] };
+      expect(sessionsMayRemain(failed, at(16))).toBe(true);
+      expect(offeredContainment(failed, both, at(16))).toMatchObject({ repeat: true, release: true });
+      expect(offeredContainment(failed, neither, at(16)).repeat).toBe(false);
+
+      // The last sweep never reported: given up half an hour after its contain.
+      const lost = { ...quiet, sweeps: { scheduled: 2, done: 1 }, events: [sweep2, contain] };
+      expect(offeredContainment(lost, both, at(29)).repeat).toBe(false);
+      expect(offeredContainment(lost, both, at(30)).repeat).toBe(true);
+
+      // What the state card then says: what the complete sweep found at the time, and what came later.
+      const time = (iso: string) => `<${iso}>`;
+      expect(sessionsStatus(failed, time, at(16))).toEqual({
+        quiet: null,
+        quietOnce: 'A background sweep at <2026-11-28T01:02:05.000000Z> left no session running.',
+        later: 'failed',
+        partial: false,
+        sweeps: 'Background sweeps: 2 of 2 done.',
+        unconfirmed: false,
+        overdue: false,
+      });
+      expect(sessionsStatus(lost, time, at(29))).toMatchObject({ quiet: 'No running session since <2026-11-28T01:02:05.000000Z>. Every session the portal could find has ended or was stopped.', quietOnce: null, later: null });
+      expect(sessionsStatus(lost, time, at(30))).toMatchObject({ quiet: null, quietOnce: 'A background sweep at <2026-11-28T01:02:05.000000Z> left no session running.', later: 'overdue', overdue: false, unconfirmed: false });
+      expect(SWEEP_FAILED_LATER_NOTE).toBe('The newest background sweep did not complete. A session that started later may still be running.');
+      expect(SWEEPS_OVERDUE_LATER_NOTE).toBe('A later background sweep has still not reported 30 minutes after its contain. A session that started later may still be running.');
+
+      // A failed sweep before the complete one is settled by it: sweep 1 failed, sweep 2 confirmed quiet.
+      const sweep1failed = event({ event_id: 's1', action: 'sweep', sweep: 1, outcome: 'failed', at: '2026-11-28T01:00:20.000000Z', sessions_found: 2, sessions_failed: 1 });
+      const settled = { ...quiet, partial: true, sweeps: { scheduled: 3, done: 2 }, events: [sweep2, sweep1failed, contain] };
+      expect(offeredContainment(settled, both, at(10)).repeat).toBe(false);
+      expect(sessionsStatus(settled, time, at(10))).toMatchObject({ quietOnce: null, later: null, partial: false });
+
+      // A role that is not sent the events reads what the API says and is offered nothing.
+      expect(sessionsStatus({ ...quiet, sweeps: { scheduled: 2, done: 1 } }, time, at(90))).toMatchObject({ quietOnce: null, later: null });
+      expect(tabSrc).toContain('{sessions.quietOnce && <p className="mt-2 text-sm text-slate-900">{sessions.quietOnce}</p>}');
+      expect(tabSrc).toContain("{sessions.later === 'failed' && <p className=\"mt-2 text-sm font-medium text-amber-900\">{SWEEP_FAILED_LATER_NOTE}</p>}");
+      expect(tabSrc).toContain("{sessions.later === 'overdue' && <p className=\"mt-2 text-sm font-medium text-amber-900\">{SWEEPS_OVERDUE_LATER_NOTE}</p>}");
+    });
+
     it('says in the confirmation when the contain can come too soon, and only then', () => {
       const began = '2026-11-28T01:00:00.000000Z';
       const at = (minutes: number) => Date.parse(began) + minutes * 60_000;
@@ -332,6 +392,8 @@ describe('background sweeps', () => {
   it('says how many sweeps have run', () => {
     expect(sessionsStatus(held({ sweeps: { scheduled: 2, done: 1 } }), at)).toEqual({
       quiet: null,
+      quietOnce: null,
+      later: null,
       partial: false,
       sweeps: 'Background sweeps: 1 of 2 done.',
       unconfirmed: false,
@@ -349,7 +411,7 @@ describe('background sweeps', () => {
   });
 
   it('keeps the partial warning until a sweep has confirmed that no session is running', () => {
-    expect(sessionsStatus(held({ partial: true }), at)).toEqual({ quiet: null, partial: true, sweeps: null, unconfirmed: false, overdue: false });
+    expect(sessionsStatus(held({ partial: true }), at)).toEqual({ quiet: null, quietOnce: null, later: null, partial: true, sweeps: null, unconfirmed: false, overdue: false });
     expect(sessionsStatus(held({ partial: true, sweeps: { scheduled: 3, done: 1 } }), at).partial).toBe(true);
     expect(sessionsStatus(held({ partial: true, quiet_at: '  ' }), at).partial).toBe(true);
   });
@@ -361,7 +423,7 @@ describe('background sweeps', () => {
   });
 
   it('says nothing about sessions for an agent that is not contained', () => {
-    const nothing = { quiet: null, partial: false, sweeps: null, unconfirmed: false, overdue: false };
+    const nothing = { quiet: null, quietOnce: null, later: null, partial: false, sweeps: null, unconfirmed: false, overdue: false };
     expect(sessionsStatus(held({ state: 'not_contained', partial: true, sweeps: { scheduled: 2, done: 2 }, quiet_at: 'x' }), at)).toEqual(nothing);
     expect(sessionsStatus(held({ state: 'unknown', partial: true }), at)).toEqual(nothing);
     expect(sessionsStatus(null, at)).toEqual(nothing);
@@ -514,13 +576,18 @@ describe('stateCard', () => {
       heading: 'Contained',
       body: 'Invocations of this agent are denied. Nothing was deleted, and it can be released.',
     });
-    expect(stateCard({ state: 'not_contained' })).toMatchObject({ heading: 'Not contained', body: 'This agent can be invoked.', note: null });
+    expect(stateCard({ state: 'not_contained' })).toMatchObject({ heading: 'Not contained', body: 'Invocations of this agent are not denied by the portal.', note: null });
   });
 
   it('adds what the API says about a state it knows, as sent', () => {
-    // A statement that carries the portal's identifier but does not deny invocation: not contained.
-    const decoy = 'A statement with the portal’s identifier is in the Runtime’s resource policy but does not deny invocation; contain the agent to replace it.';
-    expect(stateCard({ state: 'not_contained', detail: decoy })).toMatchObject({ heading: 'Not contained', body: 'This agent can be invoked.', note: decoy });
+    // A statement that carries the portal's identifier and is not the one the portal writes: not
+    // contained by the portal. It may or may not deny invocation, and the API's sentence says so.
+    const decoy = 'A statement with the portal’s identifier is in the Runtime’s resource policy, but it is not the statement the portal writes and may or may not deny invocation; contain the agent to replace it.';
+    const card = stateCard({ state: 'not_contained', detail: decoy });
+    expect(card).toMatchObject({ heading: 'Not contained', body: 'Invocations of this agent are not denied by the portal.', note: decoy });
+    // The page's own sentence must not say more than the API's: it never says that the agent can be invoked.
+    expect(`${card.heading} ${card.body}`).not.toMatch(/can be invoked/i);
+    expect(stateCard({ state: 'not_contained' }).body).not.toMatch(/can be invoked/i);
     const holder = 'Who contained the agent could not be established: the Runtime’s history holds more than 2000 events since its last contain or release.';
     expect(stateCard({ state: 'contained', detail: ` ${holder} ` })).toMatchObject({ heading: 'Contained', note: holder });
     expect(stateCard({ state: 'contained', detail: ' ' }).note).toBeNull();
@@ -672,7 +739,7 @@ describe('partial results', () => {
       'The agent was already contained, and its policy was not changed. Not every running session was stopped.',
     );
     expect(resultHeadline('release', { ...contained(), action: 'release', outcome: 'unchanged', state: 'not_contained', sessions: null, steps: [] })).toBe(
-      'The agent was not contained. Nothing was changed.',
+      'This agent was not contained by the portal. Nothing was changed.',
     );
   });
 

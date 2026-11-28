@@ -17,8 +17,10 @@ import {
   PARTIAL_NOTE,
   REPEAT_TOO_SOON_CAVEAT,
   SAME_PERSON_NOTE,
+  SWEEPS_OVERDUE_LATER_NOTE,
   SWEEPS_OVERDUE_NOTE,
   SWEEPS_UNCONFIRMED_NOTE,
+  SWEEP_FAILED_LATER_NOTE,
   SWEEP_POLL_LIMIT,
   SWEEP_POLL_SECONDS,
   containEffects,
@@ -295,7 +297,7 @@ export default function ContainmentTab({
       <section aria-labelledby="containment-state" className={`rounded-xl border p-5 ${stateView.cls}`}>
         <h2 id="containment-state" className="text-base font-semibold text-slate-900">{stateView.heading}</h2>
         <p className="text-sm text-slate-800 mt-1">{stateView.body}</p>
-        {/* What the API says about a state it knows, for example a statement that does not deny invocation. */}
+        {/* What the API says about a state it knows, for example a statement with the portal's identifier that is not the one the portal writes. */}
         {stateView.note && <p className="mt-2 text-sm font-medium text-amber-900">{stateView.note}</p>}
         {state === 'contained' && !view.contained_by_label && !view.contained_at && !stateView.note && (
           <p className="mt-2 text-sm text-slate-800">{OTHER_MEANS_NOTE}</p>
@@ -305,6 +307,7 @@ export default function ContainmentTab({
         )}
         {/* The sessions of a contained agent: part of the state, so every role reads it. */}
         {sessions.quiet && <p className="mt-2 text-sm font-medium text-slate-900">{sessions.quiet}</p>}
+        {sessions.quietOnce && <p className="mt-2 text-sm text-slate-900">{sessions.quietOnce}</p>}
         {sessions.partial && <p className="mt-2 text-sm font-medium text-amber-900">{PARTIAL_NOTE}</p>}
         {sessions.sweeps && (
           <p className="mt-2 text-sm text-slate-800">
@@ -324,6 +327,8 @@ export default function ContainmentTab({
         )}
         {sessions.unconfirmed && <p className="mt-2 text-sm font-medium text-amber-900">{SWEEPS_UNCONFIRMED_NOTE}</p>}
         {sessions.overdue && <p className="mt-2 text-sm font-medium text-amber-900">{SWEEPS_OVERDUE_NOTE}</p>}
+        {sessions.later === 'failed' && <p className="mt-2 text-sm font-medium text-amber-900">{SWEEP_FAILED_LATER_NOTE}</p>}
+        {sessions.later === 'overdue' && <p className="mt-2 text-sm font-medium text-amber-900">{SWEEPS_OVERDUE_LATER_NOTE}</p>}
         {state === 'contained' && incident && (view.contained_by_label || view.contained_at) && (
           <dl className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-x-8 gap-y-3 text-sm">
             <div>
