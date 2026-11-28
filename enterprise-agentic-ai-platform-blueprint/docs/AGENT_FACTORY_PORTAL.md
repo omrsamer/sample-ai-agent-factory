@@ -87,12 +87,13 @@ A signed-in user who belongs to no mapped group is refused.
 
 With governed actions on, roles also carry authorities, and tenants come from `agenticai/portalGroupTenantMap`:
 
-| Portal role | Registrar (create, change, submit, delete) | Approver (approve, reject) | Tenants |
+| Portal role | Registrar (create, change, submit, delete) | Approver (approve, reject, retire, attest a review) | Tenants |
 | --- | --- | --- | --- |
 | `platform` | yes | yes | every tenant |
 | `developer` | yes | no | tenants of the user's groups |
 | `approver`, `security` | no | yes | tenants of the user's groups |
-| `sre`, `finops`, `readonly` | no | no | none |
+| `sre` | no | no | tenants of the user's groups, used for containment only |
+| `finops`, `readonly` | no | no | none |
 
 With containment enabled for a cell:
 
@@ -180,9 +181,10 @@ What the opt-in adds, and what it never does:
 | Added | Guarantee |
 | --- | --- |
 | Registrar function, role `AgenticAI-RegistryRegistrar-<env>` | Creates, changes, submits and deletes agent records in the agent Registry. Cannot decide an approval and cannot touch the Platform Registry. |
-| Approver function, role `AgenticAI-RegistryApprover-<env>` | Approves or rejects a submitted record. Cannot create or change one. The person who submitted a record cannot decide it, whatever their role. |
-| Audit trail (DynamoDB, point-in-time recovery) | Every decision, allowed or refused, with who and why. The functions can append; none can change or delete an entry. |
-| Rules of the registration core | An approved record cannot have its runtime, gateway, tool subscriptions, risk class or data classification changed; that needs a new registration. Any other change returns the record to draft for a new review. |
+| Approver function, role `AgenticAI-RegistryApprover-<env>` | Approves or rejects a submitted record, confirms a periodic review and retires a registration. Cannot create or change one. The person who submitted a record cannot decide it, whatever their role. |
+| Audit trail (DynamoDB, point-in-time recovery) | Every decision about a record, allowed or refused, with who and why. The functions can append; none can change or delete an entry. A caller who lacks the authority, or does not hold the record's tenant, is refused and leaves nothing in a history: that refusal is in the function's log with its request id. So nobody writes into the history of a record they have no part in, and each function's role can write only its own kind of entry. Every rule identifies a person by the subject id of their token; the label recorded beside it (a verified or directory-set email or user name) is for reading. |
+| Rules of the registration core | An approved record cannot have its runtime, gateway, tool subscriptions, risk class or data classification changed; that needs a new registration. Any other change returns the record to draft for a new review. A registration cannot name a Runtime, Gateway or policy engine that runs in a cell of another tenant; where several tenants share an account and Region, only someone who holds all of them can register or approve a resource there, because an ARN does not say whose it is. A review date is at most 366 days ahead. |
+| Token verification | The registrar, approver and containment functions verify the caller's token themselves (signature, issuer, audience, expiry), so an event handed to a function directly carries no weight. |
 
 Where SCP-11 is attached, add the approver role to the protected authority manifest (purpose: registry), or its status decisions are denied by the organization.
 
@@ -236,6 +238,30 @@ Running sessions are found through the names of the Runtime's session log stream
 
 See "Incident containment" below for what it does and what it cannot do.
 
+#### Accounts shared by several tenants
+
+The reference model is one cell per account, and there the account itself says whose a Runtime is. When cells of several tenants are configured for one account and Region, the portal cannot tell from an ARN whose a Runtime is, so:
+
+- For containment, the Runtime's own `tenant-id` tag decides, and only when it names one of the tenants configured there. A Runtime with no such tag, or with a tag the portal's role in the cell cannot read, can be contained and released by the `platform` role only.
+- A registration that names a Runtime, Gateway or policy engine in that account can be created and approved only by someone who holds every tenant configured there.
+
+That makes the tag an authority. Whoever can change it decides which tenant's responders may act, so in a shared account reserve the tag key for the cell's pipeline. Attach this statement as a service control policy, or put it in the permissions boundary of every other role of the account:
+
+```json
+{
+  "Sid": "OnlyThePipelineSetsTheTenantOfARuntime",
+  "Effect": "Deny",
+  "Action": ["bedrock-agentcore:TagResource", "bedrock-agentcore:UntagResource"],
+  "Resource": "arn:aws:bedrock-agentcore:*:*:runtime/*",
+  "Condition": {
+    "ForAnyValue:StringEquals": { "aws:TagKeys": ["tenant-id"] },
+    "ArnNotLike": { "aws:PrincipalArn": "arn:aws:iam::*:role/<DEPLOYMENT_ROLE_OF_THE_CELL_PIPELINE>" }
+  }
+}
+```
+
+Checked on a live Runtime with the deny in a session policy: setting the key, removing it, and setting it together with another key are refused; other tag keys are not affected. The portal adds its own guard on top: if the tenant that decides is not the one an agent was contained under, only the `platform` role can release it.
+
 ### Hand-off to Amazon CloudWatch Omni (optional)
 
 Add `"omniDomainUrl": "https://<domain id>.cloudwatch-omni.global.app.aws"` and `"omniRegion": "<REGION>"` to a cell in `agenticai/portalCells`, and `"accountAlias": "<name>"` to show a name instead of an account id. The domain URL is the `domainEndpointUrl` of the account's Omni domain (`aws cloudwatchomni get-domain`).
@@ -258,7 +284,9 @@ The role `AgenticAI-ExternalInventoryReader-<env>` can list Runtimes with their 
 
 ### Upgrading
 
-A portal release can add a read to the cell reader role. Redeploy the `agent-factory-portal-fleet-reader` stage in every cell account when you upgrade the portal stage. Until a cell's reader is current, what the new read feeds is shown as unknown for that cell (for example the contained flag), never as a wrong value.
+A portal release can add a read to a cell's roles. Redeploy the `agent-factory-portal-fleet-reader` stage in every cell account when you upgrade the portal stage, and the `agent-factory-portal-containment` stage in every cell that deployed it. Until a cell's reader is current, what the new read feeds is shown as unknown for that cell (for example the contained flag), never as a wrong value; until its containment role can read a Runtime's tags, a Runtime in an account shared by several tenants can be contained by the `platform` role only.
+
+The portal's functions assume a cell's roles under the session names `portal-reader`, `portal-containment` and `portal-sweeper`. A cell that restricts the session name in a role's trust policy must allow them.
 
 ### Context reference
 
@@ -277,6 +305,7 @@ A portal release can add a read to the cell reader role. Redeploy the `agent-fac
 | `agenticai/portalModelAllowlist`, `agenticai/portalGuardrailTag` | portal | Catalog inputs |
 | `agenticai/portalApiCodePath`, `agenticai/portalWebDistPath` | portal | Override the bundle locations |
 | `agenticai/portalLogsKeyArn`, `agenticai/portalEdgeLogsKeyArn` | portal, edge | Operator-provisioned customer managed key for the log groups (optional). The stacks never create or tag a key. |
+| `agenticai/portalAlarmTopicArn` | portal | Operator-provisioned Amazon SNS topic that is told when a background containment sweep could not be processed (optional). The stack creates no topic. |
 | `agenticai/portalGovernedActions` | portal | `true` adds registration and approval (default: off, read-only) |
 | `agenticai/portalAgentRegistryId`, `agenticai/portalAgentRegistryArn` | portal | The agent Registry (outputs of the agent-registry stage); required with governed actions |
 | `agenticai/portalGroupTenantMap` | portal | Group or app-role name to the tenant ids its members may act for (JSON) |
@@ -324,6 +353,14 @@ The risk level (low, medium, high, critical) is not a score. A fixed table of ru
 
 The inventory can be downloaded as CSV or JSON (`GET /api/v1/agents/export`), one row per agent with its state, flags, risk level and reasons.
 
+## Life after approval
+
+An approval is not the end of an agent's governance. Three things follow it, all in the portal, none of which changes a cell.
+
+- **Periodic review.** A registration carries a review date. A person with the approver authority for the agent's tenant confirms a review and sets the next date (at most 366 days ahead). The person who submitted the registration cannot confirm its review, and a registration's review can be confirmed once a day. The confirmation is recorded in the audit trail and never touches the record, because a change to a record returns it to draft. An approval of a registration that names a review date counts as a review. An agent whose date has passed is flagged, and the flag raises its risk level.
+- **Retirement.** The same authority retires a registration with a reason. It is permanent: the record can no longer be approved, changed or submitted, and bringing the agent back needs a new registration. Retiring deploys and removes nothing. While the agent's Runtime is still detected, the agent is listed as retired and still deployed, at a high risk level, until its pipeline removes it. That is the follow-up the portal keeps visible.
+- **Evidence.** Every agent has one evidence document to download: what it is and where it runs, its registration as stored with its hash, every decision about it with who and why, its reviews, its containment history, its risk level with the reasons, the policy mode and policy hashes of its Tool Gateways, and its latest release. It holds no environment value, no secret and no full account id outside an ARN, and it says what it could not read. A document requested right after a decision is built from a fresh read of the inventory, so its sections do not contradict its own list of decisions. The incident record of a containment is included only for the roles that may read it.
+
 ## Incident containment
 
 Containing an agent denies every invocation of its Runtime and stops its running sessions. Releasing it lifts the denial. It is the portal's answer to "contain the principal" in README section 9.3, and the one place where the portal writes into a Workstream account.
@@ -338,19 +375,22 @@ Release removes exactly that statement and nothing else. Nothing is deleted from
 The rules:
 
 - Contain needs the `security`, `platform` or `sre` role; release needs `security` or `platform`. The caller must hold the agent's tenant.
-- The tenant is decided by where the Runtime runs, never by what a registration says. One tenant in the Runtime's account and Region: that tenant. An account shared by several: the tenant of the agent's registration, only when that registration is approved and names one of them. Otherwise only the `platform` role may act. A draft that names another tenant's Runtime gives nobody authority over it.
-- The person who contained an agent cannot release it. A second person must. No role bypasses this, and it holds whichever id a request uses: the history belongs to the Runtime.
-- A reason is required. Every action, every failure and every refusal about a Runtime is in that Runtime's history with who and why. A caller without the role is refused before anything is looked up; that refusal is in the function's log.
-- Both actions are safe to repeat. Containing a contained agent changes nothing, does not change who is on record as having contained it, and stops any session that is still running.
+- The tenant is decided by where the Runtime runs, never by what a registration says. One tenant in the Runtime's account and Region: that tenant. An account shared by several: the tenant in the Runtime's `tenant-id` tag, when it is one of them. Otherwise only the `platform` role may act. If the tenant that decides is no longer the one the agent was contained under, only the `platform` role may release it. See "Accounts shared by several tenants" under Deploy.
+- The person who contained an agent cannot release it. A second person must. No role bypasses this, and it holds whichever id or spelling of the Runtime's ARN a request uses: the portal builds the ARN itself, and the history belongs to that Runtime.
+- A reason is required. Every action and every failure about a Runtime is in its history with who and why, and so is a refusal of someone who holds its tenant, such as the person who contained it asking to release it. A caller without the role or without the tenant is refused and leaves nothing in the history; that refusal is in the function's log with its request id. People of one tenant cannot write into another tenant's history.
+- Both actions are safe to repeat. Containing a contained agent changes nothing and does not change who is on record as having contained it. While its background sweeps are still to run, a repeated contain answers at once; after that it stops any session that is still running and schedules the sweeps again.
+- The portal recognises its statement by its content, not by its name. A statement that carries the portal's identifier but does not deny invocation to every principal is reported as not contained, and the next contain replaces it.
 
 What to know before relying on it:
 
 - **Enforcement is not instant, and the two directions differ.** The service applies a resource policy change host by host. Measured on a live Runtime under steady calls: after a contain the first refusal came within seconds and an occasional invocation still succeeded for up to 52 seconds, none after that; after a release most calls were still refused in the first minute and some were still refused four minutes later. The portal therefore says "within about 90 seconds" for a contain and "about 5 minutes" for a release. Slow to reopen and fast to close is the safe direction, but plan a release with that delay in mind.
-- **Sessions are stopped best effort.** At most 1000 per action, most recent first, within the request's time budget. When a limit or the time budget cuts the work, the result is marked partial and says that more sessions may be running; containing again continues. A Runtime that neither emits spans nor writes output has no session the portal can find; invocation is still denied, including on a session that is still running, but work already in progress inside such a session is not interrupted. The result says how many sessions were found, stopped and missed, and from which source. A session that starts during the enforcement delay is not stopped by the action that was already taken: contain again a few minutes later when that matters.
-- **The policy change is not atomic.** The service offers no conditional write for a resource policy. If another tool rewrites the same policy at the same moment, the read-back fails and the action reports that it could not be verified.
+- **Sessions are stopped in two stages.** The action itself stops up to 1000 sessions, most recent first, within the request's time budget, and says so when a limit cut the work. Containment then finishes in the background: a sweep right away when the first one was cut short, a second two minutes later, which catches a session that started on a host that had not yet applied the deny, and a third after fifteen minutes. Each sweep is one entry in the agent's history with what it found and stopped, and the containment view says since when no session has been found running. Two alarms watch the sweeps: one when a sweep could not be processed twice and was set aside, one when sweeps have been waiting for more than an hour (`agenticai/portalAlarmTopicArn` names the topic to notify). Only the containment role can send, receive, delete or purge a message of the sweep queue, whatever another principal's own permissions are. The sweeper still treats every message as untrusted: it takes no role, account or Region from a message, it reads the Runtime's policy first, and its session in the cell can read a policy and stop a session but cannot write or delete a policy. So the most a message can cause is one more sweep of an agent the portal is containing at that moment. Every sweep asks the service to stop each session of the last eight hours, ended or not, because no API says which are live; on the validation Runtime that was about 430 calls in 22 seconds. A Runtime that writes no output has no session the portal can find; invocation is still denied, including on a session that is still running, but work already in progress inside such a session is not interrupted.
+- **The policy change is not atomic.** The service offers no conditional write for a resource policy. If another tool rewrites the same policy at the same moment, the read-back fails and the action reports that it could not be verified. A write that fails in a way that may still have been applied is recorded as unknown, so that the person who asked is on record and cannot release it alone.
+- **A decision reads a bounded part of the history.** A release reads back from the newest entry to the contain it is about, at most 2,000 entries, and is refused if it does not find it; an approval reads back to the latest submit in the same way. Only people with authority over the agent can add entries, a repeated contain adds one per person in fifteen minutes, and the sweeps of one contain add at most three, so the bound is reached only by sustained misuse from inside the agent's own tenant. The remedy is then in the cell: remove the portal's statement from the Runtime's resource policy there.
 - **It covers the Runtime.** An agent's Gateway, Memory and identities are not touched. Revoking a tool grant or a credential is a pipeline change.
-- **The permission boundary.** The portal's containment function can assume the role of the cells that granted it, read one record of the agent Registry and use the audit trail; nothing else. The cell's role can read, put and delete a Runtime's resource policy, stop a session, and list endpoints and session log stream names. It cannot invoke, update or delete a Runtime, read a log event or run a query (`tests/conformance/phase-29-portal-containment-and-inventory.test.ts`).
-- **What that boundary does not close.** IAM cannot restrict the content of a resource policy, so the permission that writes the deny statement could write any statement: whoever controls the containment function controls the invocation policy of every Runtime in the cells that opted in. And the functions trust the claims Amazon API Gateway passes after it has verified the token; a principal of the Platform account who may invoke a function directly can supply claims of its own. Treat the portal's functions, their roles and the permission to invoke them as protected authorities of the Platform account, and alarm in each cell on a `PutResourcePolicy` by the containment role whose statement is not the portal's. Verifying the token inside the action functions is on the roadmap.
+- **The permission boundary.** The role shared by the containment function and the sweeper can assume the role of the cells that granted it, read one record of the agent Registry, write and read containment histories in the audit trail (no other kind of entry), use the sweep queue and write its own two log groups; nothing else. The cell's role can read, put and delete a Runtime's resource policy, stop a session, list endpoints and session log stream names, and read a Runtime's tags. It cannot invoke, update or delete a Runtime, read its configuration, read a log event or run a query (`tests/conformance/phase-29-portal-containment-and-inventory.test.ts`). Contain and release have a request budget of their own, so traffic on the portal's other routes cannot throttle them.
+- **What that boundary does not close.** IAM cannot restrict the content of a resource policy, so the permission that writes the deny statement could write any statement: whoever controls the containment function controls the invocation policy of every Runtime in the cells that opted in. Treat the portal's functions, their code and their roles as protected authorities of the Platform account, and alarm in each cell on a `PutResourcePolicy` by the containment role whose statement is not the portal's, and on any by its `portal-sweeper` session (each function uses its own role session name in a cell's CloudTrail: `portal-reader`, `portal-containment`, `portal-sweeper`). A principal of the Platform account that may invoke Lambda functions can start the sweeper directly; it treats that event as it treats a queue message. A principal of a cell account that may write a Runtime's resource policy can remove the portal's statement; the portal then reports the agent as not contained. The two-person rule counts token subjects, so it is as strong as the identity provider's guarantee of one subject per person.
+- **The API endpoint.** The read API, which changes nothing, trusts the claims Amazon API Gateway passes after it has verified the token; the functions that decide verify the token themselves. The API endpoint is reachable from the internet and is protected by those checks and by request budgets, not by the web distribution's allow list. Measured: requests the authorizer refuses do not use up a budget (600 unauthenticated requests at about 100 per second were all answered 401), while one signed-in user can use up the budget the read routes share and make reads fail for everyone for as long as they keep it up; the access log names the subject.
 
 ## Hand-off to Amazon CloudWatch Omni
 
@@ -367,7 +407,7 @@ The portal also asks the Omni Context Graph which agents it observes in telemetr
 
 Release every contained agent first: deleting the portal does not lift a containment, and after the containment role is gone only the cell account itself can remove the statement (Sid `AgenticAIPortalContainment`) from a Runtime's resource policy.
 
-Delete the stacks in reverse order: portal, then in each cell the containment, external reader and fleet reader stacks, then edge. The two Registries hold the system of record and are removed last and deliberately, if at all: the agent Registry when its records are no longer needed, and the discovery Registry after turning auto-detection off and deleting its records (see "Organization-wide inventory"). The teardown script refuses both by name. Use `scripts/agent_factory_portal_teardown.py` for the portal stack: its access-log bucket keeps receiving log deliveries for a while after the stack has emptied it, so a plain stack delete can fail on that bucket, and the log groups of the stack's provider functions are not stack resources. The script captures what the stack owns before deleting, retries after emptying exactly those buckets, and removes exactly those log groups.
+Delete the stacks in reverse order: portal, then in each cell the containment, external reader and fleet reader stacks, then edge. The two Registries hold the system of record and are removed last and deliberately, if at all: the agent Registry when its records are no longer needed, and the discovery Registry after turning auto-detection off and deleting its records (see "Organization-wide inventory"). The teardown script refuses both by name. Use `scripts/agent_factory_portal_teardown.py` for the portal stack: its access-log bucket keeps receiving log deliveries for a while after the stack has emptied it, so a plain stack delete can fail on that bucket, and the log groups of the stack's provider functions are not stack resources. The script captures what the stack owns before deleting, retries after emptying exactly those buckets, and removes exactly those log groups. It also finishes a stack left in DELETE_FAILED by an event source mapping that is in fact gone, which an execution role rendered before this release can cause.
 
 ```bash
 python3 scripts/agent_factory_portal_teardown.py --stack-name AgenticAI-AgentFactoryPortal-<env> \
@@ -388,8 +428,8 @@ The portal follows the blueprint's rule: the support claim stops at the tested b
 | Milestone | Adds |
 | --- | --- |
 | Policy and access | Tool-level effective access per agent, policy change proposals as pull requests, a check before promoting a policy engine from logging to enforcing, release approval with the evidence beside it, tool subscription requests |
-| Lifecycle | Owner reassignment, periodic review, and retirement of an agent as governed actions |
-| Hardening | The action functions verify the token themselves; containment finishes in the background, with a second sweep after the enforcement delay; a record in the cell of every change the portal made there; reads scoped to the tenants a product team holds |
+| Lifecycle | Owner reassignment as a governed action; reminders before a review date |
+| Hardening | A record in the cell of every change the portal made there; reads scoped to the tenants a product team holds |
 | Security posture | Findings of the account's threat detection and posture services as inputs to the risk level |
 | FinOps and product metrics | Cost by allocation tag, budgets, tag coverage, and the platform product metrics of README section 7 |
 | Developer experience | Golden-path catalog with versions and support windows, onboarding intake that produces the descriptor and pull request, "my agents" with pipeline status |
