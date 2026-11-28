@@ -31,16 +31,21 @@ PORTAL_ROLES: tuple[str, ...] = (
     "platform",
 )
 
-_ACCOUNT_ID = re.compile(r"^\d{12}$")
-_REGION = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
-_ROLE_ARN = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512}$")
-_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
-_ALARM_PREFIX = re.compile(r"^[A-Za-z0-9_.\-/ ]{1,255}$")
-_PIPELINE_NAME = re.compile(r"^[A-Za-z0-9.@_-]{1,100}$")
-_HTTPS_URL = re.compile(r"^https://[A-Za-z0-9.-]{1,253}(:\d{1,5})?(/[A-Za-z0-9._~/-]{0,512})?$")
-_TABLE_NAME = re.compile(r"^[A-Za-z0-9_.-]{3,255}$")
-_TENANT = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_EXTERNAL_ID = re.compile(r"^[\w+=,.@:/-]{2,1224}$")
+# Every pattern is ASCII only and is applied with ``fullmatch``: ``\d`` and ``\w`` would also match
+# digits and letters of other scripts, and ``$`` would also match before a final line feed.
+_ACCOUNT_ID = re.compile(r"[0-9]{12}", re.ASCII)
+_REGION = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]", re.ASCII)
+_ROLE_ARN = re.compile(r"arn:aws[a-z-]{0,10}:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]{1,512}", re.ASCII)
+_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", re.ASCII)
+_ALARM_PREFIX = re.compile(r"[A-Za-z0-9_.\-/ ]{1,255}", re.ASCII)
+_PIPELINE_NAME = re.compile(r"[A-Za-z0-9.@_-]{1,100}", re.ASCII)
+_HTTPS_URL = re.compile(r"https://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]{0,512})?", re.ASCII)
+_TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}", re.ASCII)
+# An Amazon SQS queue URL, in the regional form the service returns.
+_QUEUE_URL = re.compile(r"https://sqs\.[a-z0-9-]{1,30}\.amazonaws\.com(\.cn)?/[0-9]{12}/[A-Za-z0-9_-]{1,80}", re.ASCII)
+_TENANT = re.compile(r"[a-z0-9][a-z0-9-]{0,62}", re.ASCII)
+_EXTERNAL_ID = re.compile(r"[A-Za-z0-9_+=,.@:/-]{2,1224}", re.ASCII)
+_MODEL_ID = re.compile(r"[A-Za-z0-9._:/-]{1,256}", re.ASCII)
 
 
 class ConfigError(Exception):
@@ -74,6 +79,16 @@ class Cell:
     @property
     def key(self) -> str:
         return f"{self.tenant_id}/{self.agent_id}/{self.environment}"
+
+    @property
+    def partition(self) -> str:
+        """The AWS partition of the cell's account, as the ARN of its role spells it.
+
+        The portal builds a Runtime's ARN from this, the cell's Region and the
+        cell's account (``portal_api/arns.py``), and never takes the partition
+        from a caller.
+        """
+        return (self.containment_role_arn or self.reader_role_arn).split(":", 2)[1]
 
     @property
     def scope(self) -> tuple[str, str, str, str | None]:
@@ -154,7 +169,7 @@ def _json(env: Mapping[str, str], name: str, *, required: bool = True, default: 
 
 
 def _match(pattern: re.Pattern[str], value: Any, label: str) -> str:
-    if not isinstance(value, str) or not pattern.match(value):
+    if not isinstance(value, str) or not pattern.fullmatch(value):
         raise ConfigError(f"{label} is missing or malformed")
     return value
 
@@ -163,6 +178,10 @@ def _optional(pattern: re.Pattern[str], value: Any, label: str) -> str | None:
     if value is None or value == "":
         return None
     return _match(pattern, value, label)
+
+
+def _partition(arn: str) -> str:
+    return arn.split(":", 2)[1]
 
 
 def _flag(value: Any, label: str) -> bool:
@@ -205,6 +224,8 @@ def _parse_cells(raw: Any) -> tuple[Cell, ...]:
         )
         if cell.containment_role_arn and f":{cell.account_id}:" not in cell.containment_role_arn:
             raise ConfigError(f"{label}.containmentRoleArn is not in the cell account")
+        if cell.containment_role_arn and _partition(cell.containment_role_arn) != _partition(cell.reader_role_arn):
+            raise ConfigError(f"{label}.containmentRoleArn is not in the partition of readerRoleArn")
         if cell.containment_spans and not cell.containment_role_arn:
             raise ConfigError(f"{label}.containmentSpans needs containmentRoleArn")
         if f":{cell.account_id}:" not in cell.reader_role_arn:
@@ -249,10 +270,10 @@ def _parse_models(raw: Any, default_regions: tuple[str, ...]) -> tuple[ModelEntr
         if not isinstance(item, dict):
             raise ConfigError(f"{label} must be a string or an object")
         model_id = item.get("modelId") or item.get("model_id")
-        if not isinstance(model_id, str) or not re.match(r"^[A-Za-z0-9._:/-]{1,256}$", model_id):
+        if not isinstance(model_id, str) or not _MODEL_ID.fullmatch(model_id):
             raise ConfigError(f"{label}.modelId is missing or malformed")
         regions = item.get("regions") or list(default_regions)
-        if not isinstance(regions, list) or not all(isinstance(r, str) and _REGION.match(r) for r in regions):
+        if not isinstance(regions, list) or not all(isinstance(r, str) and _REGION.fullmatch(r) for r in regions):
             raise ConfigError(f"{label}.regions is malformed")
         provider = item.get("provider") or provider_of(model_id)
         status = item.get("status") or "approved"
@@ -372,6 +393,11 @@ _CONFIG_KEYS = (
     "PORTAL_INACTIVE_DAYS",
     "PORTAL_GROUP_TENANT_MAP",
     "PORTAL_ACTION_ROLE",
+    "PORTAL_SWEEP_QUEUE_URL",
+    "PORTAL_JWT_ISSUER",
+    "PORTAL_JWT_AUDIENCE",
+    "PORTAL_JWT_TOKEN_USE",
+    "PORTAL_JWKS_URL",
 )
 _cached: tuple[tuple[str | None, ...], Settings] | None = None
 
@@ -394,14 +420,112 @@ def get_settings() -> Settings:
 ACTION_ROLES = ("registrar", "approver", "containment")
 ALL_TENANTS = "*"  # same marker as portal_api.authorities.ALL_TENANTS
 
+_COGNITO_ISSUER = re.compile(
+    r"https://cognito-idp\.[a-z0-9-]{1,30}\.amazonaws\.com(\.cn)?/[A-Za-z0-9-]{1,30}_[A-Za-z0-9]{1,60}", re.ASCII
+)
+_AUDIENCE = re.compile(r"[\x21-\x7e]{1,256}", re.ASCII)
+# The hosts a Microsoft Entra ID key set may be read from. Whoever signs with a key published at
+# the configured address is believed, so the address is not free: it must be the key set of the
+# issuer's own tenant on one of these hosts. A national cloud is added here, in this one place.
+ENTRA_KEY_HOSTS: tuple[str, ...] = ("login.microsoftonline.com",)
+_ENTRA_TENANT = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+# The two forms of an Entra issuer: of version 2.0 tokens, and of version 1.0 tokens.
+_ENTRA_ISSUER = re.compile(
+    rf"https://(?:login\.microsoftonline\.com/(?P<v2>{_ENTRA_TENANT})/v2\.0|sts\.windows\.net/(?P<v1>{_ENTRA_TENANT})/)",
+    re.ASCII,
+)
+_TOKEN_VARIABLES = ("PORTAL_JWT_ISSUER", "PORTAL_JWT_AUDIENCE", "PORTAL_JWT_TOKEN_USE", "PORTAL_JWKS_URL")
+_VERIFIES = "the action functions verify the caller's token themselves"
+
+
+@dataclass(frozen=True)
+class TokenSettings:
+    """What an action function needs to verify the caller's bearer token (``portal_api/identity/verify.py``)."""
+
+    provider: str  # cognito | entra
+    issuer: str  # compared exactly with the token's iss
+    audiences: tuple[str, ...]  # accepted app client ids or audiences
+    token_use: str  # id | access; Cognito only
+    jwks_url: str  # where the issuer publishes its signing keys
+
+
+def _parse_token_settings(env: Mapping[str, str], provider: str) -> TokenSettings | None:
+    """The token settings of an action function. Required, so a function without them answers 500.
+
+    The one exception is local development: with ``PORTAL_DEV_AUTH`` on (which
+    is impossible inside AWS Lambda) and none of the variables set, there is
+    nothing to verify against and the header-based identity is the only one.
+    """
+    if dev_auth_enabled(env) and not any((env.get(name) or "").strip() for name in _TOKEN_VARIABLES):
+        return None
+    issuer = (env.get("PORTAL_JWT_ISSUER") or "").strip()
+    if not issuer:
+        raise ConfigError(f"PORTAL_JWT_ISSUER is not set: {_VERIFIES} and need the token issuer")
+    if not _HTTPS_URL.fullmatch(issuer) or (provider == "cognito" and not _COGNITO_ISSUER.fullmatch(issuer)):
+        raise ConfigError("PORTAL_JWT_ISSUER is malformed: it must be the issuer exactly as it stands in the token")
+    entra = _ENTRA_ISSUER.fullmatch(issuer) if provider == "entra" else None
+    if provider == "entra" and entra is None:
+        raise ConfigError(
+            "PORTAL_JWT_ISSUER is malformed: for Microsoft Entra ID it must be "
+            "https://login.microsoftonline.com/<tenant id>/v2.0 or https://sts.windows.net/<tenant id>/"
+        )
+    if not (env.get("PORTAL_JWT_AUDIENCE") or "").strip():
+        raise ConfigError(f"PORTAL_JWT_AUDIENCE is not set: {_VERIFIES} and need the accepted audiences")
+    audiences = _json(env, "PORTAL_JWT_AUDIENCE")
+    if (
+        not isinstance(audiences, list)
+        or not 1 <= len(audiences) <= 20
+        or not all(isinstance(a, str) and _AUDIENCE.fullmatch(a) for a in audiences)
+    ):
+        raise ConfigError("PORTAL_JWT_AUDIENCE must be a JSON list of app client ids or audiences")
+    token_use = (env.get("PORTAL_JWT_TOKEN_USE") or "id").strip()
+    if token_use not in ("id", "access"):
+        raise ConfigError("PORTAL_JWT_TOKEN_USE must be id or access")
+    jwks_url = _key_set_address(provider, issuer, (env.get("PORTAL_JWKS_URL") or "").strip(), entra)
+    return TokenSettings(
+        provider=provider, issuer=issuer, audiences=tuple(audiences), token_use=token_use, jwks_url=jwks_url
+    )
+
+
+def _key_set_address(provider: str, issuer: str, configured: str, entra: re.Match[str] | None) -> str:
+    """Where the issuer's signing keys are read from. Never an address that is free to choose.
+
+    A token signed with a key published at this address is believed. A wrong
+    host here, by a slip or by design, would make whoever runs that host a
+    signer of portal tokens. So the address follows from the issuer:
+
+    - Amazon Cognito: always ``<issuer>/.well-known/jwks.json``.
+      ``PORTAL_JWKS_URL`` is not used; naming any other address is an error.
+    - Microsoft Entra ID: ``PORTAL_JWKS_URL`` must be set, and must be the key
+      set of the issuer's own tenant on one of ``ENTRA_KEY_HOSTS``.
+    """
+    if provider == "cognito":
+        derived = f"{issuer}/.well-known/jwks.json"  # where Amazon Cognito publishes a user pool's keys
+        if configured and configured != derived:
+            raise ConfigError(
+                "PORTAL_JWKS_URL is not used with Amazon Cognito: the keys are read from the issuer's own "
+                "address. Remove it"
+            )
+        return derived
+    if not configured:
+        raise ConfigError(f"PORTAL_JWKS_URL is not set: {_VERIFIES} and need the address of the issuer's keys")
+    tenant = (entra.group("v2") or entra.group("v1")) if entra else ""
+    if configured not in {f"https://{host}/{tenant}/discovery/v2.0/keys" for host in ENTRA_KEY_HOSTS}:
+        raise ConfigError(
+            "PORTAL_JWKS_URL is malformed: for Microsoft Entra ID it must be "
+            "https://login.microsoftonline.com/<the issuer's tenant id>/discovery/v2.0/keys"
+        )
+    return configured
+
 
 @dataclass(frozen=True)
 class ActionSettings:
     """Configuration of one action function (registrar, approver or containment).
 
     Deliberately smaller than ``Settings``: an action function does not need
-    guardrail tags or the model allow-list. Only the containment function needs
-    the cells, to find the containment role of an agent's cell.
+    guardrail tags or the model allow-list. It needs the cells: the
+    containment function to act in them, the other two to know which tenant
+    runs where.
     """
 
     env: str
@@ -414,6 +538,16 @@ class ActionSettings:
     audit_table: str
     allowed_origins: tuple[str, ...] = ()
     cells: tuple[Cell, ...] = ()
+    # Containment function only: the queue its background sweeps are sent to. None means the
+    # feature is off and a contain does exactly what it did before sweeps existed.
+    sweep_queue_url: str | None = None
+    # Set instead of the address when ``PORTAL_SWEEP_QUEUE_URL`` holds something that is not a
+    # queue address. That must not stop an emergency action: contain and release still work, and
+    # every contain says that its background sweeps could not be scheduled, and why.
+    sweep_queue_error: str | None = None
+    # How the function verifies the caller's bearer token. None only in local development with
+    # the header-based identity; inside AWS Lambda it is always set.
+    token: TokenSettings | None = None
 
 
 def _parse_tenant_map(raw: Any, role_map: Mapping[str, str]) -> dict[str, tuple[str, ...]]:
@@ -427,7 +561,7 @@ def _parse_tenant_map(raw: Any, role_map: Mapping[str, str]) -> dict[str, tuple[
             if tenant == ALL_TENANTS:
                 if role_map.get(group) != "platform":
                     raise ConfigError("PORTAL_GROUP_TENANT_MAP allows '*' only for a group mapped to platform")
-            elif not isinstance(tenant, str) or not _TENANT.match(tenant):
+            elif not isinstance(tenant, str) or not _TENANT.fullmatch(tenant):
                 raise ConfigError("PORTAL_GROUP_TENANT_MAP holds a malformed tenant id")
         result[group] = tuple(dict.fromkeys(tenants))
     return result
@@ -459,7 +593,60 @@ def load_action_settings(env: Mapping[str, str] | None = None) -> ActionSettings
         group_tenant_map=_parse_tenant_map(_json(env, "PORTAL_GROUP_TENANT_MAP"), role_map),
         audit_table=_match(_TABLE_NAME, _required(env, "PORTAL_AUDIT_TABLE"), "PORTAL_AUDIT_TABLE"),
         allowed_origins=tuple(origins),
-        cells=_parse_cells(_json(env, "PORTAL_CELLS")) if action_role == "containment" else (),
+        # The containment function acts in the cells. The registrar and approver functions only
+        # read which tenant each cell belongs to, to refuse a registration that names another
+        # tenant's Runtime, Tool Gateway or policy engine.
+        cells=_parse_cells(_json(env, "PORTAL_CELLS")),
+        **_sweep_queue(env, action_role),
+        token=_parse_token_settings(env, provider),
+    )
+
+
+def _sweep_queue(env: Mapping[str, str], action_role: str) -> dict[str, str | None]:
+    """The containment function's sweep queue: its address, or why the configured value is not one.
+
+    Unset or empty means the feature is off. A value that is not a queue
+    address is the one malformed setting that is not a configuration error:
+    the queue is an addition to containment, and a mistake in it must not
+    take contain and release away.
+    """
+    value = (env.get("PORTAL_SWEEP_QUEUE_URL") or "").strip()
+    if action_role != "containment" or not value:
+        return {"sweep_queue_url": None, "sweep_queue_error": None}
+    if not _QUEUE_URL.fullmatch(value):
+        return {
+            "sweep_queue_url": None,
+            "sweep_queue_error": "the setting PORTAL_SWEEP_QUEUE_URL is not an Amazon SQS queue address",
+        }
+    return {"sweep_queue_url": value, "sweep_queue_error": None}
+
+
+SWEEPER_ROLE = "sweeper"
+
+
+@dataclass(frozen=True)
+class SweeperSettings:
+    """Configuration of the sweeper function. It serves no caller, so it has no identity settings."""
+
+    env: str
+    registry_region: str
+    audit_table: str
+    cells: tuple[Cell, ...]
+
+
+def load_sweeper_settings(env: Mapping[str, str] | None = None) -> SweeperSettings:
+    """Parse and validate the environment of the sweeper function. Fails closed."""
+    env = os.environ if env is None else env
+    if _required(env, "PORTAL_ACTION_ROLE") != SWEEPER_ROLE:
+        raise ConfigError("PORTAL_ACTION_ROLE must be sweeper for the sweeper function")
+    portal_env = _required(env, "PORTAL_ENV")
+    if portal_env not in ("nonprod", "prod"):
+        raise ConfigError("PORTAL_ENV must be nonprod or prod")
+    return SweeperSettings(
+        env=portal_env,
+        registry_region=_match(_REGION, _required(env, "PORTAL_REGISTRY_REGION"), "PORTAL_REGISTRY_REGION"),
+        audit_table=_match(_TABLE_NAME, _required(env, "PORTAL_AUDIT_TABLE"), "PORTAL_AUDIT_TABLE"),
+        cells=_parse_cells(_json(env, "PORTAL_CELLS")),
     )
 
 

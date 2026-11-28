@@ -32,7 +32,8 @@ from tests.conftest import (
 from tests.fakes import FakeDynamo, FakePages, FakeRegistry, client_error
 from tests.test_api import event
 
-SEC = {"sub": "sec-1", "name": "Sam Security", "cognito:groups": "[sec]"}  # security, tenants ws1 and ws2
+# security, tenants ws1 and ws2. A name is never what a person is recorded as, so this one is "sec-1".
+SEC = {"sub": "sec-1", "name": "Sam Security", "cognito:groups": "[sec]"}
 PAT = {"sub": "pat-1", "email": "pat@example.com", "cognito:groups": "[platform-admins]"}  # platform
 PAT2 = {"sub": "pat-2", "cognito:groups": "[platform-admins]"}
 SRE = {"sub": "sre-1", "cognito:groups": "[sre-team]"}  # sre, tenant ws1
@@ -80,6 +81,7 @@ class FakeCell:
         self.streams: dict[str, list[dict[str, Any]]] = {}  # log group name -> its streams, newest first
         self.stream_page_size = 50
         self.stream_requests: list[dict[str, Any]] = []
+        self.tags: dict[str, dict[str, str]] = {}  # Runtime ARN -> its tags
 
     def _enter(self, operation: str) -> None:
         self.calls.append(operation)
@@ -114,6 +116,10 @@ class FakeCell:
             raise client_error("ResourceNotFoundException", "DeleteResourcePolicy")
         del self.policies[resourceArn]
         return {}
+
+    def list_tags_for_resource(self, resourceArn: str) -> dict[str, Any]:  # noqa: N803
+        self._enter("list_tags_for_resource")
+        return {"tags": dict(self.tags.get(resourceArn, {}))}
 
     def get_paginator(self, operation: str) -> FakePages:
         assert operation == "list_agent_runtime_endpoints"  # noqa: S101
@@ -155,11 +161,15 @@ class FakeAssumed:
     def __init__(self, cell: FakeCell) -> None:
         self.cell = cell
         self.error: Exception | None = None
+        self.session_policies: list[str | None] = []  # the session policy of every role assumption, in order
 
-    def assumed(self, role_arn: str, external_id: str | None, region: str, service: str) -> FakeCell:
+    def assumed(
+        self, role_arn: str, external_id: str | None, region: str, service: str, session_policy: str | None = None
+    ) -> FakeCell:
         if self.error:
             raise self.error
         self.cell.assumed.append((role_arn, external_id, region, service))
+        self.session_policies.append(session_policy)
         return self.cell
 
 
@@ -234,6 +244,11 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
     return World(monkeypatch)
 
 
+def refusals_logged(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The refusals the containment function logged instead of writing them to the audit trail."""
+    return [r.getMessage() for r in caplog.records if "not written to the audit trail" in r.getMessage()]
+
+
 # --- the rules (pure) ------------------------------------------------------------------------
 
 
@@ -246,6 +261,7 @@ def decide(**overrides: Any) -> rules.ContainmentDecision:
         "held_tenants": ("ws1",),
         "holds_all_tenants": False,
         "contained_by": None,
+        "contained_tenant": "ws1",  # the tenant the Runtime had when it was contained: unchanged
     }
     values.update(overrides)
     return rules.evaluate(**values)
@@ -301,18 +317,23 @@ def test_tenant_rules():
 
 
 def test_the_tenant_comes_from_where_the_runtime_runs_not_from_a_registration():
+    import inspect
+
     tenant_for = rules.tenant_for
-    # One tenant in the Runtime's account: that tenant, whatever a registration claims.
+    # One tenant in the Runtime's account: that tenant, whatever the Runtime's tag says.
     assert tenant_for({"ws2"}) == "ws2"
-    assert tenant_for({"ws2"}, record_tenant="ws1", record_approved=True) == "ws2"
-    assert tenant_for({"ws2"}, record_tenant="ws1", record_approved=False) == "ws2"
-    # A shared account: only an approved registration that names one of its tenants decides.
-    assert tenant_for({"ws1", "ws9"}, record_tenant="ws1", record_approved=True) == "ws1"
-    assert tenant_for({"ws1", "ws9"}, record_tenant="ws1", record_approved=False) is None
-    assert tenant_for({"ws1", "ws9"}, record_tenant="ws5", record_approved=True) is None
-    assert tenant_for({"ws1", "ws9"}) is None
+    assert tenant_for({"ws2"}, "ws1") == "ws2"
+    assert tenant_for({"ws2"}, runtime_tenant_tag=None) == "ws2"
+    # A shared account: the Runtime's own tenant-id tag decides, when it names one of the account's tenants.
+    assert tenant_for({"ws1", "ws9"}, "ws1") == "ws1"
+    assert tenant_for({"ws1", "ws9"}, "ws9") == "ws9"
+    assert tenant_for({"ws1", "ws9"}, "ws5") is None  # a tenant the account does not host
+    assert tenant_for({"ws1", "ws9"}, "") is None
+    assert tenant_for({"ws1", "ws9"}) is None  # no tag, or a tag that could not be read
     # No cell at all for that account and Region.
-    assert tenant_for(set(), record_tenant="ws1", record_approved=True) is None
+    assert tenant_for(set(), "ws1") is None
+    # A registration is no input of the rule at all.
+    assert list(inspect.signature(tenant_for).parameters) == ["cell_tenants", "runtime_tenant_tag"]
 
 
 def test_rules_fail_closed():
@@ -401,7 +422,7 @@ def test_contain_audit_events(world):
         and "1 of 1 recent session(s) stopped" in result["reason"]
     )
     for item in (intent, result):
-        assert (item["actor_subject"], item["actor_label"], item["actor_role"]) == ("sec-1", "Sam Security", "security")
+        assert (item["actor_subject"], item["actor_label"], item["actor_role"]) == ("sec-1", "sec-1", "security")
         assert (item["agent_id"], item["runtime_arn"], item["tenant_id"]) == (world.record_id, RUNTIME_ARN, "ws1")
         assert item["sk"] == f"EVENT#{item['at']}#{item['event_id']}"
     assert intent["request_id"] == result["request_id"]
@@ -434,19 +455,23 @@ def test_a_second_contain_changes_nothing_and_does_not_replace_the_container(wor
         (VIEW, 403, "CON-01-N"),
     ],
 )
-def test_contain_authority_and_tenant(world, claims, expected, reason):
-    code, body = world.post("contain", claims=claims)
+def test_contain_authority_and_tenant(world, caplog, claims, expected, reason):
+    with caplog.at_level("WARNING"):
+        code, body = world.post("contain", claims=claims)
     assert code == expected
     if reason:
         assert reason in body["detail"] and RUNTIME_ARN not in world.cell.policies
         assert world.cell.calls == []
+        # A caller without the role, or without the Runtime's tenant, has no part in the Runtime:
+        # nothing is written into its history and nothing is read of it. Any signed-in responder
+        # of another tenant could otherwise fill it, and a history is never shortened.
+        assert world.trail() == [] and world.dynamo.calls == []
+        # The function's log keeps the attempt, under the request id the answer carries.
+        (logged,) = refusals_logged(caplog)
+        assert body["request_id"] in logged and reason in logged
         if reason == "CON-01-N":
-            # Refused before the agent is resolved: nothing is written, because the key would be
-            # the caller's choice and any signed-in user could fill any agent's history.
-            assert world.trail() == [] and world.registry.calls == []
-        else:
-            assert world.trail() == [("contain", "result", "denied")]
-            assert world.dynamo.events()[0]["pk"] == f"CONTAINMENT#{RUNTIME_ARN}"
+            # Refused before the agent is resolved at all.
+            assert world.registry.calls == []
 
 
 def test_a_caller_without_the_role_is_refused_before_anything_is_looked_up(world):
@@ -459,12 +484,16 @@ def test_a_caller_without_the_role_is_refused_before_anything_is_looked_up(world
     assert world.dynamo.events() == []
 
 
-def test_containment_not_enabled_for_the_cell_is_409(world, monkeypatch):
+def test_containment_not_enabled_for_the_cell_is_409(world, monkeypatch, caplog):
     without = {k: v for k, v in CELLS[0].items() if k not in ("containmentRoleArn", "containmentSpans")}
     monkeypatch.setenv("PORTAL_CELLS", json.dumps([without, CELLS[1]]))
-    code, body = world.post("contain")
+    with caplog.at_level("WARNING"):
+        code, body = world.post("contain")
     assert (code, body["detail"]) == (409, "containment is not enabled for this cell")
-    assert world.cell.calls == [] and world.trail() == [("contain", "result", "denied")]
+    # Nothing is read or written about a Runtime the portal cannot contain: logged, not stored.
+    assert world.cell.calls == [] and world.trail() == [] and world.dynamo.calls == []
+    (logged,) = refusals_logged(caplog)
+    assert body["request_id"] in logged and "not enabled" in logged
 
 
 def test_resolving_a_registered_agent(world):
@@ -749,6 +778,40 @@ def test_one_source_failing_leaves_the_other_in_use(world):
     assert world.cell.stopped == [(sid("bbb"), "DEFAULT")] and body["partial"] is True
 
 
+@pytest.mark.parametrize("status", ["Timeout", "Failed", "Cancelled"])
+def test_a_spans_query_that_did_not_finish_never_reads_as_a_complete_list(world, status):
+    world.cell.sessions = [session_row(sid("partial"))]
+    world.cell.query_status = status  # the query ended, but not as complete: its rows may be a part
+    code, body = world.post("contain")
+    assert code == 200 and body["state"] == "contained"
+    # What it did return is stopped, and the result says that more may be running.
+    assert world.cell.stopped == [(sid("partial"), "DEFAULT")]
+    note = f"the spans query did not finish (query ended with status {status}), so more sessions may be running"
+    assert body["sessions"]["discovery"] == f"ok; {note}"
+    assert body["partial"] is True and body["steps"][2]["status"] == "partial"
+    assert note in body["steps"][2]["detail"]
+    assert world.dynamo.events()[-1]["detail"] == f"ok; {note}"
+
+
+def test_a_spans_query_still_running_at_the_deadline_never_reads_as_a_complete_list(world, monkeypatch):
+    from portal_api.actions import containment
+
+    assert containment.SPANS_WAIT_SECONDS == 8.0
+    monkeypatch.setattr(containment, "SPANS_WAIT_SECONDS", 0.05)
+    world.cell.sessions = [session_row(sid("partial"))]
+    world.cell.query_status = "Running"  # partial rows, as the service returns while a query runs
+    code, body = world.post("contain")
+    assert code == 200 and world.cell.stopped == [(sid("partial"), "DEFAULT")]
+    assert body["sessions"]["discovery"] == (
+        "ok; the spans query did not finish (query still running after 0.05s), so more sessions may be running"
+    )
+    assert body["partial"] is True
+    # A query that finished with no row left is complete, and says nothing.
+    world.cell.query_status = "Complete"
+    again = world.post("contain", claims=PAT)[1]
+    assert (again["sessions"]["discovery"], again["partial"]) == ("ok", False)
+
+
 def test_streams_that_are_not_recent_sessions_are_ignored(world):
     old = 9 * 60  # minutes: outside the eight-hour window
     world.cell.streams[log_group()] = [
@@ -871,7 +934,7 @@ def test_release_by_the_same_person_is_403(world):
     assert world.post("contain", claims=PAT)[0] == 200
     code, body = world.post("release", claims=PAT)
     assert code == 403 and "two-person rule (CON-03-N)" in body["detail"]
-    assert containment_policy.is_contained(world.cell.policies[RUNTIME_ARN])
+    assert containment_policy.is_contained(world.cell.policies[RUNTIME_ARN], RUNTIME_ARN)
     assert world.trail()[-1] == ("release", "result", "denied")
 
 
@@ -1014,7 +1077,7 @@ def test_containment_holds_even_when_sessions_cannot_be_listed(world):
         "log streams could not be listed (AccessDeniedException))"
     )
     assert body["partial"] is True and body["steps"][2]["status"] == "failed"
-    assert containment_policy.is_contained(world.cell.policies[RUNTIME_ARN])
+    assert containment_policy.is_contained(world.cell.policies[RUNTIME_ARN], RUNTIME_ARN)
     result = world.dynamo.events()[-1]
     assert result["outcome"] == "allowed" and "Running sessions were not stopped" in result["reason"]
     assert result["detail"] == body["sessions"]["discovery"]
@@ -1055,7 +1118,7 @@ def test_a_failed_release_says_the_runtime_is_still_contained(world):
     world.cell.fail["delete_resource_policy"] = "ThrottlingException"
     code, body = world.post("release", claims=PAT)
     assert code == 502 and body["detail"].endswith("The Runtime is still contained.")
-    assert containment_policy.is_contained(world.cell.policies[RUNTIME_ARN])
+    assert containment_policy.is_contained(world.cell.policies[RUNTIME_ARN], RUNTIME_ARN)
     failed = world.dynamo.events()[-1]
     assert (failed["outcome"], failed["status_before"], failed["status_after"]) == ("failed", "contained", "contained")
     # a failed release does not clear the container
@@ -1138,9 +1201,12 @@ def test_containment_settings():
     env = {**BASE_ENV, "PORTAL_ACTION_ROLE": "containment"}
     settings = load_action_settings(env)
     assert settings.cells[0].containment_role_arn == CONTAINMENT_ROLE and settings.cells[1].containment_role_arn is None
-    assert load_action_settings({**BASE_ENV, "PORTAL_ACTION_ROLE": "registrar"}).cells == ()
-    with pytest.raises(ConfigError, match="PORTAL_CELLS"):
-        load_action_settings({k: v for k, v in env.items() if k != "PORTAL_CELLS"})
+    # The registrar and approver functions read the cells too: which tenant runs where.
+    for role in ("registrar", "approver", "containment"):
+        role_env = {**BASE_ENV, "PORTAL_ACTION_ROLE": role}
+        assert [c.tenant_id for c in load_action_settings(role_env).cells] == ["ws1", "ws2"]
+        with pytest.raises(ConfigError, match="PORTAL_CELLS"):
+            load_action_settings({k: v for k, v in role_env.items() if k != "PORTAL_CELLS"})
     wrong = [{**CELLS[0], "containmentRoleArn": "arn:aws:iam::999999999999:role/elsewhere"}]
     with pytest.raises(ConfigError, match="containmentRoleArn"):
         load_action_settings({**env, "PORTAL_CELLS": json.dumps(wrong)})
@@ -1191,7 +1257,7 @@ def test_containment_view(world, read):
     assert (view["state"], view["contained_by"], view["contained_by_label"], view["contained_by_me"]) == (
         "contained",
         "sec-1",
-        "Sam Security",
+        "sec-1",
         False,
     )
     assert view["contained_at"] and view["reason"].startswith("Suspected prompt injection.")
@@ -1284,9 +1350,8 @@ def test_a_registration_cannot_bring_another_tenants_runtime_into_reach(world):
     code, body = world.post("contain", agent_id=claimed, claims=SRE2)
     assert code == 403 and "CON-04-N" in body["detail"]
     assert RUNTIME_ARN not in world.cell.policies and world.cell.calls == []
-    # The refusal is in the Runtime's history, with the tenant that decided.
-    (denied,) = world.dynamo.events()
-    assert (denied["pk"], denied["tenant_id"], denied["outcome"]) == (f"CONTAINMENT#{RUNTIME_ARN}", "ws1", "denied")
+    # The refusal is not in the Runtime's history: this caller has no part in the Runtime.
+    assert world.dynamo.events() == [] and world.dynamo.calls == []
     # A responder of the real tenant can act, through that record or through the genuine one.
     assert world.post("contain", agent_id=claimed, claims=SRE)[0] == 200
     # And the ws2 responder cannot lift a containment the real tenant placed.
@@ -1294,25 +1359,115 @@ def test_a_registration_cannot_bring_another_tenants_runtime_into_reach(world):
     assert RUNTIME_ARN in world.cell.policies
 
 
-def test_in_a_shared_account_only_an_approved_registration_names_the_tenant(world, monkeypatch):
+def shared_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cell account hosts two tenants, ws1 and ws9."""
     shared = {**CELLS[0], "tenantId": "ws9", "agentId": "second-agent"}
     monkeypatch.setenv("PORTAL_CELLS", json.dumps([CELLS[0], CELLS[1], shared]))
-    # The seeded record is APPROVED for ws1, one of the account's tenants: ws1 decides.
+
+
+def test_in_a_shared_account_the_runtimes_own_tag_names_the_tenant(world, monkeypatch):
+    shared_account(monkeypatch)
+    # A Runtime tagged ws1 in an account of ws1 and ws9 is ws1's.
+    world.cell.tags[RUNTIME_ARN] = {"tenant-id": "ws1", "agent-id": "travel-agent"}
     assert world.post("contain", claims=SRE)[0] == 200
+    assert world.cell.calls.count("list_tags_for_resource") == 1
+    assert [e["tenant_id"] for e in world.dynamo.events()] == ["ws1", "ws1"]
+    # A responder of the other tenant does not hold it.
+    code, body = world.post("release", claims={"sub": "sec-ws2", "cognito:groups": "[sre-team2]"})
+    assert code == 403
     assert world.post("release", claims=PAT)[0] == 200
-    # A draft cannot name the tenant: the tenant is then undetermined and only platform may act.
-    draft = world.registry.seed("agent-ws1-draft-nonprod", json.dumps(agent_document(agentId="draft")), "DRAFT")
-    for claims in (SRE, SEC):
-        code, body = world.post("contain", agent_id=draft, claims=claims)
-        assert code == 403 and "CON-05-N" in body["detail"]
-    # An approved record that names a tenant the account does not host does not decide either.
-    foreign = world.registry.seed(
-        "agent-ws2-foreign-nonprod", json.dumps(agent_document(tenantId="ws2", agentId="foreign")), "APPROVED"
-    )
-    code, body = world.post("contain", agent_id=foreign, claims=SRE2)
-    assert code == 403 and "CON-05-N" in body["detail"]
+
+    # Tagged for the account's other tenant: ws1's responders do not hold it.
+    world.cell.tags[RUNTIME_ARN] = {"tenant-id": "ws9"}
+    recorded = len(world.dynamo.events())
+    code, body = world.post("contain", claims=SRE)
+    assert code == 403 and "CON-04-N" in body["detail"]
+    assert len(world.dynamo.events()) == recorded  # not their Runtime, so not in its history
     assert RUNTIME_ARN not in world.cell.policies
-    assert world.post("contain", agent_id=draft, claims=PAT)[0] == 200
+
+
+@pytest.mark.parametrize("tags", [{}, {"tenant-id": "ws2"}, {"tenant-id": ""}, {"Tenant-Id": "ws1"}])
+def test_in_a_shared_account_an_untagged_runtime_has_no_tenant(world, monkeypatch, tags):
+    """No tag, or a tag naming a tenant the account does not host: undetermined, platform only."""
+    shared_account(monkeypatch)
+    world.cell.tags[RUNTIME_ARN] = tags
+    for claims in (SRE, SEC, SRE2):
+        code, body = world.post("contain", claims=claims)
+        assert code == 403 and "CON-05-N" in body["detail"]
+    assert RUNTIME_ARN not in world.cell.policies
+    assert world.post("contain", claims=PAT)[0] == 200
+
+
+def test_in_a_shared_account_a_registration_approved_or_not_changes_nothing(world, monkeypatch):
+    shared_account(monkeypatch)
+    # The seeded record is APPROVED for ws1, one of the account's tenants. The Runtime has no tag.
+    code, body = world.post("contain", claims=SRE)
+    assert code == 403 and "CON-05-N" in body["detail"]
+    # An approved record that claims the account's other tenant decides nothing either.
+    other = world.registry.seed(
+        "agent-ws9-second-nonprod", json.dumps(agent_document(tenantId="ws9", agentId="second")), "APPROVED"
+    )
+    world.cell.tags[RUNTIME_ARN] = {"tenant-id": "ws1"}
+    assert world.post("contain", agent_id=other, claims=SRE)[0] == 200  # the tag says ws1, whatever the record says
+    assert world.dynamo.events()[-1]["tenant_id"] == "ws1"
+    # Nor does a draft: with the tag gone the tenant is undetermined again.
+    world.cell.tags.clear()
+    draft = world.registry.seed("agent-ws1-draft-nonprod", json.dumps(agent_document(agentId="draft")), "DRAFT")
+    code, body = world.post("release", agent_id=draft, claims=SEC)
+    assert code == 403 and "CON-05-N" in body["detail"]
+    # The same holds for an agent with no registration, addressed by its Runtime id.
+    code, body = world.post(
+        "release", agent_id=RUNTIME_ID, claims=SEC, body={"reason": "x", "runtime_arn": RUNTIME_ARN}
+    )
+    assert code == 403 and "CON-05-N" in body["detail"]
+    assert RUNTIME_ARN in world.cell.policies
+
+
+def test_in_a_shared_account_a_tag_that_cannot_be_read_leaves_the_tenant_undetermined(world, monkeypatch):
+    shared_account(monkeypatch)
+    world.cell.tags[RUNTIME_ARN] = {"tenant-id": "ws1"}
+    world.cell.fail["list_tags_for_resource"] = "AccessDeniedException"
+    code, body = world.post("contain", claims=SRE)
+    assert code == 403 and "CON-05-N" in body["detail"]
+    # The role could not be assumed at all: undetermined as well.
+    world.assumed.error = client_error("AccessDenied", "AssumeRole")
+    code, body = world.post("contain", claims=SRE)
+    assert code == 403 and "CON-05-N" in body["detail"]
+    world.assumed.error = None
+    assert world.post("contain", claims=SRE)[0] == 200  # readable again
+
+
+def test_the_tag_is_read_only_in_a_shared_account_and_only_after_the_role_check(world, monkeypatch):
+    # One tenant in the account: nothing is read.
+    assert world.post("contain", claims=SRE)[0] == 200
+    assert "list_tags_for_resource" not in world.cell.calls
+    # A shared account, and a caller without the role: refused before anything is looked up.
+    shared_account(monkeypatch)
+    world.cell.calls.clear()
+    world.registry.calls.clear()
+    assumed_before = list(world.cell.assumed)
+    code, body = world.post("contain", claims=DEV)
+    assert code == 403 and "CON-01-N" in body["detail"]
+    assert world.cell.calls == [] and world.cell.assumed == assumed_before and world.registry.calls == []
+
+
+def test_the_tag_request_matches_the_service_model():
+    import boto3
+    from botocore.stub import Stubber
+
+    from portal_api.actions import containment
+
+    client = boto3.client(
+        "bedrock-agentcore-control", region_name="eu-west-1", aws_access_key_id="test", aws_secret_access_key="test"
+    )
+    with Stubber(client) as stub:
+        stub.add_response("list_tags_for_resource", {"tags": {"tenant-id": "ws1"}}, {"resourceArn": RUNTIME_ARN})
+        stub.add_response("list_tags_for_resource", {"tags": {"agent-id": "x"}}, {"resourceArn": RUNTIME_ARN})
+        stub.add_response("list_tags_for_resource", {}, {"resourceArn": RUNTIME_ARN})
+        assert containment.get_tenant_tag(client, RUNTIME_ARN) == "ws1"
+        assert containment.get_tenant_tag(client, RUNTIME_ARN) is None
+        assert containment.get_tenant_tag(client, RUNTIME_ARN) is None
+        stub.assert_no_pending_responses()
 
 
 def test_a_contain_that_could_not_be_verified_still_has_a_holder(world):

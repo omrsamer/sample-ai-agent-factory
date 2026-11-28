@@ -15,6 +15,12 @@ Two principles hold for every rule:
 - A fact that is not known (``None``) never triggers a rule, so an unknown
   never raises or lowers the level.
 
+One guard stands before the table (``closed``): a retired registration with no
+Runtime known has nothing left that anyone could act on, so no rule applies
+to it. The guard is not granted while the portal is blind for a passing
+reason: when the reader of the Runtime's account failed for this inventory,
+the rules apply as for any other agent.
+
 The same table is in README.md.
 """
 
@@ -38,10 +44,14 @@ class RiskFacts:
     registered: bool | None = None  # the agent has a registration, in any status
     registry_status: str | None = None  # the registration's status in the registry
     runtime_known: bool | None = None  # a detection source sees a Runtime for the agent
+    # The reader of the account the registration's Runtime is in exists and could not be used for
+    # this inventory. False when it answered, when that account has no reader at all, and when
+    # the registration names no Runtime.
+    runtime_reader_unreachable: bool | None = None
     owner_group_missing: bool | None = None  # the registration names no owner group
     owner_group_in_roster: bool | None = None  # None when no roster is configured
     sponsor_missing: bool | None = None  # the registration names neither a sponsor nor a contact
-    review_overdue: bool | None = None
+    review_overdue: bool | None = None  # the effective review date (attestation, else registration) has passed
     inactive: bool | None = None
     gateway_policy_mode: str | None = None  # enforce | log_only | none; None when no Tool Gateway is known
     guardrail_configured: bool | None = None  # the Runtime names a guardrail or the inference gateway
@@ -96,7 +106,7 @@ RULES: tuple[Rule, ...] = (
         "REGISTRATION_DEPRECATED",
         "high",
         lambda f: f.registry_status == "DEPRECATED" and f.runtime_known is True,
-        "The agent's registration is deprecated and its Runtime is still deployed.",
+        "The agent's registration is retired (DEPRECATED) and its Runtime is still deployed.",
     ),
     Rule("RISK_CLASS_HIGH", "high", lambda f: f.risk_class == "high", "The registration declares risk class high."),
     Rule(
@@ -148,7 +158,7 @@ RULES: tuple[Rule, ...] = (
         lambda f: f.data_classification == "confidential",
         "The agent handles data classified confidential.",
     ),
-    Rule("REVIEW_OVERDUE", "medium", lambda f: f.review_overdue is True, "The registration's review date has passed."),
+    Rule("REVIEW_OVERDUE", "medium", lambda f: f.review_overdue is True, "The agent's review date has passed."),
     Rule(
         "EVALUATION_NOT_RUN",
         "medium",
@@ -177,8 +187,42 @@ RULES: tuple[Rule, ...] = (
 )
 
 
+def closed(facts: RiskFacts) -> bool:
+    """Whether the agent's obligations are closed: a retired registration with no Runtime known.
+
+    Retirement is terminal. A retired record can no longer be updated,
+    reviewed, approved or submitted, so a finding about what it says (its
+    owner group, its sponsor, its evaluation) could never be cleared, and the
+    agent would stay in the attention list until someone deleted the record.
+    With nothing deployed there is nothing left to do, and no rule applies.
+
+    A retired registration whose Runtime is still deployed is the opposite
+    case: someone still has to remove that Runtime, so every rule applies,
+    ``REGISTRATION_DEPRECATED`` first. A rejected registration is not closed
+    either: it can be corrected and submitted again.
+
+    "Closed" takes an agent out of every list that asks for attention, so it
+    is not granted while the portal is blind for a passing reason. When the
+    reader of the Runtime's account exists and could not be used for this
+    inventory, the Runtime may well be there: the agent is not closed, and
+    the rules apply to it as to any registered agent whose Runtime could not
+    be read. An account with no reader at all, and a registration that names
+    no Runtime, do not keep an agent open: nothing would ever close it.
+
+    This is the one place the condition is written. ``assess`` uses it for the
+    risk, and the service uses it for the flags and the fleet summary.
+    """
+    return (
+        facts.registry_status == "DEPRECATED"
+        and facts.runtime_known is not True
+        and facts.runtime_reader_unreachable is not True
+    )
+
+
 def assess(facts: RiskFacts) -> Risk:
     """The agent's risk: every rule that applies, most severe first, and the highest severity as the level."""
+    if closed(facts):
+        return Risk(level=SEVERITIES[0], reasons=())
     reasons = [Reason(rule.code, rule.severity, rule.detail) for rule in RULES if rule.applies(facts)]
     reasons.sort(key=lambda reason: -SEVERITIES.index(reason.severity))  # stable: table order within a severity
     level = reasons[0].severity if reasons else SEVERITIES[0]

@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""MCP servers: one per Workstream Tool Gateway."""
+"""MCP servers: one per Tool Gateway a cell reader read or the organization registry detected."""
 
 from __future__ import annotations
 
@@ -46,7 +46,9 @@ def policies(server_id: EntityId, _: CurrentPrincipal, service: Service) -> Ceda
 @router.get("/{server_id}/policy-enforcement", response_model=PolicyEnforcement)
 def policy_enforcement(server_id: EntityId, _: CurrentPrincipal, service: Service) -> PolicyEnforcement:
     server = service.gateway(server_id).server
-    return PolicyEnforcement(enforcement_mode=server.cedar_enforcement_mode, engine_id=server.cedar_policy_engine_id)
+    return PolicyEnforcement(
+        enforcement_mode=server.cedar_enforcement_mode, engine_id=server.cedar_policy_engine_id, detail=server.detail
+    )
 
 
 @router.get("/{server_id}/grants", response_model=list[Grant])

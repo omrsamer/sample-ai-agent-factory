@@ -35,10 +35,31 @@ class Principal:
     display_name: str | None
     groups: tuple[str, ...]
     role: str
+    # A readable name for the record, when the token holds one that is not simply what the person
+    # typed (see ``label``). ``None`` means the record shows the subject.
+    recorded_as: str | None = None
 
     @property
     def label(self) -> str:
-        """Name shown for this caller, for example as the actor of an audit event."""
+        """What is written beside the subject in a record, for a person to read.
+
+        The subject is the identity. Every rule that compares people (the
+        two-person rule, separation of duties) compares subjects, and every
+        record stores the subject. The label is a reading aid next to it: an
+        email or a user name where the token has one that the directory set
+        or verified, else the subject again.
+
+        It is not an identity and nothing is decided on it. An email can
+        change: a local Cognito user can change theirs and verify the new
+        one, and a directory can rename a user. A display name changes more
+        freely still and is never used here; ``name`` is for showing callers
+        their own name.
+        """
+        return self.recorded_as or self.subject
+
+    @property
+    def name(self) -> str:
+        """The caller's own name, for display to the caller (``/users/me``). Never written to a record."""
         return self.display_name or self.email or self.subject
 
 
@@ -105,8 +126,35 @@ def _text(claims: Mapping[str, Any], *names: str) -> str | None:
 
 
 def _display_name(claims: Mapping[str, Any]) -> str | None:
-    """A human label for the caller. The subject is the last resort (see ``Principal.label``)."""
+    """A human name for the caller, for display. The subject is the last resort (see ``Principal.name``)."""
     return _text(claims, "name", "email", "cognito:username", "preferred_username")
+
+
+def _is_true(value: Any) -> bool:
+    """A boolean claim. API Gateway passes it as the string ``true``; a verified token holds a boolean."""
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def _present(value: Any) -> bool:
+    """A claim that holds something: a non-empty list, or a string that is not an empty list."""
+    if isinstance(value, str):
+        return value.strip() not in ("", "[]", "null")
+    return bool(value)
+
+
+def _cognito_recorded_as(claims: Mapping[str, Any]) -> str | None:
+    """The email, when it is more than what the person typed. A label to read, not an identity.
+
+    - A federated user (the token has an ``identities`` claim): the email is
+      the one the identity provider set.
+    - A local user: only an email that Cognito has verified. An unverified
+      one is whatever its owner typed. A verified one can still be replaced
+      by its owner with another address they verify.
+    """
+    email = _text(claims, "email")
+    if email and (_present(claims.get("identities")) or _is_true(claims.get("email_verified"))):
+        return email
+    return None
 
 
 class IdentityProvider(Protocol):
@@ -121,13 +169,16 @@ def _build(
     display_name: str | None,
     groups: tuple[str, ...],
     role_map: Mapping[str, str],
+    recorded_as: str | None = None,
 ) -> Principal:
     if not subject:
         raise NotAuthenticated("token has no subject")
     role = resolve_role(groups, role_map)
     if role is None:
         raise NotAuthorized("no group or app role maps to a portal role")
-    return Principal(subject=subject, email=email, display_name=display_name, groups=groups, role=role)
+    return Principal(
+        subject=subject, email=email, display_name=display_name, groups=groups, role=role, recorded_as=recorded_as
+    )
 
 
 class CognitoProvider:
@@ -150,6 +201,7 @@ class CognitoProvider:
             _display_name(claims),
             groups,
             role_map,
+            _cognito_recorded_as(claims),
         )
 
 
@@ -170,6 +222,9 @@ class EntraProvider:
             _display_name(claims),
             merged,
             role_map,
+            # The user name as the directory holds it. A directory can change it, and for a guest
+            # it is the guest's own address: a label to read, like the Cognito one.
+            _text(claims, "preferred_username", "upn"),
         )
 
 

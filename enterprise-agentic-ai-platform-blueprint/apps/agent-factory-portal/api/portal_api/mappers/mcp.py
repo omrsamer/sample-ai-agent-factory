@@ -14,17 +14,36 @@ from portal_api.mappers.common import EPOCH_ISO, arn_parts, arn_resource_id, iso
 from portal_api.models.wire import CedarPolicyRow, CedarPolicySet, McpServer, McpTool
 
 _MODES = {"LOG_ONLY": "log_only", "ENFORCE": "enforce"}
+# The policy mode of a gateway that no reader read. Not "none": that would claim it has no policy engine.
+UNKNOWN_MODE = "unknown"
+SOURCE_ORGANIZATION_REGISTRY = "organization_registry"
+READER_OK, READER_NONE, READER_UNREACHABLE, READER_NOT_LISTED = "ok", "none", "unreachable", "not_listed"
+_NOT_SHOWN = "so its targets, its policy engine and its policies cannot be shown"
+NOT_READ = {
+    READER_NONE: f"There is no reader role in this gateway's account, {_NOT_SHOWN}.",
+    READER_UNREACHABLE: f"The reader role in this gateway's account could not be used, {_NOT_SHOWN}.",
+    READER_NOT_LISTED: (
+        f"The reader in this gateway's account did not list this gateway, {_NOT_SHOWN}. "
+        "It may have been deleted since the organization registry detected it."
+    ),
+}
 
 
 @dataclass
 class GatewayEntry:
     server: McpServer
-    cell: Cell
+    # The cell whose reader read the gateway. None for a gateway known from the organization
+    # registry only: nothing of it can be read, so nothing about it is claimed.
+    cell: Cell | None
     arn: str
     url: str | None
     tags: dict[str, str]
     policy_engine_arn: str | None
-    enforcement_mode: str  # "none" | "log_only" | "enforce"
+    enforcement_mode: str  # "none" | "log_only" | "enforce", or "unknown" when no reader read it
+
+    @property
+    def read(self) -> bool:
+        return self.cell is not None
 
     @property
     def has_policy(self) -> bool:
@@ -125,6 +144,7 @@ def gateway_entry(bundle: dict[str, Any], cell: Cell, tool_index: dict[str, dict
         environment=tags.get(TAG_ENVIRONMENT),
         account_id=parts.get("account") or cell.account_id,
         agent_id=tags.get(TAG_AGENT),
+        protocol=text(gateway.get("protocolType")),
     )
     return GatewayEntry(
         server=server,
@@ -134,6 +154,44 @@ def gateway_entry(bundle: dict[str, Any], cell: Cell, tool_index: dict[str, dict
         tags=tags,
         policy_engine_arn=engine_arn,
         enforcement_mode=mode,
+    )
+
+
+def gateway_from_detection(detection: Any, reader_status: str) -> GatewayEntry:
+    """A gateway known only from the organization registry: identity, authorizer and protocol.
+
+    Its status, targets, tags, policy engine and policy mode are not known and
+    are not guessed: no tools, no tenant, and the mode is ``unknown``.
+    """
+    parts = arn_parts(detection.arn) or {}
+    gateway_id = arn_resource_id(detection.arn) or detection.arn
+    detected = iso(detection.detected_at) or EPOCH_ISO
+    server = McpServer(
+        id=gateway_id,
+        name=gateway_id.rsplit("-", 1)[0] or gateway_id,
+        region=parts.get("region") or None,
+        gateway_arn=detection.arn,
+        cedar_enforcement_mode=UNKNOWN_MODE,
+        gateway_id=gateway_id,
+        lifecycle_state="discovered",
+        created_at=detected,
+        updated_at=detected,
+        gateway_status="UNKNOWN",
+        authorizer_type=detection.authorizer_type,
+        account_id=parts.get("account") or None,
+        detection_sources=[SOURCE_ORGANIZATION_REGISTRY],
+        reader_status=reader_status,
+        protocol=detection.protocol,
+        detail=NOT_READ[reader_status],
+    )
+    return GatewayEntry(
+        server=server,
+        cell=None,
+        arn=detection.arn,
+        url=None,
+        tags={},
+        policy_engine_arn=None,
+        enforcement_mode=UNKNOWN_MODE,
     )
 
 

@@ -151,7 +151,7 @@ def test_a_registration_waiting_for_approval_is_medium_not_high(status):
         (
             "DEPRECATED",
             "REGISTRATION_DEPRECATED",
-            "The agent's registration is deprecated and its Runtime is still deployed.",
+            "The agent's registration is retired (DEPRECATED) and its Runtime is still deployed.",
         ),
     ],
 )
@@ -280,3 +280,89 @@ def test_readme_documents_every_rule_with_its_severity_in_table_order():
     assert "names neither a guardrail nor the inference gateway" in README
     for flag in ("unmanaged", "ownerless", "review_overdue", "inactive", "contained"):
         assert f"| `{flag}` |" in README
+
+
+# --- a retired registration with nothing deployed is closed ------------------------------------------
+
+# Every fact that triggers a rule on its own, on a retired registration.
+LOUD = RiskFacts(
+    risk_class="unacceptable",
+    data_classification="restricted",
+    registered=True,
+    registry_status="DEPRECATED",
+    runtime_known=False,
+    owner_group_missing=True,
+    owner_group_in_roster=False,
+    sponsor_missing=True,
+    review_overdue=True,
+    inactive=True,
+    gateway_policy_mode="none",
+    guardrail_configured=False,
+    authorizer_type="NONE",
+    evaluation_verdict="failed",
+    cell_health_state="critical",
+)
+
+
+def by_the_table(facts: RiskFacts) -> list[str]:
+    """The reasons the rule table alone gives, most severe first: what ``assess`` returns when no guard stands in."""
+    found = [rule for rule in risk.RULES if rule.applies(facts)]
+    found.sort(key=lambda rule: -risk.SEVERITIES.index(rule.severity))
+    return [rule.code for rule in found]
+
+
+@pytest.mark.parametrize("runtime_known", [False, None])
+@pytest.mark.parametrize("reader_unreachable", [False, None])
+def test_a_retired_registration_with_no_runtime_known_is_closed_and_no_rule_applies(runtime_known, reader_unreachable):
+    facts = dataclasses.replace(LOUD, runtime_known=runtime_known, runtime_reader_unreachable=reader_unreachable)
+    assert len(by_the_table(facts)) >= 10  # the table would have plenty to say
+    assert risk.closed(facts) is True
+    assert risk.assess(facts) == risk.Risk(level="low", reasons=())
+
+
+@pytest.mark.parametrize("runtime_known", [False, None])
+def test_it_is_not_closed_while_the_reader_of_its_runtimes_account_cannot_be_used(runtime_known):
+    """Closed takes an agent off every list that asks for attention: never while the portal is blind in passing."""
+    facts = dataclasses.replace(LOUD, runtime_known=runtime_known, runtime_reader_unreachable=True)
+    assert risk.closed(facts) is False
+    # The rules apply as they did before there was a guard: everything but the one that needs the Runtime to be seen.
+    assert codes(facts) == by_the_table(facts) and len(codes(facts)) >= 10
+    assert "REGISTRATION_DEPRECATED" not in codes(facts) and risk.assess(facts).level == "critical"
+    # Seen by another source while the reader is down: still deployed, so not closed either.
+    seen = dataclasses.replace(facts, runtime_known=True)
+    assert risk.closed(seen) is False and "REGISTRATION_DEPRECATED" in codes(seen)
+
+
+def test_a_retired_registration_whose_runtime_is_still_deployed_keeps_every_rule():
+    facts = dataclasses.replace(LOUD, runtime_known=True)
+    assert risk.closed(facts) is False
+    found = risk.assess(facts)
+    assert [reason.code for reason in found.reasons] == by_the_table(facts)
+    assert found.level == "critical" and "REGISTRATION_DEPRECATED" in codes(facts)
+    assert {"OWNERLESS", "OWNER_GROUP_NOT_IN_ROSTER", "EVALUATION_FAILED", "SPONSOR_MISSING"} <= set(codes(facts))
+
+
+@pytest.mark.parametrize("status", ["REJECTED", "APPROVED", "DRAFT", "PENDING_APPROVAL", "UPDATING", None])
+@pytest.mark.parametrize("runtime_known", [True, False, None])
+def test_only_retirement_closes_an_agent(status, runtime_known):
+    """A rejected registration can be corrected and submitted again, so its findings stay."""
+    facts = dataclasses.replace(LOUD, registry_status=status, runtime_known=runtime_known)
+    assert risk.closed(facts) is False
+    assert codes(facts) == by_the_table(facts) and codes(facts)
+
+
+def test_the_condition_is_written_in_one_place():
+    import inspect
+
+    from portal_api import service
+
+    assert inspect.getsource(risk.assess).count("closed(facts)") == 1
+    # The rules themselves are untouched: the one about a retired registration still needs a Runtime.
+    assert CASES["REGISTRATION_DEPRECATED"][1].runtime_known is True
+    # The service asks the same function for the flags and the summary, and holds no copy of the condition.
+    source = inspect.getsource(service)
+    assert source.count("risk.closed(facts)") == 1 and '"DEPRECATED" and' not in source
+    # The service only states the fact that the reader failed; what follows from it is decided in ``closed``.
+    assert source.count('runtime_reader_unreachable=agent.reader_status == "unreachable"') == 1
+    assert inspect.getsource(risk.closed).count("runtime_reader_unreachable is not True") == 1
+    assert "A retired registration with no Runtime known is closed" in " ".join(README.split())

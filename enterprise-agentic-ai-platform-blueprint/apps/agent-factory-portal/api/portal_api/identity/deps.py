@@ -1,6 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""FastAPI dependencies that resolve the caller."""
+"""FastAPI dependencies that resolve the caller of the read API.
+
+The read API takes the caller from the claims the API Gateway JWT authorizer
+verified. The action functions do not use ``principal_from_request``: they
+verify the bearer token themselves (``portal_api/actions/app.py``).
+"""
 
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ def jwt_claims(request: Request) -> Mapping[str, Any] | None:
     return claims if isinstance(claims, dict) and claims else None
 
 
-def _dev_claims(request: Request, settings: Any) -> Mapping[str, Any] | None:
+def dev_claims(request: Request, settings: Any) -> Mapping[str, Any] | None:
     """Local development only: build claims from request headers.
 
     The role still comes from PORTAL_GROUP_ROLE_MAP, so a developer exercises the
@@ -52,7 +57,7 @@ def principal_from_request(request: Request, settings: Any) -> Principal:
     """Resolve the caller. ``settings`` needs ``identity_provider`` and ``group_role_map``."""
     claims = jwt_claims(request)
     if claims is None and dev_auth_enabled():
-        claims = _dev_claims(request, settings)
+        claims = dev_claims(request, settings)
     if claims is None:
         raise NotAuthenticated("no validated claims on the request")
     return get_provider(settings.identity_provider).principal(claims, settings.group_role_map)

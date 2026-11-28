@@ -33,7 +33,8 @@ def derive_links(entry: AgentEntry, gateways: list[GatewayEntry]) -> list[Gatewa
     runtime = entry.runtime
     if runtime is None or runtime.cell is None:
         return []
-    same_scope = [g for g in gateways if g.cell.scope == runtime.cell.scope]
+    # A gateway that no reader read has no address and no tags to match: nothing is derived for it.
+    same_scope = [g for g in gateways if g.cell is not None and g.cell.scope == runtime.cell.scope]
     if runtime.gateway_url:
         wanted = runtime.gateway_url.rstrip("/")
         by_url = [g for g in same_scope if g.url and g.url.rstrip("/") == wanted]
@@ -104,6 +105,8 @@ def build_graph(agents: list[AgentEntry], gateways: list[GatewayEntry]) -> Gover
                 "environment": server.environment,
                 "enforcement_mode": gateway.enforcement_mode,
                 "tool_count": len(server.available_tools),
+                "reader_status": server.reader_status,
+                "detection_sources": list(server.detection_sources),
             },
         )
 
@@ -137,6 +140,10 @@ def build_graph(agents: list[AgentEntry], gateways: list[GatewayEntry]) -> Gover
         for link in entry.links:
             mcp_node = f"mcp:{link.gateway_id}"
             gateway = by_id.get(link.gateway_id)
+            if gateway is not None and not gateway.read:
+                # The gateway is known from the organization registry only. An edge would say who
+                # can call it and whether a policy stands between, and neither is known.
+                continue
             if mcp_node not in nodes:
                 # The record names a gateway that is not in a configured cell.
                 nodes[mcp_node] = GraphNode(

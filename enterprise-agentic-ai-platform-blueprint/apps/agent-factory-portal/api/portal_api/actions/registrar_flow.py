@@ -4,12 +4,13 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Any
 
 from botocore.exceptions import ClientError
 
-from portal_api import registrations
-from portal_api.actions import audit_writer, authority, registrar
+from portal_api import registrations, reviews
+from portal_api.actions import audit_writer, authority, lifecycle_rules, reference_rules, registrar
 from portal_api.actions.engine import ActionEngine, ActionError, Target
 from portal_api.aws.session import error_code
 from portal_api.models.portal import ActionResult, Registration, RegistrationInput
@@ -26,21 +27,29 @@ def _registration(record: dict[str, Any]) -> Registration:
 
 
 def _document(body: RegistrationInput, version: str) -> dict[str, Any]:
+    """The governance document of a create or an update, or the 422 that says what is wrong with it."""
     try:
-        return registrations.build_document(body, version)
+        document = registrations.build_document(body, version)
     except registrations.DocumentError as exc:
         raise ActionError(422, exc.errors()) from exc
+    # A registration's own review date is bounded like a review's: at most a year ahead.
+    problem = reviews.document_date_error(document.get("reviewBy"), dt.datetime.now(dt.UTC).date())
+    if problem is not None:
+        raise ActionError(422, registrations.DocumentError(problem, "document.reviewBy").errors())
+    return document
 
 
 def _load(engine: ActionEngine, action: str, record_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """The settled record and its governance document, or 404.
 
     A caller without the registrar authority is refused before the record is
-    read, so the answer does not reveal whether the record exists.
+    read, so the answer does not reveal whether the record exists. That
+    refusal is logged, not written to the record's history: nothing has been
+    resolved, and the id is whatever the caller sent.
     """
     if not authority.has_authority(engine.principal, action):
         target = Target(action=action, tenant_id=authority.NO_TENANT, record_name="", record_id=record_id)
-        engine.authorize(target, {"recordId": record_id}, None)
+        engine.authorize(target, {"recordId": record_id}, None, resolved=False)
     try:
         record = registrar.wait_until_settled(engine.registry, engine.settings.registry_id, record_id)
     except ClientError as exc:
@@ -83,6 +92,28 @@ def _in_transition(engine: ActionEngine, target: Target) -> None:
         raise engine.deny(target, 409, f"The record is still {target.status_before}; try again shortly")
 
 
+def _own_references(document: dict[str, Any], engine: ActionEngine) -> str | None:
+    """The refusal when the document names a Runtime, Tool Gateway or policy engine this caller may not name."""
+    return reference_rules.foreign_reference(
+        document,
+        engine.settings.cells,
+        authority.tenants_of(engine.principal, engine.settings),
+        authority.holds_all_tenants(engine.principal),
+    )
+
+
+def _foreign(error: ActionError) -> ActionError:
+    error.extra["hint"] = reference_rules.HINT
+    return error
+
+
+def _not_retired(engine: ActionEngine, target: Target) -> None:
+    """A retired record is final: it is refused by rule, not left to the registry to reject."""
+    retired = lifecycle_rules.retired_refusal(target.action, target.status_before)
+    if retired is not None:
+        raise engine.deny(target, 409, retired)
+
+
 def create(engine: ActionEngine, body: RegistrationInput) -> ActionResult:
     version = body.record_version or "1.0.0"
     if registrations.parse_version(version) is None:
@@ -100,7 +131,12 @@ def create(engine: ActionEngine, body: RegistrationInput) -> ActionResult:
         record_name=name,
         document_sha256=registrations.sha256(registrations.canonical(document)),
     )
-    allow_reason = engine.authorize(target, {"tenantId": document["tenantId"]}, None)
+    # No record exists yet, and the name is the caller's: a create that is refused for authority,
+    # for the tenant or for its references is logged, not written under that name.
+    allow_reason = engine.authorize(target, {"tenantId": document["tenantId"]}, None, resolved=False)
+    foreign = _own_references(document, engine)
+    if foreign is not None:
+        raise _foreign(engine.refuse_unrecorded(target, 403, foreign))
     if registrar.find_by_name(engine.registry, engine.settings.registry_id, name):
         raise engine.deny(target, 409, f"A record named {name} already exists")
 
@@ -118,6 +154,8 @@ def update(engine: ActionEngine, record_id: str, body: RegistrationInput) -> Act
     if not authority.holds_tenant(engine.principal, engine.settings, str(current.get("tenantId"))):
         # Refuse a caller who does not hold the record's tenant before telling it anything about the record.
         engine.authorize(_target("update", record, current), {"recordId": record_id}, _state(record, current))
+    # Said before the body is looked at: nothing a caller sends can change a retired record.
+    _not_retired(engine, _target("update", record, current))
     for field, value in (("tenantId", body.tenant_id), ("agentId", body.agent_id), ("environment", body.environment)):
         if value != current.get(field):
             raise ActionError(
@@ -141,6 +179,9 @@ def update(engine: ActionEngine, record_id: str, body: RegistrationInput) -> Act
         "proposedReferences": authority.approved_references(document),
     }
     allow_reason = engine.authorize(target, request, _state(record, current))
+    foreign = _own_references(document, engine)
+    if foreign is not None:
+        raise _foreign(engine.deny(target, 403, foreign))
     _in_transition(engine, target)
     if target.status_before not in UPDATABLE:
         raise engine.deny(target, 409, f"A record in status {target.status_before} cannot be updated")
@@ -160,6 +201,7 @@ def submit(engine: ActionEngine, record_id: str) -> ActionResult:
     target = _target("submit", record, document)
     engine.authorize(target, {"recordId": record_id, "tenantId": target.tenant_id}, _state(record, document))
     _in_transition(engine, target)
+    _not_retired(engine, target)
     if target.status_before == "PENDING_APPROVAL":
         raise engine.deny(target, 409, "The record is already submitted for approval")
     if target.status_before == "REJECTED":

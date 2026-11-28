@@ -16,9 +16,15 @@ from typing import Any
 
 from botocore.exceptions import ClientError
 
+_SERVER_ERRORS = ("InternalServerException", "InternalServerError", "InternalFailure", "ServiceUnavailableException")
 
-def client_error(code: str, operation: str = "Operation") -> ClientError:
-    return ClientError({"Error": {"Code": code, "Message": "simulated"}}, operation)
+
+def client_error(code: str, operation: str = "Operation", status: int | None = None) -> ClientError:
+    """An error as the service answers one: with the HTTP status that goes with the code."""
+    if status is None:
+        status = 500 if code in _SERVER_ERRORS else 429 if "Throttl" in code else 400
+    response = {"Error": {"Code": code, "Message": "simulated"}, "ResponseMetadata": {"HTTPStatusCode": status}}
+    return ClientError(response, operation)
 
 
 class FakePages:
@@ -148,13 +154,23 @@ class FakeRegistry:
 
 
 class FakeDynamo:
-    """An append-only table: put with a condition, query by partition. Nothing else exists."""
+    """An append-only table: put with a condition, query by partition. Nothing else exists.
+
+    A query is served the way the service serves one: only the items whose
+    sort key begins with the prefix the caller named, a page at a time, each
+    of at most the page size the caller asked for, and only when the caller
+    asks for the next page. ``pages_read`` and ``items_read`` count what was
+    actually handed out, so a test can show that a read stopped early.
+    """
 
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
         self.calls: list[str] = []
         self.fail_put_numbers: set[int] = set()  # 1-based indices of put_item calls that fail
         self.fail_query = False
+        self.pages_read = 0
+        self.items_read = 0
+        self.queried: list[str] = []  # the partition key of every query, in order
         self._puts = 0
 
     def put_item(self, TableName: str, Item: dict, ConditionExpression: str) -> dict[str, Any]:  # noqa: N803
@@ -174,19 +190,46 @@ class FakeDynamo:
         table = self
 
         class Pages:
-            def paginate(self, **kwargs: Any) -> list[dict[str, Any]]:
+            def paginate(self, **kwargs: Any) -> Any:
                 table.calls.append("query")
                 if table.fail_query:
                     raise client_error("InternalServerError", "Query")
                 assert kwargs["ConsistentRead"] is True  # noqa: S101
+                assert kwargs["KeyConditionExpression"] == "pk = :pk AND begins_with(sk, :prefix)"  # noqa: S101
                 pk = kwargs["ExpressionAttributeValues"][":pk"]["S"]
-                rows = [item for (p, _), item in table.items.items() if p == pk]
+                prefix = kwargs["ExpressionAttributeValues"][":prefix"]["S"]
+                table.queried.append(pk)
+                rows = [item for (p, sk), item in table.items.items() if p == pk and sk.startswith(prefix)]
                 rows.sort(key=lambda item: item["sk"]["S"], reverse=not kwargs.get("ScanIndexForward", True))
-                return [{"Items": rows}]
+                return table._serve(rows, (kwargs.get("PaginationConfig") or {}).get("PageSize"))
 
         return Pages()
 
+    def _serve(self, rows: list[dict[str, Any]], page_size: int | None) -> Any:
+        """The pages of one query, handed out one at a time as the caller iterates."""
+        size = page_size or max(len(rows), 1)
+        offset = 0
+        while True:
+            page = rows[offset : offset + size]
+            offset += len(page)
+            self.pages_read += 1
+            self.items_read += len(page)
+            # As the service does: a page that was cut at the page size says that there may be more,
+            # even when the next page then turns out to be empty.
+            if len(page) == size and page_size is not None:
+                yield {"Items": page, "LastEvaluatedKey": {"pk": page[-1]["pk"], "sk": page[-1]["sk"]}}
+            else:
+                yield {"Items": page}
+                return
+
     def events(self) -> list[dict[str, str]]:
-        """Every stored event as plain strings, oldest first."""
+        """Every stored event and attestation as plain strings, oldest first: what a history read can return."""
+        return self._rows(lambda sort_key: sort_key.startswith("EVENT#"))
+
+    def claims(self) -> list[dict[str, str]]:
+        """Every stored item that is not an event: the sweeps the sweeper has claimed."""
+        return self._rows(lambda sort_key: not sort_key.startswith("EVENT#"))
+
+    def _rows(self, wanted: Any) -> list[dict[str, str]]:
         rows = sorted(self.items.values(), key=lambda item: item["sk"]["S"])
-        return [{k: v["S"] for k, v in row.items()} for row in rows]
+        return [{k: v["S"] for k, v in row.items()} for row in rows if wanted(row["sk"]["S"])]

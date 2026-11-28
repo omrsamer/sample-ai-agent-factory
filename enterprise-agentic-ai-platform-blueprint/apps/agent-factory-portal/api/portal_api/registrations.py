@@ -22,8 +22,10 @@ from portal_api.models.portal import Registration, RegistrationInput
 
 SCHEMA_VERSION = registry_mapper.AGENT_SCHEMA
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "agent-governance-1.0.json"
-RECORD_ID = re.compile(r"^[A-Za-z0-9]{12}$")
-_SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+# ASCII only and applied with ``fullmatch``: ``\d`` would also match digits of other scripts, and
+# ``$`` would also match before a final line feed.
+RECORD_ID = re.compile(r"[A-Za-z0-9]{12}", re.ASCII)
+_SEMVER = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)", re.ASCII)
 
 # Fields that identify a record. The record name is derived from them, so they never change.
 IDENTITY_FIELDS = ("tenantId", "agentId", "environment")
@@ -111,12 +113,24 @@ def _check(node: dict[str, Any], value: Any, path: str) -> None:
             raise DocumentError(f"{path} must be a string", path)
         if "enum" in node and value not in node["enum"]:
             raise DocumentError(f"{path} must be one of {', '.join(node['enum'])}", path)
-        if "pattern" in node and not re.search(node["pattern"], value):
+        if "pattern" in node and not _matches(node["pattern"], value):
             raise DocumentError(f"{path} does not match {node['pattern']}", path)
         if len(value) < node.get("minLength", 0):
             raise DocumentError(f"{path} is too short", path)
         if "maxLength" in node and len(value) > node["maxLength"]:
             raise DocumentError(f"{path} is longer than {node['maxLength']} characters", path)
+
+
+def _matches(pattern: str, value: str) -> bool:
+    """Whether ``value`` satisfies a pattern of the schema.
+
+    In the schema ``$`` means the end of the value. Python's ``$`` also
+    matches before a final line feed, so it is replaced by ``\\Z``, which
+    does not: an ARN or an id followed by a line feed is not that ARN or id.
+    """
+    if pattern.endswith("$") and not pattern.endswith("\\$"):
+        pattern = pattern[:-1] + "\\Z"
+    return re.search(pattern, value, re.ASCII) is not None
 
 
 def validate_document(document: dict[str, Any]) -> None:
@@ -140,7 +154,7 @@ def record_description(document: dict[str, Any]) -> str:
 
 
 def parse_version(value: Any) -> tuple[int, int, int] | None:
-    match = _SEMVER.match(value) if isinstance(value, str) else None
+    match = _SEMVER.fullmatch(value) if isinstance(value, str) else None
     return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 
@@ -239,6 +253,7 @@ def to_registration(record: dict[str, Any], document: dict[str, Any]) -> Registr
         record_id=str(record["recordId"]),
         name=text(record.get("name")) or str(record["recordId"]),
         status=str(record.get("status") or "UNKNOWN"),
+        lifecycle_state=registry_mapper.lifecycle_state(record),
         status_reason=text(record.get("statusReason")),
         record_version=text(record.get("recordVersion")) or text(document.get("recordVersion")),
         tenant_id=text(document.get("tenantId")),

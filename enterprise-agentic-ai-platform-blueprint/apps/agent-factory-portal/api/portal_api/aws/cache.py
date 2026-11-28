@@ -19,10 +19,15 @@ class TTLCache:
         self._lock = threading.Lock()
         self._entries: dict[Hashable, tuple[float, Any]] = {}
 
-    def get_or_load(self, key: Hashable, ttl_seconds: float, loader: Callable[[], T]) -> T:
-        """Return the cached value for ``key`` or call ``loader``. Failures are never cached."""
+    def get_or_load(self, key: Hashable, ttl_seconds: float, loader: Callable[[], T], *, refresh: bool = False) -> T:
+        """Return the cached value for ``key`` or call ``loader``. Failures are never cached.
+
+        With ``refresh`` the cached value is not looked at: the loader runs and
+        its value replaces what was cached. If the loader fails, what was
+        cached stays.
+        """
         now = self._clock()
-        if ttl_seconds > 0:
+        if ttl_seconds > 0 and not refresh:
             with self._lock:
                 hit = self._entries.get(key)
                 if hit is not None and hit[0] > now:

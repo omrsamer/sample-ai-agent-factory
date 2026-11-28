@@ -164,8 +164,74 @@ def test_console_role_levels():
         ({}, "sub-1"),
     ],
 )
-def test_display_label_order(claims, expected):
+def test_the_name_shown_to_the_caller(claims, expected):
+    """``name`` is for display to the caller: the name, else the email, else a user name, else the subject."""
+    principal = CognitoProvider().principal({"sub": "sub-1", "cognito:groups": "[devs]", **claims}, ROLE_MAP)
+    assert principal.name == expected
+    entra = EntraProvider().principal({"oid": "sub-1", "roles": ["Portal.Admin"], **claims}, ROLE_MAP)
+    assert entra.name == expected
+
+
+FEDERATED = '[{"userId":"u-1","providerName":"Corp","providerType":"SAML","primary":"true"}]'
+
+
+@pytest.mark.parametrize(
+    ("claims", "expected"),
+    [
+        # A local user: only an email that Cognito has verified. A boolean in a verified token,
+        # the string API Gateway passes, in either case.
+        ({"email": "a@example.com", "email_verified": True}, "a@example.com"),
+        ({"email": "a@example.com", "email_verified": "true"}, "a@example.com"),
+        ({"email": "a@example.com", "email_verified": "True"}, "a@example.com"),
+        # An unverified email is whatever its owner typed: the subject is recorded instead.
+        ({"email": "a@example.com", "email_verified": False}, "sub-1"),
+        ({"email": "a@example.com", "email_verified": "false"}, "sub-1"),
+        ({"email": "a@example.com"}, "sub-1"),
+        ({"email": "a@example.com", "email_verified": "yes"}, "sub-1"),
+        ({"email": "a@example.com", "email_verified": 1}, "sub-1"),
+        # A federated user (the token has an identities claim): the email the identity provider set.
+        (
+            {"email": "a@corp.example", "email_verified": False, "identities": [{"providerName": "Corp"}]},
+            "a@corp.example",
+        ),
+        ({"email": "a@corp.example", "identities": FEDERATED}, "a@corp.example"),
+        ({"email": "a@example.com", "identities": []}, "sub-1"),
+        ({"email": "a@example.com", "identities": "[]"}, "sub-1"),
+        ({"email": "a@example.com", "identities": ""}, "sub-1"),
+        ({"identities": FEDERATED}, "sub-1"),  # federated, but the token holds no email
+        # A name is never what a person is recorded as: its owner can change it.
+        ({"name": "Ana Admin", "cognito:username": "ana1", "preferred_username": "ana"}, "sub-1"),
+        ({"name": "root@example.com", "email": "a@example.com", "email_verified": True}, "a@example.com"),
+        ({}, "sub-1"),
+    ],
+)
+def test_what_a_cognito_caller_is_recorded_as(claims, expected):
     principal = CognitoProvider().principal({"sub": "sub-1", "cognito:groups": "[devs]", **claims}, ROLE_MAP)
     assert principal.label == expected
-    entra = EntraProvider().principal({"oid": "sub-1", "roles": ["Portal.Admin"], **claims}, ROLE_MAP)
-    assert entra.label == expected
+
+
+@pytest.mark.parametrize(
+    ("claims", "expected"),
+    [
+        # The directory assigns the user name; the person cannot edit it. No proof of a verified domain is asked.
+        ({"preferred_username": "ana@corp.example", "upn": "ana.upn@corp.example", "name": "Ana"}, "ana@corp.example"),
+        ({"upn": "ana.upn@corp.example", "name": "Ana", "email": "typed@example.com"}, "ana.upn@corp.example"),
+        ({"preferred_username": "ana@corp.example", "xms_edov": False}, "ana@corp.example"),
+        # An email claim alone is not used: it can be an address its owner set.
+        ({"email": "typed@example.com", "name": "Ana"}, "oid-1"),
+        ({"name": "Ana Admin"}, "oid-1"),
+        ({}, "oid-1"),
+    ],
+)
+def test_what_an_entra_caller_is_recorded_as(claims, expected):
+    principal = EntraProvider().principal({"oid": "oid-1", "roles": ["Portal.Admin"], **claims}, ROLE_MAP)
+    assert principal.label == expected
+
+
+def test_a_principal_made_without_such_an_identifier_is_recorded_by_its_subject():
+    from portal_api.identity.provider import Principal
+
+    principal = Principal(
+        subject="s-1", email="typed@example.com", display_name="Any Name", groups=(), role="developer"
+    )
+    assert (principal.label, principal.name) == ("s-1", "Any Name")

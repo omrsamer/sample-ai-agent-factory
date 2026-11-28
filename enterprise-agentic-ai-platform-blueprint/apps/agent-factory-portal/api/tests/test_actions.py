@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from typing import Any
 
@@ -12,23 +13,35 @@ from mangum import Mangum
 
 from portal_api import deps, registrations
 from portal_api.actions import app as actions_app
-from portal_api.actions import authority
+from portal_api.actions import authority, reference_rules
 from portal_api.app import create_app
 from portal_api.aws import audit as audit_reader
-from portal_api.config import ConfigError, get_settings, load_action_settings
+from portal_api.config import ConfigError, get_settings, load_action_settings, load_settings
 from portal_api.identity.provider import Principal
 from portal_api.models.portal import AuditEvent
 from tests.conftest import BASE_ENV, FakeClients, make_service
 from tests.fakes import FakeDynamo, FakeRegistry
 from tests.test_api import event
 
-DEV = {"sub": "dev-1", "email": "dev@example.com", "cognito:groups": "[devs]"}  # developer, tenant ws1
+# developer, tenant ws1; the email is verified, so it is what this person is recorded as
+DEV = {"sub": "dev-1", "email": "dev@example.com", "email_verified": True, "cognito:groups": "[devs]"}
 DEV2 = {"sub": "dev-2", "email": "dev2@example.com", "cognito:groups": "[devs2]"}  # developer, tenant ws2
-ANN = {"sub": "ann-1", "name": "Ann Approver", "cognito:groups": "[approvers]"}  # approver, tenant ws1
+# approver, tenant ws1; recorded by the verified email, never by the name, which its owner can change
+ANN = {
+    "sub": "ann-1",
+    "name": "Ann Approver",
+    "email": "ann@example.com",
+    "email_verified": True,
+    "cognito:groups": "[approvers]",
+}
 ANN2 = {"sub": "ann-2", "cognito:groups": "[approvers2]"}  # approver, tenant ws2
 SEC = {"sub": "sec-1", "cognito:groups": "[sec]"}  # security, tenants ws1 and ws2
 PAT = {"sub": "pat-1", "email": "pat@example.com", "cognito:groups": "[platform-admins]"}  # platform, every tenant
 VIEW = {"sub": "view-1", "cognito:groups": "[viewers]"}
+
+# A Runtime in the cell of tenant ws2, and one in an account in which the portal has no cell.
+WS2_RUNTIME = "arn:aws:bedrock-agentcore:eu-west-1:777777777777:runtime/claims_agent-QqQqQq1111"
+UNMANAGED_RUNTIME = "arn:aws:bedrock-agentcore:eu-west-1:888888888888:runtime/far_agent-QwErTy5678"
 
 BODY = {
     "tenant_id": "ws1",
@@ -180,19 +193,50 @@ def test_create_refuses_a_duplicate_name_with_409(world):
         (DEV2, "ws1", "own tenant"),
     ],
 )
-def test_create_without_authority_or_tenant_is_403_and_audited(world, claims, tenant, reason):
-    code, body = world.create(claims, tenant_id=tenant)
+def test_create_without_authority_or_tenant_is_403_and_logged_not_written(world, claims, tenant, reason, caplog):
+    """No record exists and the name is the caller's, so the refusal is not written under that name."""
+    with caplog.at_level("WARNING", logger="portal_api.actions.engine"):
+        code, body = world.create(claims, tenant_id=tenant)
     assert code == 403 and reason in body["detail"]
-    assert world.registry.records == {}
-    assert world.trail() == [("create", "result", "denied")]
-    denied = world.dynamo.events()[0]
-    assert denied["pk"] == f"RECORD#NAME#agent-{tenant}-travel-agent-nonprod"
-    assert denied["actor_subject"] == claims["sub"] and denied["tenant_id"] == tenant
+    assert body["action"] == "create" and body["request_id"]
+    assert world.registry.records == {} and world.registry.calls == []
+    assert world.dynamo.items == {}
+    (logged,) = [r.getMessage() for r in caplog.records if "not written to the audit trail" in r.getMessage()]
+    assert f"request_id={body['request_id']}" in logged and f"subject={claims['sub']}" in logged
+    assert "action=create" in logged and reason in logged
+
+
+def test_a_refusal_before_a_record_is_resolved_is_never_written_whoever_the_caller_is(caplog):
+    """Two separate things keep such a refusal out of the audit trail. This is the first, on its own.
+
+    The second is that a refusal is written only for a caller who has a part in the record. The
+    platform role holds every tenant and both authorities, so it passes that one: for it, only the
+    fact that nothing was resolved keeps the refusal from being written under an id the caller sent.
+    """
+    from portal_api.actions import engine
+
+    settings = load_action_settings({**BASE_ENV, "PORTAL_ACTION_ROLE": "registrar"})
+    platform = Principal(subject="pat-1", email=None, display_name=None, groups=("platform-admins",), role="platform")
+    target = engine.Target(action="update", tenant_id="ws1", record_name="", record_id="rec000000099")
+    assert authority.has_part(platform, settings, "update", "ws1") is True
+    dynamo = FakeDynamo()
+    with caplog.at_level("WARNING", logger="portal_api.actions.engine"), pytest.raises(engine.ActionError) as refused:
+        # The core refuses an update of a record that does not exist.
+        engine.ActionEngine(settings, None, dynamo, platform).authorize(
+            target, {"recordId": "rec000000099"}, None, resolved=False
+        )
+    assert refused.value.status == 403 and "does not exist" in refused.value.detail
+    assert dynamo.items == {} and dynamo.calls == []
+    assert refused.value.extra["request_id"] in caplog.text
+    # The same refusal about a record that was resolved is written for this caller.
+    with pytest.raises(engine.ActionError):
+        engine.ActionEngine(settings, None, dynamo, platform).authorize(target, {"recordId": "rec000000099"}, None)
+    assert [e["outcome"] for e in dynamo.events()] == ["denied"]
 
 
 def test_platform_role_is_registrar_for_every_tenant(world):
-    assert world.create(PAT, tenant_id="ws2")[0] == 201
-    assert world.create(PAT, tenant_id="ws9", agent_id="other")[0] == 201
+    assert world.create(PAT, tenant_id="ws2", runtime_arn=WS2_RUNTIME)[0] == 201
+    assert world.create(PAT, tenant_id="ws9", agent_id="other", runtime_arn=UNMANAGED_RUNTIME)[0] == 201
 
 
 @pytest.mark.parametrize(
@@ -257,17 +301,22 @@ def test_type_errors_use_the_same_list_form(world):
     assert all(set(e) == {"loc", "msg", "type"} for e in body["detail"])
 
 
+def ahead(days: int) -> str:
+    """A date this many days from today (UTC). A registration's review date may be at most 366 days ahead."""
+    return (dt.datetime.now(dt.UTC).date() + dt.timedelta(days=days)).isoformat()
+
+
 def test_sponsor_and_review_date_are_stored_and_are_not_governed_references(world):
-    code, body = world.create(sponsor="Sam Sponsor", review_by="2099-06-30")
+    code, body = world.create(sponsor="Sam Sponsor", review_by=ahead(200))
     assert code == 201
     document = body["registration"]["document"]
-    assert (document["sponsor"], document["review_by"]) == ("Sam Sponsor", "2099-06-30")
+    assert (document["sponsor"], document["review_by"]) == ("Sam Sponsor", ahead(200))
     record_id = body["registration"]["record_id"]
     stored = json.loads(world.registry.records[record_id]["descriptors"]["custom"]["data"])
-    assert (stored["sponsor"], stored["reviewBy"]) == ("Sam Sponsor", "2099-06-30")
+    assert (stored["sponsor"], stored["reviewBy"]) == ("Sam Sponsor", ahead(200))
     assert world.submit(record_id)[0] == 200 and world.decide("approve", record_id)[0] == 200
     # Changing them on an approved record is an ordinary update, not a change of an approved reference.
-    code, body = world.update(record_id, sponsor="Nia Newsponsor", review_by="2100-01-31")
+    code, body = world.update(record_id, sponsor="Nia Newsponsor", review_by=ahead(300))
     assert code == 200 and body["registration"]["document"]["sponsor"] == "Nia Newsponsor"
     assert authority.approved_references({**stored, "sponsor": "x", "reviewBy": "2000-01-01"}) == (
         authority.approved_references(stored)
@@ -382,7 +431,8 @@ def test_update_of_a_deprecated_record_is_409(world):
     record_id = world.new_record()
     world.registry.records[record_id]["status"] = "DEPRECATED"
     code, body = world.update(record_id, contact="x@example.com")
-    assert code == 409 and "DEPRECATED" in body["detail"]
+    assert code == 409 and body["detail"] == "a retired record cannot be updated: retirement is permanent (RET-03-N)"
+    assert "update_registry_record" not in world.registry.calls
 
 
 # --- submit and delete ----------------------------------------------------------------
@@ -401,7 +451,7 @@ def test_submit_moves_a_draft_to_pending_approval(world):
         ("PENDING_APPROVAL", "already submitted"),
         ("REJECTED", "must be updated"),
         ("APPROVED", "cannot be submitted"),
-        ("DEPRECATED", "cannot be submitted"),
+        ("DEPRECATED", "a retired record cannot be submitted: retirement is permanent (RET-03-N)"),
     ],
 )
 def test_submit_in_a_state_that_does_not_permit_it_is_409(world, status, message):
@@ -511,7 +561,7 @@ def test_decision_without_authority_or_tenant_is_403(world, claims, reason):
     assert world.status(record_id) == "PENDING_APPROVAL"
 
 
-@pytest.mark.parametrize("status", ["DRAFT", "APPROVED", "REJECTED", "DEPRECATED"])
+@pytest.mark.parametrize("status", ["DRAFT", "APPROVED", "REJECTED"])
 def test_decision_on_a_record_that_is_not_pending_is_409(world, status):
     record_id = world.new_record()
     world.registry.records[record_id]["status"] = status
@@ -582,7 +632,8 @@ def test_every_event_carries_the_agreed_fields_and_keys(world):
     assert [e.get("status_before") for e in events[2:]] == ["DRAFT", "DRAFT", "PENDING_APPROVAL", "PENDING_APPROVAL"]
     assert [e.get("status_after") for e in events] == [None, "DRAFT", None, "PENDING_APPROVAL", None, "APPROVED"]
     assert events[2]["request_id"] == events[3]["request_id"] != events[4]["request_id"]
-    assert (events[5]["actor_label"], events[5]["actor_role"]) == ("Ann Approver", "approver")
+    assert (events[5]["actor_label"], events[5]["actor_role"]) == ("ann@example.com", "approver")
+    assert events[0]["actor_label"] == "dev@example.com"  # a verified email
     assert events[1]["actor_label"] == "dev@example.com"
     assert set(world.dynamo.calls) <= {"put_item", "query"}
 
@@ -707,8 +758,29 @@ def test_a_caller_without_authority_is_refused_before_the_record_is_read(world):
     assert world.submit(missing, VIEW)[0] == 403
     assert world.delete(missing, ANN)[0] == 403
     assert world.decide("approve", missing, DEV)[0] == 403
+    assert world.decide("reject", missing, VIEW)[0] == 403
     assert world.registry.calls == []
-    assert [e["pk"] for e in world.dynamo.events()] == [f"RECORD#{missing}"] * 3
+    # Nothing is written under an id the caller chose, whether a record has that id or not.
+    assert world.dynamo.items == {}
+    existing = world.new_record("PENDING_APPROVAL")
+    before = len(world.dynamo.events())
+    for code, body in (
+        world.update(existing, VIEW),
+        world.submit(existing, ANN),
+        world.delete(existing, SEC),
+        world.decide("approve", existing, DEV),
+        world.decide("reject", existing, VIEW),
+    ):
+        assert code == 403 and body["request_id"] and body["action"]
+    assert len(world.dynamo.events()) == before
+    # Nor is a refusal of someone who holds the authority but not the record's tenant.
+    code, body = world.update(existing, DEV2)
+    assert code == 403 and "cross-tenant" in body["detail"] and body["request_id"]
+    assert len(world.dynamo.events()) == before
+    # A refusal of someone who has a part in the record is still in its history.
+    code, body = world.submit(existing, DEV)
+    assert code == 409 and world.dynamo.events()[-1]["outcome"] == "denied"
+    assert world.dynamo.events()[-1]["pk"] == f"RECORD#{existing}"
 
 
 @pytest.mark.parametrize("record_id", ["short", "rec-00000001", "rec0000000001", "a%20b"])
@@ -805,10 +877,16 @@ def test_action_settings_need_only_their_own_variables():
         "PORTAL_GROUP_ROLE_MAP",
         "PORTAL_GROUP_TENANT_MAP",
         "PORTAL_AUDIT_TABLE",
+        "PORTAL_CELLS",  # which tenant runs where, for the rule about a registration's references
+        "PORTAL_JWT_ISSUER",  # the function verifies the caller's token itself
+        "PORTAL_JWT_AUDIENCE",
     )
     env = {"PORTAL_ACTION_ROLE": "approver", **{k: BASE_ENV[k] for k in needed if k != "PORTAL_ACTION_ROLE"}}
     settings = load_action_settings(env)
     assert settings.action_role == "approver" and settings.group_tenant_map["devs"] == ("ws1",)
+    for name in needed:
+        with pytest.raises(ConfigError, match=name):
+            load_action_settings({k: v for k, v in env.items() if k != name})
     with pytest.raises(ConfigError, match="PORTAL_ACTION_ROLE"):
         load_action_settings({**env, "PORTAL_ACTION_ROLE": "owner"})
 
@@ -890,7 +968,7 @@ def test_agent_references_are_projected_onto_the_core_slots():
 
 def test_registrations_list_and_filters(world):
     first = world.new_record("PENDING_APPROVAL")
-    code, body = world.create(PAT, tenant_id="ws2")
+    code, body = world.create(PAT, tenant_id="ws2", runtime_arn=WS2_RUNTIME)
     second = body["registration"]["record_id"]
     world.registry.seed("tool-echo", json.dumps({"schemaVersion": "agenticai.tool-governance/1.0"}))
     code, listed = world.call("read", "GET", "/registrations", VIEW)
@@ -899,6 +977,7 @@ def test_registrations_list_and_filters(world):
         "record_id",
         "name",
         "status",
+        "lifecycle_state",
         "status_reason",
         "record_version",
         "tenant_id",
@@ -941,7 +1020,7 @@ def test_single_registration_with_people_from_the_audit_trail(world):
     assert (rejected["status"], rejected["decision"], rejected["decided_by_label"], rejected["decision_reason"]) == (
         "REJECTED",
         "reject",
-        "Ann Approver",
+        "ann@example.com",
         "Owner contact is missing.",
     )
     assert world.update(record_id, contact="owner@example.com")[0] == 200  # back to DRAFT
@@ -1056,3 +1135,128 @@ def test_history_needs_the_audit_table_to_be_configured(world, monkeypatch):
     code, body = world.call("read", "GET", "/registrations/rec000000001/history", VIEW)
     assert (code, body) == (500, {"detail": "Portal configuration error: PORTAL_AUDIT_TABLE is not set"})
     assert world.call("read", "GET", "/agents", None)[0] == 401  # the rest of the read API is unaffected
+
+
+# --- a registration may not name another tenant's resources (REG-13-N) --------------------------------
+
+WS2_GATEWAY = "arn:aws:bedrock-agentcore:eu-west-1:777777777777:gateway/ws2-tools-zyxwvutsrq"
+WS2_ENGINE = "arn:aws:bedrock-agentcore:eu-west-1:777777777777:policy-engine/ws2_engine-zyxwvutsrq"
+WS1_GATEWAY = "arn:aws:bedrock-agentcore:eu-west-1:444444444444:gateway/ws1-tools-abcdefghij"
+REFUSAL = "the registration names a {} that runs in a cell of another tenant (REG-13-N)"
+
+
+def test_the_reference_rule():
+    cells = load_settings(BASE_ENV).cells  # ws1 in account 444444444444, ws2 in 777777777777, both eu-west-1
+    check = reference_rules.foreign_reference
+    own = {"tenantId": "ws1", "runtimeArn": BODY["runtime_arn"], "gatewayArn": WS1_GATEWAY}
+    assert check(own, cells) is None
+    assert check({"tenantId": "ws1"}, cells) is None  # no reference at all
+    # Each of the three references is checked, and the refusal says which one it is.
+    assert check({**own, "runtimeArn": WS2_RUNTIME}, cells) == REFUSAL.format("Runtime")
+    assert check({**own, "gatewayArn": WS2_GATEWAY}, cells) == REFUSAL.format("Tool Gateway")
+    assert check({**own, "policyEngineArn": WS2_ENGINE}, cells) == REFUSAL.format("policy engine")
+    assert check({"tenantId": "ws2", "runtimeArn": BODY["runtime_arn"]}, cells) == REFUSAL.format("Runtime")
+    assert check({"tenantId": "ws9", "runtimeArn": WS2_RUNTIME}, cells) == REFUSAL.format("Runtime")
+    # An account and Region in which the portal has no cell: allowed, whoever registers it.
+    assert check({"tenantId": "ws9", "runtimeArn": UNMANAGED_RUNTIME}, cells) is None
+    assert check({"tenantId": "ws1", "runtimeArn": WS2_RUNTIME.replace("eu-west-1", "us-east-1")}, cells) is None
+    # An account that two tenants share. The place does not say whose a resource is there, so
+    # naming one needs every tenant of the place: one tenant's people could otherwise register
+    # the other's Runtime as their own.
+    shared = [*cells, type(cells[0])(**{**cells[0].__dict__, "tenant_id": "ws9", "agent_id": "second"})]
+    everyone = "the registration names a {} in an account that several tenants share, and the principal does not "
+    everyone += "hold every one of them (REG-13-N)"
+    for tenant in ("ws1", "ws9"):
+        named = {"tenantId": tenant, "runtimeArn": BODY["runtime_arn"]}
+        assert check(named, shared) == everyone.format("Runtime")  # nobody is said to hold anything
+        assert check(named, shared, ("ws1",)) == check(named, shared, ("ws9",)) == everyone.format("Runtime")
+        assert check(named, shared, ("ws1", "ws2")) == everyone.format("Runtime")
+        assert check(named, shared, ("ws9", "ws1")) is None  # holds both
+        assert check(named, shared, ("ws1", "ws9", "ws2")) is None
+        assert check(named, shared, (), True) is None  # the platform role holds every tenant
+        assert check({**named, "runtimeArn": None, "gatewayArn": WS1_GATEWAY}, shared, ("ws1",)) == (
+            everyone.format("Tool Gateway")
+        )
+    # A third tenant is refused as before, whatever the caller holds.
+    assert check({"tenantId": "ws2", "runtimeArn": BODY["runtime_arn"]}, shared) == REFUSAL.format("Runtime")
+    assert check({"tenantId": "ws2", "runtimeArn": BODY["runtime_arn"]}, shared, (), True) == REFUSAL.format("Runtime")
+    # A place with one tenant needs no more than before: the caller's tenants play no part.
+    assert check(own, cells, ()) is None and check(own, cells, ("ws2",)) is None
+    # Something that is not an ARN names no account; the document's own validation refuses it.
+    assert check({"tenantId": "ws1", "runtimeArn": "not-an-arn", "gatewayArn": None}, cells) is None
+
+
+@pytest.mark.parametrize(
+    ("changes", "what"),
+    [
+        ({"runtime_arn": WS2_RUNTIME}, "Runtime"),
+        ({"gateway_arn": WS2_GATEWAY}, "Tool Gateway"),
+        ({"policy_engine_arn": WS2_ENGINE}, "policy engine"),
+    ],
+)
+def test_create_naming_another_tenants_resource_is_403_and_logged_not_written(world, changes, what, caplog):
+    with caplog.at_level("WARNING", logger="portal_api.actions.engine"):
+        code, body = world.create(DEV, **changes)  # a registrar of ws1, a resource in ws2's cell
+    assert code == 403 and body["detail"] == REFUSAL.format(what)
+    assert body["action"] == "create" and body["request_id"] and "no cell" in body["hint"]
+    # Nothing was created, and nothing is written under a name the caller chose.
+    assert world.registry.records == {} and world.registry.calls == [] and world.dynamo.items == {}
+    assert any(f"request_id={body['request_id']}" in r.getMessage() for r in caplog.records)
+    # The platform role holds every tenant, and the rule holds for it too.
+    assert world.create(PAT, **changes)[0] == 403
+
+
+def test_create_naming_a_resource_in_an_account_without_a_cell_is_allowed(world):
+    code, body = world.create(DEV, runtime_arn=UNMANAGED_RUNTIME)
+    assert code == 201 and body["registration"]["document"]["runtime_arn"] == UNMANAGED_RUNTIME
+
+
+def test_update_naming_another_tenants_resource_is_403_and_in_the_records_history(world):
+    record_id = world.new_record()
+    before = dict(world.registry.records[record_id])
+    code, body = world.update(record_id, DEV, runtime_arn=WS2_RUNTIME)
+    assert code == 403 and body["detail"] == REFUSAL.format("Runtime") and body["hint"]
+    assert world.registry.records[record_id]["descriptors"] == before["descriptors"]
+    denied = world.dynamo.events()[-1]
+    assert (denied["pk"], denied["action"], denied["outcome"]) == (f"RECORD#{record_id}", "update", "denied")
+    assert denied["request_id"] == body["request_id"] and "REG-13-N" in denied["reason"]
+    # An update that names the tenant's own resources goes through.
+    assert world.update(record_id, DEV, gateway_arn=WS1_GATEWAY)[0] == 200
+
+
+def test_approve_refuses_a_record_that_names_another_tenants_resource(world):
+    """A record written before the rule, or by other means, is checked again when it is approved."""
+    document = {**registrations.agent_document(world.registry.records[world.new_record()]), "agentId": "borrowed"}
+    document["runtimeArn"] = WS2_RUNTIME
+    seeded = world.registry.seed("agent-ws1-borrowed-nonprod", json.dumps(document), "PENDING_APPROVAL")
+    code, body = world.decide("approve", seeded, ANN)
+    assert code == 403 and body["detail"] == REFUSAL.format("Runtime") and body["hint"]
+    assert world.status(seeded) == "PENDING_APPROVAL"
+    denied = world.dynamo.events()[-1]
+    assert (denied["pk"], denied["action"], denied["outcome"]) == (f"RECORD#{seeded}", "approve", "denied")
+    # The platform role cannot approve it either; rejecting it is always possible.
+    assert world.decide("approve", seeded, PAT)[0] == 403
+    assert world.decide("reject", seeded, ANN)[0] == 200 and world.status(seeded) == "REJECTED"
+
+
+def test_the_documents_state_the_reference_rule_and_what_is_not_written():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    contract = " ".join((root / "ACTIONS_CONTRACT.md").read_text().split())
+    assert REFUSAL.format("Runtime") in contract and reference_rules.RULE == "REG-13-N"
+    for said in (
+        "| `REG-13-N` | 403 |",
+        "hint?: string; // present on REG-12-N and REG-13-N",
+        "The rule is checked on create, on update, and again on approve",
+        "**Who writes into a record's history.** Only a caller who has a part in the record",
+        "It is **not** in a history",
+        "kept in the function's log under that id",
+        "A history therefore shows fewer refusals than before this rule.",
+    ):
+        assert said in contract, said
+    readme = " ".join((root / "README.md").read_text().split())
+    assert "`portal_api/actions/reference_rules.py` (pure)" in readme
+    assert "**Who writes into a record's history.** Only a caller who has a part in the record" in readme
+    assert "`ActionEngine.deny` is the one place a refusal is written" in readme
+    assert [field for field, _ in reference_rules.REFERENCES] == ["runtimeArn", "gatewayArn", "policyEngineArn"]

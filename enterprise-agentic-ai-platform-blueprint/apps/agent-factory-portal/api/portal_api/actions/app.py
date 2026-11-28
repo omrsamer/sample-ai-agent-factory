@@ -6,6 +6,10 @@ Each function serves only its own routes. Anything else, including the other
 function's routes and every read route, is answered with 404. A function whose
 ``PORTAL_ACTION_ROLE`` does not match the handler it runs answers 404 for
 everything, so a mis-wired function fails closed.
+
+The caller is taken from the bearer token, which each function verifies itself
+(``portal_api/identity/verify.py``). The claims API Gateway puts in the event
+are not read here.
 """
 
 from __future__ import annotations
@@ -24,18 +28,22 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from portal_api.actions import sweep_queue
 from portal_api.actions.containment_flow import ContainmentService
 from portal_api.actions.engine import ActionEngine, ActionError
-from portal_api.aws.session import BOTO_CONFIG, AwsClients
-from portal_api.config import ACTION_ROLES, ActionSettings, ConfigError, get_action_settings
-from portal_api.identity.deps import principal_from_request
-from portal_api.identity.provider import NotAuthenticated, NotAuthorized, Principal
+from portal_api.aws.session import BOTO_CONFIG, SESSION_CONTAINMENT, AwsClients
+from portal_api.config import ACTION_ROLES, ActionSettings, ConfigError, dev_auth_enabled, get_action_settings
+from portal_api.identity import verify as tokens
+from portal_api.identity.deps import dev_claims
+from portal_api.identity.provider import NotAuthenticated, NotAuthorized, Principal, get_provider
 from portal_api.models.portal import (
     ActionResult,
     ContainmentInput,
     ContainmentResult,
     DecisionInput,
     RegistrationInput,
+    RetireInput,
+    ReviewInput,
 )
 
 logger = logging.getLogger("portal_api.actions")
@@ -43,6 +51,10 @@ logger = logging.getLogger("portal_api.actions")
 API_PREFIX = "/api/v1"
 RecordId = Annotated[str, Path(pattern=r"^[A-Za-z0-9]{12}$")]
 _NOT_FOUND = {"detail": "Not found"}
+KEYS_UNAVAILABLE = (
+    "The caller could not be verified because the identity provider's signing keys are not available. "
+    "Nothing was done. Try again shortly."
+)
 
 _lock = threading.Lock()
 _clients: dict[str, Any] = {}
@@ -64,8 +76,34 @@ def dynamodb_client(settings: ActionSettings = Depends(get_action_settings)) -> 
     return _client("dynamodb", settings.registry_region)
 
 
+def bearer_token(request: Request) -> str | None:
+    """The token of ``Authorization: Bearer <token>``, or ``None`` when the header is not of that form."""
+    scheme, _, value = (request.headers.get("authorization") or "").strip().partition(" ")
+    value = value.strip()
+    return value if scheme.lower() == "bearer" and value and " " not in value else None
+
+
 def action_principal(request: Request, settings: ActionSettings = Depends(get_action_settings)) -> Principal:
-    return principal_from_request(request, settings)
+    """The caller, from the bearer token this function verifies itself.
+
+    Nothing of the event's authorizer context is read: a caller who can
+    invoke the function directly chooses that. In local development (never
+    inside AWS Lambda) the header-based identity is accepted as before.
+    """
+    provider = get_provider(settings.identity_provider)
+    if dev_auth_enabled():
+        claims = dev_claims(request, settings)
+        if claims is not None:
+            return provider.principal(claims, settings.group_role_map)
+    token = bearer_token(request)
+    if token is None or settings.token is None:
+        raise NotAuthenticated("no bearer token on the request")
+    try:
+        claims = tokens.verify(token, settings.token, tokens.keys_for(settings.token.jwks_url))
+    except tokens.TokenRejected as exc:
+        logger.warning("Bearer token not accepted: %s", exc)
+        raise NotAuthenticated("the bearer token was not accepted") from exc
+    return provider.principal(claims, settings.group_role_map)
 
 
 def engine(
@@ -122,7 +160,7 @@ def _registrar_router() -> APIRouter:
 
 
 def _approver_router() -> APIRouter:
-    from portal_api.actions import approver_flow
+    from portal_api.actions import approver_flow, lifecycle_flow
 
     router = APIRouter(prefix="/registrations", tags=["registrations"])
 
@@ -134,6 +172,14 @@ def _approver_router() -> APIRouter:
     def reject(record_id: RecordId, body: DecisionInput, engine: Engine) -> ActionResult:
         return approver_flow.decide(engine, "reject", record_id, body)
 
+    @router.post("/{record_id}/retire", response_model=ActionResult)
+    def retire(record_id: RecordId, body: RetireInput, engine: Engine) -> ActionResult:
+        return lifecycle_flow.retire(engine, record_id, body)
+
+    @router.post("/{record_id}/review", response_model=ActionResult)
+    def review(record_id: RecordId, body: ReviewInput, engine: Engine) -> ActionResult:
+        return lifecycle_flow.review(engine, record_id, body)
+
     return router
 
 
@@ -142,8 +188,15 @@ def containment_clients(settings: ActionSettings = Depends(get_action_settings))
     key = f"containment:{settings.registry_region}"
     with _lock:
         if key not in _clients:
-            _clients[key] = AwsClients(home_region=settings.registry_region)
+            _clients[key] = AwsClients(home_region=settings.registry_region, session_name=SESSION_CONTAINMENT)
         return _clients[key]
+
+
+def sweep_queue_client(settings: ActionSettings = Depends(get_action_settings)) -> Any:
+    """The queue client for background sweeps, or ``None`` when no sweep queue is configured."""
+    if not settings.sweep_queue_url:
+        return None
+    return _client("sqs", sweep_queue.region_of(settings.sweep_queue_url) or settings.registry_region)
 
 
 def containment_service(
@@ -152,8 +205,9 @@ def containment_service(
     registry: Any = Depends(registry_client),
     dynamodb: Any = Depends(dynamodb_client),
     clients: Any = Depends(containment_clients),
+    sqs: Any = Depends(sweep_queue_client),
 ) -> ContainmentService:
-    return ContainmentService(settings, clients, registry, dynamodb, principal)
+    return ContainmentService(settings, clients, registry, dynamodb, principal, sqs)
 
 
 Containment = Annotated[ContainmentService, Depends(containment_service)]
@@ -212,6 +266,11 @@ def create_action_app(role: str) -> FastAPI:
     @app.exception_handler(NotAuthorized)
     async def not_authorized(_: Request, exc: NotAuthorized) -> JSONResponse:
         return JSONResponse({"detail": "No portal role is assigned to this identity"}, status_code=403)
+
+    @app.exception_handler(tokens.KeysUnavailable)
+    async def keys_unavailable(_: Request, exc: tokens.KeysUnavailable) -> JSONResponse:
+        logger.error("No token can be verified: %s", exc)
+        return JSONResponse({"detail": KEYS_UNAVAILABLE}, status_code=503)
 
     @app.exception_handler(ActionError)
     async def action_error(_: Request, exc: ActionError) -> JSONResponse:

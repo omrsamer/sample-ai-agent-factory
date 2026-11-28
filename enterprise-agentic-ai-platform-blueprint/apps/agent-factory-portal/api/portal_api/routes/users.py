@@ -34,7 +34,7 @@ def me(principal: CurrentPrincipal, settings: Settings = Depends(get_settings)) 
         # Milestone 1 is read-only: nobody can deploy or change anything through the portal.
         can_deploy=False,
         oid=principal.subject,
-        name=principal.label,
+        name=principal.name,
         tenants=[{"id": tenant, "name": tenant, "line_of_business": "", "stages": {}} for tenant in tenants],
         portal_role=principal.role,
         groups=list(principal.groups),

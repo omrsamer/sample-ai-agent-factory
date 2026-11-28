@@ -68,6 +68,9 @@ class FleetSummary(BaseModel):
     gateways_by_policy_mode: dict[str, int] = Field(default_factory=dict)
     # "ok", "disabled" (no discovery registry configured) or the error code when it could not be read.
     organization_registry: str = "disabled"
+    # The review attestations in the audit trail: "ok", "disabled" (no audit table configured) or the
+    # error code when they could not be read. Then every review date is the registration's own.
+    review_attestations: str = "disabled"
     unreachable_cells: int = 0
     inactive_days: int = 30
     # CloudWatch Omni domains of the configured cells, to link out to. omni_url is set when there is exactly one.
@@ -194,10 +197,31 @@ class DecisionInput(BaseModel):
     document_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
+class RetireInput(BaseModel):
+    """Request body of retire."""
+
+    model_config = {"extra": "forbid"}
+
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ReviewInput(BaseModel):
+    """Request body of a review attestation."""
+
+    model_config = {"extra": "forbid"}
+
+    reason: str = Field(min_length=1, max_length=1000)
+    # After today (UTC) and at most 366 days ahead; checked when the request is decided.
+    next_review_by: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+
+
 class Registration(BaseModel):
     record_id: str
     name: str
     status: str  # native registry status
+    # The same status in the agent lifecycle vocabulary: proposed | pending_approval | approved |
+    # rejected | deprecated. A retired registration is DEPRECATED and "deprecated".
+    lifecycle_state: str = "proposed"
     status_reason: str | None = None
     record_version: str | None = None
     tenant_id: str | None = None
@@ -230,6 +254,12 @@ class RegistrationDetail(Registration):
     decision_reason: str | None = None  # the approver's full reason
     # The document as it was when last approved through the portal (snake_case), for a diff. Null when never.
     previous_approved: dict[str, object] | None = None
+    # The latest attestation made through the portal: a review, or an approval of a document that
+    # names a review date. Null when there is none.
+    last_reviewed_at: str | None = None
+    last_reviewed_by: str | None = None  # the reviewer's or approver's label
+    # When the registration must be reviewed next: the latest attestation's date, else document.review_by.
+    effective_review_by: str | None = None
 
 
 class AuditEvent(BaseModel):
@@ -237,8 +267,8 @@ class AuditEvent(BaseModel):
     request_id: str
     at: str
     phase: str  # "intent" | "result"
-    action: str  # create | update | submit | delete | approve | reject
-    outcome: str  # allowed | denied | failed
+    action: str  # create | update | submit | delete | approve | reject | retire | review; contain | release | sweep
+    outcome: str  # allowed | denied | failed | unchanged; a sweep can also be skipped
     reason: str
     actor_subject: str
     actor_label: str
@@ -249,23 +279,39 @@ class AuditEvent(BaseModel):
     document_sha256: str | None = None
     status_before: str | None = None
     status_after: str | None = None
+    # A review, and the result of an approval that recorded a review date: that date, YYYY-MM-DD.
+    next_review_by: str | None = None
+    # The result event of a review, or of an approval that recorded a review date: the time of the
+    # attestation it wrote (the same value as last_reviewed_at).
+    attested_at: str | None = None
     # Containment events only.
     agent_id: str | None = None
     runtime_arn: str | None = None
     sessions_found: int | None = None
     sessions_stopped: int | None = None
     sessions_failed: int | None = None
-    detail: str | None = None  # for example why sessions could not be listed
+    # The result of a contain: how many background sweeps it scheduled.
+    sweeps_scheduled: int | None = None
+    # A background sweep (action "sweep"): which one it is (1, 2 or 3), how many sessions had
+    # already ended, and how long the sweep took.
+    sweep: int | None = None
+    sessions_not_active: int | None = None
+    duration_ms: int | None = None
+    # For example why sessions could not be listed; on a retirement, what retirement means; on an
+    # approval, that its review date could not be recorded.
+    detail: str | None = None
 
 
 class RegistrationHistory(BaseModel):
     record_id: str
+    # The newest events of the record's history, newest first: at most 200.
     events: list[AuditEvent] = Field(default_factory=list)
+    events_truncated: bool = False  # the history holds older events that are not listed
 
 
 class ActionResult(BaseModel):
     action: str
-    outcome: str = "allowed"
+    outcome: str = "allowed"  # "unchanged" when there was nothing to change (retiring a retired record)
     reason: str
     request_id: str
     registration: Registration | None = None  # null after a delete
@@ -283,9 +329,11 @@ class ContainmentInput(BaseModel):
 
     reason: str = Field(min_length=1, max_length=1000)
     # Needed only for an agent that has no registration when more than one cell account can be contained.
+    # It must be the Runtime's ARN exactly as the portal writes it: another spelling of the partition,
+    # the Region or the account is refused (422). ASCII digits only: ``\d`` would accept others.
     runtime_arn: str | None = Field(
         default=None,
-        pattern=r"^arn:aws[a-z-]{0,10}:bedrock-agentcore:[a-z0-9-]{1,30}:\d{12}:runtime/[A-Za-z0-9_-]{1,100}$",
+        pattern=r"^arn:aws[a-z-]{0,10}:bedrock-agentcore:[a-z0-9-]{1,30}:[0-9]{12}:runtime/[A-Za-z0-9_-]{1,100}$",
     )
 
 
@@ -318,6 +366,9 @@ class ContainmentResult(BaseModel):
     runtime_arn: str
     state: str  # contained | not_contained, verified by reading the policy back
     changed: bool
+    # Contain only: a statement with the portal's identifier that the portal had not written was
+    # in the policy (it did not deny invocation) and was replaced by the portal's own.
+    replaced_foreign_statement: bool = False
     policy_deleted: bool = False  # release only: the policy held nothing else, so it was deleted
     other_statements_kept: int = 0
     sessions: SessionsStopped | None = None  # contain only
@@ -328,7 +379,22 @@ class ContainmentResult(BaseModel):
     # How long this change can take to apply everywhere: about a minute for contain, several
     # minutes for release (the service applies a policy change host by host).
     enforcement_delay_seconds: int = CONTAIN_DELAY_SECONDS
+    # Contain only: the background sweeps that were scheduled, as seconds from now. Empty when
+    # background sweeps are not configured, or could not be scheduled (a step then says why).
+    sweeps_scheduled_in_seconds: list[int] = Field(default_factory=list)
+    # Contain only, with outcome "unchanged": set when the agent was contained a moment ago and
+    # this request therefore did nothing (no session was stopped, nothing was scheduled). It says
+    # in how many seconds to ask again: when a contain does its work again, or, while a background
+    # sweep has yet to report, the earliest that can be.
+    retry_after_seconds: int | None = None
     audit_complete: bool = True
+
+
+class ContainmentSweeps(BaseModel):
+    """The background sweeps of the containment that holds."""
+
+    scheduled: int = 0
+    done: int = 0  # how many of them have run, whatever their outcome
 
 
 class ContainmentView(BaseModel):
@@ -341,9 +407,19 @@ class ContainmentView(BaseModel):
     contained_at: str | None = None
     reason: str | None = None
     contained_by_me: bool = False  # the caller contained it and therefore cannot release it
-    detail: str | None = None  # why the state is unknown, for example no reader in the agent's account
+    # Why the state is unknown (for example no reader in the agent's account). Also set when the
+    # state is not_contained although a statement with the portal's identifier is in the policy:
+    # that statement does not deny invocation, and a contain replaces it.
+    detail: str | None = None
     partial: bool = False  # the containment that holds did not stop every session it found
     # How long a contain, and a release, can take to apply everywhere.
     enforcement_delay_seconds: int = CONTAIN_DELAY_SECONDS
     release_delay_seconds: int = RELEASE_DELAY_SECONDS
+    # Background sweeps after the contain, and since when the agent is known to be quiet: the end
+    # of the first sweep that started after every host applies the deny, listed every session and
+    # left none running. Null until such a sweep has run.
+    sweeps: ContainmentSweeps = Field(default_factory=ContainmentSweeps)
+    quiet_at: str | None = None
+    # The newest events of the Runtime's containment history, newest first: at most 200.
     events: list[AuditEvent] = Field(default_factory=list)
+    events_truncated: bool = False  # the history holds older events that are not listed

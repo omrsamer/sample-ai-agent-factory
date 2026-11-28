@@ -31,6 +31,7 @@ from tests.conftest import (
     runtime_bundle,
     tool_record,
 )
+from tests.fakes import FakeDynamo
 
 OUTSIDE_ARN = f"arn:aws:bedrock-agentcore:{REGION}:888888888888:runtime/shadow_agent-QwErTy5678"
 DISCOVERY = "DISCOVERYREG0001"
@@ -260,6 +261,7 @@ class Backend:
         self.clients = FakeClients(
             {
                 ("platform", "agent-registry-control"): FakeClient(),
+                ("platform", "dynamodb"): FakeDynamo(),
                 (CELL_ACCOUNT, "bedrock-agentcore-control"): self.control,
                 (CELL_ACCOUNT, "cloudwatch"): FakeClient({"describe_alarms": [{"MetricAlarms": []}]}),
                 (OTHER_ACCOUNT, "bedrock-agentcore-control"): denied,
@@ -529,7 +531,8 @@ def test_adding_and_removing_the_statement_keeps_other_statements_byte_for_byte(
     contained = containment_policy.with_containment(original, RUNTIME_ARN)
     document = json.loads(contained)
     assert document["Statement"][:2] == other and document["Id"] == "keep-me" and len(document["Statement"]) == 3
-    assert containment_policy.is_contained(contained) and not containment_policy.is_contained(original)
+    assert containment_policy.is_contained(contained, RUNTIME_ARN)
+    assert not containment_policy.is_contained(original, RUNTIME_ARN)
     again = containment_policy.with_containment(contained, RUNTIME_ARN)
     assert json.loads(again) == document  # idempotent: never two containment statements
     released = containment_policy.without_containment(contained)
@@ -542,7 +545,8 @@ def test_policy_edge_cases():
     assert json.loads(only_ours)["Version"] == "2012-10-17"
     assert containment_policy.without_containment(only_ours) is None  # nothing else remains: delete the policy
     assert containment_policy.without_containment(None) is None
-    assert containment_policy.is_contained(None) is False and containment_policy.is_contained("  ") is False
+    assert containment_policy.is_contained(None, RUNTIME_ARN) is False
+    assert containment_policy.is_contained("  ", RUNTIME_ARN) is False
     single = json.dumps({"Version": "2012-10-17", "Statement": {"Sid": "One", "Effect": "Allow"}})
     assert json.loads(containment_policy.with_containment(single, RUNTIME_ARN))["Statement"][0] == {
         "Sid": "One",
@@ -624,7 +628,9 @@ def test_a_rejected_or_deprecated_paper_record_with_no_runtime_is_not_a_risk(fle
     for status in ("REJECTED", "DEPRECATED"):
         fleet.records = [benign(status)]
         agent = fleet.agents()["recAgent0001"]
-        assert (agent.inventory_state, agent.flags.unmanaged) == ("registered_only", True)
+        assert agent.inventory_state == "registered_only"
+        # A rejected registration is still unmanaged; for a retired one with nothing deployed the flag does not apply.
+        assert agent.flags.unmanaged is (True if status == "REJECTED" else None)
         assert [r.code for r in agent.risk.reasons] == [] and agent.risk.level == "low"
     fleet.records = [benign("PENDING_APPROVAL")]  # waiting for approval is reported with or without a Runtime
     assert [r.code for r in fleet.agents()["recAgent0001"].risk.reasons] == ["REGISTRATION_NOT_APPROVED"]
@@ -885,5 +891,198 @@ def test_fleet_summary_counts(discovery):
         "inactive": 2,
         "contained": 2,
     }
-    assert (summary_.gateways_total, summary_.gateways_by_policy_mode) == (1, {"enforce": 1, "log_only": 0, "none": 0})
+    assert (summary_.gateways_total, summary_.gateways_by_policy_mode) == (
+        1,
+        {"enforce": 1, "log_only": 0, "none": 0, "unknown": 0},
+    )
     assert (summary_.organization_registry, summary_.unreachable_cells, summary_.inactive_days) == ("ok", 1, 30)
+
+
+# --- a retired registration with nothing deployed is closed ------------------------------------------
+
+ROSTER = {"PORTAL_OWNER_GROUPS": json.dumps(["travel-owners"])}
+
+
+def troubled(status: str, record_id: str = "recAgent0001", **overrides: Any) -> dict[str, Any]:
+    """A registration that three rules have something to say about: its owner group has left the
+    roster, it names no person, and no evaluation is recorded."""
+    document = {"dataClassification": "internal", "ownerGroup": "left-the-company", "sponsor": None, "contact": None}
+    return agent_record(status, record_id=record_id, **{**document, "evaluation": None, **overrides})
+
+
+@pytest.fixture
+def roster(monkeypatch: pytest.MonkeyPatch) -> Backend:
+    backend = Backend(monkeypatch, ROSTER)
+    backend.control.runtimes = [rich_bundle()]
+    backend.cloudwatch = backend.clients.clients[(CELL_ACCOUNT, "cloudwatch")]
+    backend.cloudwatch.responses["describe_alarms"] = [{"MetricAlarms": [{"AlarmName": "a", "StateValue": "OK"}]}]
+    backend.cloudwatch.responses["get_metric_data"] = invoked(0)
+    return backend
+
+
+TROUBLE = ["OWNER_GROUP_NOT_IN_ROSTER", "EVALUATION_NOT_RUN", "SPONSOR_MISSING"]
+NOT_APPLICABLE = {"unmanaged": None, "ownerless": None, "review_overdue": None, "inactive": None, "contained": None}
+
+
+def test_a_retired_registration_with_nothing_deployed_is_closed(roster):
+    roster.control.runtimes = []
+    roster.records = [troubled("DEPRECATED", reviewBy="2020-01-31")]
+    agent = roster.agents()["recAgent0001"]
+    assert (agent.inventory_state, agent.lifecycle_state) == ("registered_only", "deprecated")
+    # Nothing is left that anyone could act on: no rule applies, and the flags do not apply.
+    assert agent.obligations_closed is True
+    assert (agent.risk.level, agent.risk.reasons) == ("low", [])
+    assert agent.flags.model_dump() == NOT_APPLICABLE
+    # The same registration, not retired, is what the lead saw in the browser: high risk and ownerless.
+    roster.records = [troubled("APPROVED")]
+    approved = roster.agents()["recAgent0001"]
+    assert approved.obligations_closed is False and approved.flags.ownerless is True
+    assert (approved.risk.level, [r.code for r in approved.risk.reasons]) == ("high", TROUBLE)
+
+
+def test_a_retired_registration_whose_runtime_is_still_deployed_keeps_every_finding(roster):
+    roster.records = [troubled("DEPRECATED", reviewBy="2020-01-31")]
+    agent = roster.agents()["recAgent0001"]
+    assert agent.inventory_state == "registered_and_detected" and agent.obligations_closed is False
+    # Someone still has to remove the Runtime, and everything else about the agent is reported too.
+    assert [r.code for r in agent.risk.reasons] == ["REGISTRATION_DEPRECATED", *TROUBLE]
+    assert agent.risk.level == "high"
+    assert agent.flags.model_dump() == {
+        "unmanaged": True,
+        "ownerless": True,
+        "review_overdue": False,  # a retired registration is never overdue for review
+        "inactive": False,
+        "contained": False,
+    }
+
+
+def test_a_rejected_registration_with_nothing_deployed_is_not_closed(roster):
+    roster.control.runtimes = []
+    roster.records = [troubled("REJECTED")]
+    agent = roster.agents()["recAgent0001"]
+    # It can be corrected and submitted again, so its findings stay.
+    assert agent.obligations_closed is False
+    assert (agent.risk.level, [r.code for r in agent.risk.reasons]) == ("high", TROUBLE)
+    assert (agent.flags.unmanaged, agent.flags.ownerless, agent.flags.review_overdue) == (True, True, False)
+    assert (agent.flags.inactive, agent.flags.contained) == (None, None)  # no Runtime to read them from
+
+
+def test_a_retired_registration_is_not_closed_while_its_cells_reader_cannot_be_used(roster):
+    """Retired, its Runtime named in a cell whose reader fails: the Runtime may well be there."""
+    roster.records = [troubled("DEPRECATED")]  # names the Runtime in the first cell's account
+    key = (CELL_ACCOUNT, "bedrock-agentcore-control")
+    reader = roster.clients.clients[key]
+    roster.clients.clients[key] = ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "AssumeRole")
+    agent = roster.agents()["recAgent0001"]
+    assert (agent.reader_status, agent.inventory_state) == ("unreachable", "registered_only")
+    assert agent.obligations_closed is False
+    # Flags and reasons are those of any registered agent whose Runtime could not be read.
+    assert (agent.risk.level, [r.code for r in agent.risk.reasons]) == ("high", TROUBLE)
+    assert agent.flags.model_dump() == {
+        "unmanaged": True,
+        "ownerless": True,
+        "review_overdue": False,
+        "inactive": None,
+        "contained": None,
+    }
+    summary_ = roster.service.fleet_summary()
+    assert summary_.unreachable_cells == 2  # the summary says that a cell could not be read
+    assert [a.agent_id for a in summary_.needs_attention] == ["recAgent0001"]
+    assert (summary_.flags["ownerless"], summary_.flags_unknown["contained"]) == (1, 1)
+
+    # The reader answers again and finds no Runtime: closed.
+    roster.clients.clients[key] = reader
+    reader.runtimes = []
+    agent = roster.agents()["recAgent0001"]
+    assert (agent.reader_status, agent.obligations_closed) == ("ok", True)
+    assert (agent.risk.level, agent.risk.reasons, agent.flags.model_dump()) == ("low", [], NOT_APPLICABLE)
+    assert roster.service.fleet_summary().needs_attention == []
+
+    # It answers and finds the Runtime: someone still has to remove it.
+    reader.runtimes = [rich_bundle()]
+    agent = roster.agents()["recAgent0001"]
+    assert agent.obligations_closed is False
+    assert [r.code for r in agent.risk.reasons] == ["REGISTRATION_DEPRECATED", *TROUBLE]
+
+
+@pytest.mark.parametrize("runtime_arn", [None, OUTSIDE_ARN])
+def test_no_runtime_named_or_an_account_with_no_reader_at_all_stays_closed(roster, runtime_arn):
+    """Nothing would ever close such an agent, so the missing reader does not keep it open."""
+    roster.records = [troubled("DEPRECATED", runtimeArn=runtime_arn, gatewayArn=None)]
+    agent = roster.agents()["recAgent0001"]
+    assert (agent.reader_status, agent.inventory_state) == ("none", "registered_only")
+    assert agent.obligations_closed is True and agent.risk.reasons == []
+
+
+def three_registrations(roster: Backend) -> None:
+    """Retired with nothing deployed, retired and still deployed, rejected with nothing deployed."""
+    roster.records = [
+        troubled("DEPRECATED", "recClosed0001", agentId="closed-agent", runtimeArn=None, gatewayArn=None),
+        troubled("DEPRECATED", "recDeployed01"),
+        troubled("REJECTED", "recRejected01", agentId="rejected-agent", runtimeArn=None, gatewayArn=None),
+    ]
+    roster.service.cache.clear()
+
+
+def test_the_fleet_summary_counts_no_flag_of_a_closed_agent_and_it_needs_no_attention(roster):
+    three_registrations(roster)
+    summary_ = roster.service.fleet_summary()
+    # It is still an agent of the inventory, at the lowest risk level.
+    assert summary_.agents_total == 3
+    assert summary_.by_inventory_state == {"registered_and_detected": 1, "registered_only": 2, "detected_only": 0}
+    assert summary_.by_lifecycle == {"deprecated": 2, "rejected": 1}
+    assert summary_.by_risk_level == {"low": 1, "medium": 0, "high": 2, "critical": 0}
+    # Its flags are counted neither as set nor as unknown: only the other two agents are.
+    assert summary_.flags == {"unmanaged": 2, "ownerless": 2, "review_overdue": 0, "inactive": 0, "contained": 0}
+    assert summary_.flags_unknown == {
+        "unmanaged": 0,
+        "ownerless": 0,
+        "review_overdue": 0,
+        "inactive": 1,  # the rejected registration has no Runtime to read
+        "contained": 1,
+    }
+    assert sorted(a.agent_id for a in summary_.needs_attention) == ["recDeployed01", "recRejected01"]
+
+
+def test_a_closed_agent_through_the_api_the_export_and_the_evidence_document(roster):
+    from mangum import Mangum
+
+    from portal_api import deps
+    from portal_api.app import create_app
+    from tests.test_api import PLATFORM_CLAIMS, event
+
+    three_registrations(roster)
+    application = create_app()
+    application.dependency_overrides[deps.get_service] = lambda: roster.service
+    handler = Mangum(application, lifespan="off")
+
+    def get(path: str, query: str = "") -> Any:
+        response = handler(event(path, "GET", PLATFORM_CLAIMS, query=query), None)
+        assert response["statusCode"] == 200, response["body"]
+        return json.loads(response["body"])
+
+    closed = get("/agents/recClosed0001")
+    assert closed["obligations_closed"] is True and closed["flags"] == NOT_APPLICABLE
+    assert closed["risk"] == {"level": "low", "reasons": []}
+    listed = {agent["id"]: agent["obligations_closed"] for agent in get("/agents")}
+    assert listed == {"recClosed0001": True, "recDeployed01": False, "recRejected01": False}
+    summary_ = get("/fleet/summary")
+    assert [a["agent_id"] for a in summary_["needs_attention"]] != [] and "recClosed0001" not in [
+        a["agent_id"] for a in summary_["needs_attention"]
+    ]
+    # The evidence document has the same empty risk, and says in the risk section why the flags are null.
+    evidence = get("/agents/recClosed0001/evidence")
+    assert evidence["risk"]["level"] == "low" and evidence["risk"]["reasons"] == []
+    assert evidence["risk"]["flags"] == NOT_APPLICABLE and evidence["risk"]["obligations_closed"] is True
+    assert evidence["registration"]["status"] == "DEPRECATED"
+    assert not [note for note in evidence["limitations"] if "retired" in note.lower()]
+    assert get("/agents/recDeployed01/evidence")["risk"]["obligations_closed"] is False
+    # The export has no flag and no reason for it either.
+    rows = {row["agent_id"]: row for row in get("/agents/export", "format=json")}
+    row = rows["recClosed0001"]
+    assert (row["risk_level"], row["risk_reasons"], row["lifecycle_state"]) == ("low", [], "deprecated")
+    assert all(row[name] is None for name in NOT_APPLICABLE) and row["runtime_arn"] is None
+    assert (
+        rows["recDeployed01"]["unmanaged"] is True
+        and "REGISTRATION_DEPRECATED" in rows["recDeployed01"]["risk_reasons"]
+    )

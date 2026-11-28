@@ -15,6 +15,7 @@ from portal_api import deps
 from portal_api.aws.cache import TTLCache
 from portal_api.config import load_settings
 from portal_api.service import PortalService
+from tests import tokens
 
 PLATFORM_ACCOUNT = "111111111111"
 CELL_ACCOUNT = "444444444444"
@@ -91,6 +92,9 @@ BASE_ENV = {
     ),
     "PORTAL_ALLOWED_ORIGINS": json.dumps(["https://portal.example.com"]),
     "PORTAL_CACHE_TTL_SECONDS": "30",
+    # Read by the action functions only: they verify the caller's token themselves.
+    "PORTAL_JWT_ISSUER": tokens.ISSUER,
+    "PORTAL_JWT_AUDIENCE": json.dumps([tokens.AUDIENCE]),
 }
 
 
@@ -263,6 +267,29 @@ def portal_env(monkeypatch: pytest.MonkeyPatch):
     yield
     config_module._cached = None
     deps._service = None
+
+
+@pytest.fixture(autouse=True)
+def issuer_keys(monkeypatch: pytest.MonkeyPatch):
+    """The issuer's key set without the network: every fetch is recorded and answered with the test key.
+
+    A test that needs another answer puts a callable in ``answer[0]``.
+    """
+    from portal_api.identity import verify
+
+    fetched: list[str] = []
+    answer: list[Any] = [lambda url: tokens.key_set()]
+
+    def fetch(url: str) -> dict[str, Any]:
+        fetched.append(url)
+        return answer[0](url)
+
+    monkeypatch.setattr(verify, "fetch_keys", fetch)
+    verify._keysets.clear()
+    fetch.fetched = fetched  # type: ignore[attr-defined]
+    fetch.answer = answer  # type: ignore[attr-defined]
+    yield fetch
+    verify._keysets.clear()
 
 
 @pytest.fixture

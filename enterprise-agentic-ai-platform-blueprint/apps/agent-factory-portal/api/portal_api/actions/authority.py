@@ -23,6 +23,8 @@ from portal_api.identity.provider import Principal
 
 REGISTRAR_ACTIONS = ("create", "update", "submit", "delete")
 APPROVER_ACTIONS = ("approve", "reject")
+# Retire and review are decided by ``lifecycle_rules``, not by the core, and need the approver authority.
+LIFECYCLE_ACTIONS = ("retire", "review")
 
 # The core has no "submit" or "reject". Submitting is a registrar change to a record, so it is
 # evaluated as "update" with no reference change. Rejecting is an approver's decision on a
@@ -70,6 +72,24 @@ def core_role(principal: Principal, action: str) -> str:
 def has_authority(principal: Principal, action: str) -> bool:
     wanted = core.APPROVER if action in APPROVER_ACTIONS else core.REGISTRAR
     return core_role(principal, action) == wanted
+
+
+def has_part(principal: Principal, settings: ActionSettings, action: str, tenant_id: str | None) -> bool:
+    """Whether the caller has a part in a record of this tenant, as far as ``action`` goes.
+
+    That is: the caller's role holds the authority the action needs, and the
+    caller holds the record's tenant. Only such a caller writes into the
+    record's history (``ActionEngine.deny``). Anyone else could otherwise
+    fill the history of a record of another tenant with refusals, and a
+    history is never shortened.
+    """
+    if action in REGISTRAR_ACTIONS:
+        roles = REGISTRAR_ROLES
+    elif action in APPROVER_ACTIONS or action in LIFECYCLE_ACTIONS:
+        roles = APPROVER_ROLES
+    else:
+        return False
+    return principal.role in roles and bool(tenant_id) and holds_tenant(principal, settings, str(tenant_id))
 
 
 def core_principal(principal: Principal, settings: ActionSettings, action: str, tenant_id: str) -> dict[str, str]:

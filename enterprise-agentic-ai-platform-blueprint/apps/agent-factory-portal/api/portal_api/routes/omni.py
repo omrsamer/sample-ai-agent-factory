@@ -15,8 +15,8 @@ from portal_api.models.portal import ObservedServices
 
 router = APIRouter(prefix="/omni", tags=["omni"])
 
-_ACCOUNT = re.compile(r"^\d{12}$")
-_FUNCTION_ARN = re.compile(r"^arn:aws[a-z-]*:lambda:[a-z0-9-]+:(\d{12}):function:")
+_ACCOUNT = re.compile(r"[0-9]{12}", re.ASCII)
+_FUNCTION_ARN = re.compile(r"arn:aws[a-z-]*:lambda:[a-z0-9-]+:([0-9]{12}):function:", re.ASCII)
 
 
 def own_account_id(request: Request) -> str | None:

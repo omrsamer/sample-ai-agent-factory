@@ -20,8 +20,9 @@ from portal_api.aws.session import error_code
 logger = logging.getLogger(__name__)
 
 SPANS_LOG_GROUP = "aws/spans"
+# ASCII digits only: ``\d`` would also match digits of other scripts.
 _RUNTIME_ARN = re.compile(
-    r"^arn:aws[a-z-]{0,10}:bedrock-agentcore:[a-z0-9-]{1,30}:\d{12}:runtime/[A-Za-z0-9_-]{1,100}$"
+    r"arn:aws[a-z-]{0,10}:bedrock-agentcore:[a-z0-9-]{1,30}:[0-9]{12}:runtime/[A-Za-z0-9_-]{1,100}", re.ASCII
 )
 _TERMINAL = {"Complete", "Failed", "Cancelled", "Timeout", "Unknown"}
 
@@ -98,6 +99,8 @@ def traces_by_user_query(runtime_arn: str) -> str:
 
 SESSION_LOOKBACK_HOURS = 8  # the maximum lifetime of a Runtime session
 MAX_SESSIONS = 1000
+# What a background sweep asks for: as many rows as one GetQueryResults call returns.
+MAX_SWEEP_SESSIONS = 10_000
 
 
 def sessions_query(runtime_arn: str, limit: int = MAX_SESSIONS) -> str:
@@ -108,7 +111,7 @@ def sessions_query(runtime_arn: str, limit: int = MAX_SESSIONS) -> str:
         " | stats max(@timestamp) as last_seen, latest(resource.attributes.cloud.resource_id) as resource_id"
         " by attributes.session.id as session_id"
         " | sort last_seen desc"
-        f" | limit {safe_limit(limit, MAX_SESSIONS)}"
+        f" | limit {safe_limit(limit, MAX_SWEEP_SESSIONS)}"
     )
 
 

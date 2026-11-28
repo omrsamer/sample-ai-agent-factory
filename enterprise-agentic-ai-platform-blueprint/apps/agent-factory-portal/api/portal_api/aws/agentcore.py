@@ -43,13 +43,25 @@ def resource_policy(client: Any, resource_arn: str) -> str | None:
         raise
 
 
-def contained(client: Any, runtime_arn: str) -> bool | None:
-    """Whether the Runtime's resource policy holds the containment statement. ``None`` when it cannot be read."""
+def containment_state(client: Any, runtime_arn: str) -> str | None:
+    """What the Runtime's resource policy says about its containment. ``None`` when it cannot be read.
+
+    One of ``containment_policy.CONTAINED``, ``FOREIGN`` (a statement carries
+    the portal's Sid but does not deny invocation) and ``ABSENT``.
+    ``runtime_arn`` is the ARN as the service or the portal spells it, never
+    as a caller wrote it.
+    """
     try:
-        return containment_policy.is_contained(resource_policy(client, runtime_arn))
+        return containment_policy.state(resource_policy(client, runtime_arn), runtime_arn)
     except Exception as exc:  # noqa: BLE001 - unknown is reported as unknown
         logger.warning("Runtime resource policy could not be read: %s", error_code(exc))
         return None
+
+
+def contained(client: Any, runtime_arn: str) -> bool | None:
+    """Whether the Runtime's resource policy holds the containment statement. ``None`` when it cannot be read."""
+    state = containment_state(client, runtime_arn)
+    return None if state is None else state == containment_policy.CONTAINED
 
 
 def guardrail_covered(env: dict[str, Any]) -> bool:

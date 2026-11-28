@@ -16,7 +16,7 @@ from portal_api.models.portal import ObservedService, OmniDomain
 RESOURCE_ID_ATTRIBUTE = "cloud.resource_id"
 OBSERVED_ONLY = "observed_only"
 # An agent node's resource id is its Runtime ARN followed by the endpoint it was called through.
-_RUNTIME = re.compile(r"^(arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:\d{12}:runtime/[A-Za-z0-9_-]+)(/.*)?$")
+_RUNTIME = re.compile(r"(arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:runtime/[A-Za-z0-9_-]+)(/.*)?", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class KnownAgent:
 
 def runtime_arn(resource_id: str | None) -> str | None:
     """The Runtime ARN inside a node's resource id (the id cut at the endpoint part), if it holds one."""
-    match = _RUNTIME.match(resource_id or "")
+    match = _RUNTIME.fullmatch(resource_id or "")
     return match.group(1) if match else None
 
 

@@ -23,3 +23,8 @@ jmespath==1.1.0
 python-dateutil==2.9.0.post0
 six==1.17.0
 urllib3==2.8.0
+# The action functions verify the caller's bearer token themselves (portal_api/identity/verify.py).
+PyJWT==2.15.1
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.12

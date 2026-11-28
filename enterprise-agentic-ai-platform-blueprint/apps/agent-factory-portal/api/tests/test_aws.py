@@ -181,7 +181,7 @@ def test_cell_credentials_are_assumed_with_external_id_and_cached_until_near_exp
 
     expected = {
         "RoleArn": f"arn:aws:iam::{CELL_ACCOUNT}:role/agenticai-portal-reader",
-        "RoleSessionName": "agent-factory-portal",
+        "RoleSessionName": "portal-reader",
         "DurationSeconds": 900,
         "ExternalId": "portal-ext-id",
     }
@@ -214,7 +214,7 @@ def test_cell_without_external_id_omits_it():
             },
             {
                 "RoleArn": settings.cells[1].reader_role_arn,
-                "RoleSessionName": "agent-factory-portal",
+                "RoleSessionName": "portal-reader",
                 "DurationSeconds": 900,
             },
         )
@@ -255,3 +255,131 @@ def test_error_code_never_returns_the_message():
     error = ClientError({"Error": {"Code": "AccessDenied", "Message": "arn:aws:iam::111111111111:role/x"}}, "Op")
     assert error_code(error) == "AccessDenied"
     assert error_code(ValueError("secret")) == "ValueError"
+
+
+# --- lifecycle: retire, and review attestations in the audit table --------------------------------
+
+
+def test_the_pinned_sdk_knows_the_retired_status_and_its_reason():
+    model = _client("agent-registry-control").meta.service_model.operation_model("UpdateRegistryRecordStatus")
+    members = model.input_shape.members
+    assert {"registryId", "recordId", "status", "statusReason"} <= set(members)
+    assert "DEPRECATED" in members["status"].enum
+
+
+def test_retire_sends_the_status_call_the_sdk_accepts():
+    from portal_api.actions import approver
+
+    client = _client("agent-registry-control")
+    arn = f"arn:aws:agent-registry:{REGION}:{PLATFORM_ACCOUNT}:registry/REGISTRYID000001"
+    with Stubber(client) as stub:
+        stub.add_response(
+            "update_registry_record_status",
+            {
+                "registryArn": arn,
+                "recordArn": f"{arn}/record/recAAAAAAAAA1",
+                "recordId": "recAAAAAAAAA1",
+                "status": "DEPRECATED",
+                "statusReason": "x" * 255,
+                "updatedAt": T0,
+            },
+            {
+                "registryId": "REGISTRYID000001",
+                "recordId": "recAAAAAAAAA1",
+                "status": "DEPRECATED",
+                "statusReason": "x" * 255,  # cut to what the registry stores
+            },
+        )
+        approver.set_status(client, "REGISTRYID000001", "recAAAAAAAAA1", "DEPRECATED", "x" * 1000)
+        stub.assert_no_pending_responses()
+
+
+def _attestation_item(at: str, record_id: str = "recAAAAAAAAA1") -> dict:
+    return {
+        "pk": {"S": "REVIEWS"},
+        "sk": {"S": f"EVENT#{at}#{record_id}"},
+        "kind": {"S": "review"},
+        "at": {"S": at},
+        "record_id": {"S": record_id},
+        "next_review_by": {"S": "2027-06-01"},
+        "reviewed_by": {"S": "ann-1"},
+        "reviewed_by_label": {"S": "Ann Approver"},
+        "reviewed_by_role": {"S": "approver"},
+        "reason": {"S": "Reviewed."},
+        "request_id": {"S": "r1"},
+    }
+
+
+def test_attestations_are_read_page_by_page_with_a_real_query_request():
+    from portal_api.aws import audit
+
+    client = _client("dynamodb")
+    request = {
+        "TableName": "agenticai-portal-audit-test",
+        "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
+        "ExpressionAttributeValues": {":pk": {"S": "REVIEWS"}, ":prefix": {"S": "EVENT#"}},
+        "ConsistentRead": True,
+        "ScanIndexForward": False,
+    }
+    newer, older = "2026-06-01T10:00:00.000000Z", "2026-01-01T10:00:00.000000Z"
+    last_key = {"pk": {"S": "REVIEWS"}, "sk": {"S": f"EVENT#{newer}#recAAAAAAAAA1"}}
+
+    def stub_two_pages(stub: Stubber, pages: int) -> None:
+        stub.add_response("query", {"Items": [_attestation_item(newer)], "LastEvaluatedKey": last_key}, request)
+        if pages > 1:
+            stub.add_response(
+                "query", {"Items": [_attestation_item(older)]}, {**request, "ExclusiveStartKey": last_key}
+            )
+
+    with Stubber(client) as stub:
+        stub_two_pages(stub, 2)
+        found, truncated = audit.query_attestations(client, "agenticai-portal-audit-test")
+        stub.assert_no_pending_responses()
+    assert [a.at for a in found] == [newer, older] and truncated is False
+    assert (found[0].record_id, found[0].next_review_by, found[0].reviewed_by_label) == (
+        "recAAAAAAAAA1",
+        "2027-06-01",
+        "Ann Approver",
+    )
+
+    # Bounded: after the last allowed page it stops, and says that more was left unread.
+    with Stubber(client) as stub:
+        stub_two_pages(stub, 1)
+        found, truncated = audit.query_attestations(client, "agenticai-portal-audit-test", max_pages=1)
+        stub.assert_no_pending_responses()
+    assert [a.at for a in found] == [newer] and truncated is True
+
+
+def test_an_attestation_is_written_with_a_put_the_sdk_accepts_and_cannot_replace_an_item():
+    from botocore.exceptions import ClientError
+
+    from portal_api.actions import audit_writer
+
+    client = _client("dynamodb")
+    at = "2026-06-01T10:00:00.000000Z"
+    expected = {
+        "TableName": "agenticai-portal-audit-test",
+        "Item": _attestation_item(at),
+        "ConditionExpression": "attribute_not_exists(pk)",
+    }
+    arguments = {
+        "at": at,
+        "record_id": "recAAAAAAAAA1",
+        "next_review_by": "2027-06-01",
+        "reviewed_by": "ann-1",
+        "reviewed_by_label": "Ann Approver",
+        "reviewed_by_role": "approver",
+        "reason": "Reviewed.",
+        "request_id": "r1",
+    }
+    with Stubber(client) as stub:
+        stub.add_response("put_item", {}, expected)
+        audit_writer.put_attestation(client, "agenticai-portal-audit-test", **arguments)
+        stub.add_client_error("put_item", "ConditionalCheckFailedException", expected_params=expected)
+        try:
+            audit_writer.put_attestation(client, "agenticai-portal-audit-test", **arguments)
+        except ClientError as exc:
+            assert error_code(exc) == "ConditionalCheckFailedException"
+        else:
+            raise AssertionError("a second write of the same attestation must fail")
+        stub.assert_no_pending_responses()

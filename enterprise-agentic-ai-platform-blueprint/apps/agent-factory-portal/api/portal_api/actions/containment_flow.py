@@ -6,10 +6,23 @@ Contain, in the agent's cell and with the cell's containment role:
   1. read the Runtime's resource policy;
   2. add the one containment statement, keeping every other statement as it is, and write the policy;
   3. read the policy back to verify;
-  4. find the Runtime's recent sessions in its spans and stop them, bounded in number and time.
+  4. find the Runtime's recent sessions in its spans and stop them, bounded in number and time;
+  5. when a sweep queue is configured, leave messages on it for the sweeper function, which
+     finishes the job in the background (``portal_api/actions/sweeper.py``).
 Release removes exactly that statement (the policy is deleted only when nothing
-else remains) and verifies. Both are idempotent and never touch a statement the
-portal did not write.
+else remains) and verifies. Both are idempotent and never touch a statement
+that does not carry the portal's Sid.
+
+Three things hold for every request, whatever it asks for:
+
+- The Runtime's ARN is the one the function builds from the cell's
+  configuration (``portal_api/arns.py``). Every AWS call and the key of the
+  history use that ARN and no other spelling of it.
+- A Runtime is contained only when its policy holds the statement the portal
+  writes, recognised by its whole shape (``containment_policy.state``).
+- Only a caller who has a part in the Runtime (the role, and the Runtime's
+  tenant) writes into its history, and only for a Runtime of a cell that has a
+  containment role. Every other refusal is logged with its request id.
 
 The function never invokes the Runtime to test the block: its role must not be
 able to. A change to the policy is not enforced instantly: the service applies
@@ -24,24 +37,31 @@ changes to the same policy from different tools could overwrite each other.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
-import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from botocore.exceptions import ClientError
 
-from portal_api import authorities, containment_policy, registrations
-from portal_api.actions import audit_writer, containment
+from portal_api import arns, authorities, containment_policy, registrations, sweeps
+from portal_api.actions import audit_writer, containment, sweep_queue
 from portal_api.actions import containment_rules as rules
 from portal_api.actions.engine import ActionError
 from portal_api.aws import audit as audit_reader
 from portal_api.aws.session import AwsClients, error_code
 from portal_api.config import ActionSettings, Cell
-from portal_api.containment_timing import CONTAIN_DELAY_SECONDS, RELEASE_DELAY_SECONDS, delay_words
+from portal_api.containment_timing import (
+    CONTAIN_DELAY_SECONDS,
+    RELEASE_DELAY_SECONDS,
+    REPEAT_AFTER_SECONDS,
+    REPEAT_RECHECK_SECONDS,
+    SWEEP_DELAYS_SECONDS,
+    SWEEPS_OVER_AFTER_SECONDS,
+    delay_words,
+)
 from portal_api.identity.provider import Principal
-from portal_api.mappers.common import arn_parts
 from portal_api.models.portal import (
     AuditEvent,
     ContainmentInput,
@@ -54,21 +74,53 @@ logger = logging.getLogger(__name__)
 
 CONTAINED, NOT_CONTAINED = "contained", "not_contained"
 NOT_ENABLED = "containment is not enabled for this cell"
-_RUNTIME_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{1,20}$")
-_RUNTIME_ARN = re.compile(
-    r"^arn:aws[a-z-]{0,10}:bedrock-agentcore:[a-z0-9-]{1,30}:\d{12}:runtime/[A-Za-z][A-Za-z0-9_]{0,99}-[A-Za-z0-9]{1,20}$"
+NOT_CANONICAL = (
+    "runtime_arn is not this Runtime's ARN as the portal writes it: its partition, Region and account "
+    "must be those of the Runtime's cell"
+)
+RECORD_NOT_CANONICAL = (
+    "This registration names its Runtime by an ARN whose partition is not the one of the Runtime's cell, "
+    "so the portal does not act on it. Correct the registration, or address the agent by its Runtime id."
+)
+HOLDER_NOT_FOUND = (
+    f"The Runtime's containment history holds more than {audit_reader.MAX_DECISION_EVENTS} events since its "
+    "last contain or release, so who contained it could not be established. The Runtime was not released."
+)
+NOT_KNOWN_WHETHER_WRITTEN = "It is not known whether the statement was written. Sessions were not stopped."
+ALREADY_CONTAINED = "The Runtime was already contained; its policy was not changed."
+REPLACED_FOREIGN = (
+    "A statement with the portal's identifier that the portal had not written was in the policy and was replaced."
 )
 _LABELS = {
     "policy": "Deny invocation in the Runtime's resource policy",
     "verify": "Read the policy back to confirm the deny statement",
     "sessions": "Stop the Runtime's running sessions",
+    "background": "Stop remaining sessions in the background",
     "release": "Remove the deny statement from the Runtime's resource policy",
     "verify_release": "Read the policy back to confirm the statement is gone",
 }
 
 
 @dataclass
+class _Resolved:
+    """What a request resolved to, before anyone has been allowed anything."""
+
+    runtime_arn: str  # the ARN the portal built when ``cell`` is set; otherwise as it was named
+    cells: list[Cell]  # the cells configured for the Runtime's account and Region
+    cell: Cell | None  # the one among them that has a containment role
+
+
+@dataclass
 class Target:
+    """The Runtime an action is about, once the caller is known to have a part in it.
+
+    A target exists only for a Runtime of a cell that has a containment role,
+    and ``runtime_arn`` is the ARN the portal built for it
+    (``arns.canonical_runtime_arn``). Every AWS call about the Runtime and
+    every write to its history takes the ARN from here, so neither can use a
+    spelling a caller chose.
+    """
+
     agent_id: str
     runtime_arn: str
     tenant_id: str | None
@@ -94,32 +146,66 @@ class _Failed(Exception):
         self.after = after if after is not None else before
 
 
+@dataclass
+class _Background:
+    """The background sweeps a contain scheduled: the step that says so, and their delays in seconds."""
+
+    step: ContainmentStep
+    delays: list[int]
+
+
 class ContainmentService:
     def __init__(
-        self, settings: ActionSettings, clients: AwsClients, registry: Any, dynamodb: Any, principal: Principal
+        self,
+        settings: ActionSettings,
+        clients: AwsClients,
+        registry: Any,
+        dynamodb: Any,
+        principal: Principal,
+        sqs: Any = None,
     ) -> None:
         self.settings = settings
         self.clients = clients
         self.registry = registry
         self.dynamodb = dynamodb
         self.principal = principal
+        self.sqs = sqs  # the queue client; None when background sweeps are not configured
 
     # --- resolving the agent -------------------------------------------------
 
-    def _cells_for(self, runtime_arn: str) -> list[Cell]:
-        parts = arn_parts(runtime_arn) or {}
-        scope = (parts.get("account"), parts.get("region"))
-        return [c for c in self.settings.cells if (c.account_id, c.region) == scope]
+    def _locate(self, parsed: arns.RuntimeArn, named: str, *, from_body: bool) -> _Resolved:
+        """The cells of the account and Region ``named`` points into, and the ARN the portal uses for it.
 
-    def resolve(self, agent_id: str, body: ContainmentInput) -> tuple[str, str | None, list[Cell]]:
-        """The agent's Runtime ARN, its tenant and the cells of its account and Region.
+        When one of those cells has a containment role, the ARN is built from
+        that cell and ``named`` must be equal to it. The service answers for
+        another spelling of the same Runtime (another partition string), and
+        a second spelling would be a second history.
+        """
+        scope = (parsed.account, parsed.region)
+        cells = [c for c in self.settings.cells if (c.account_id, c.region) == scope]
+        cell = next((c for c in cells if c.containment_role_arn), None)
+        if cell is None:
+            # Nothing is read or written about a Runtime the portal cannot contain.
+            return _Resolved(named, cells, None)
+        canonical = arns.canonical_runtime_arn(cell, parsed.runtime_id)
+        if named != canonical:
+            if from_body:
+                raise ActionError(422, [_field_error("runtime_arn", NOT_CANONICAL)])
+            raise ActionError(409, RECORD_NOT_CANONICAL)
+        return _Resolved(canonical, cells, cell)
+
+    def resolve(self, agent_id: str, body: ContainmentInput) -> _Resolved:
+        """The agent's Runtime ARN and the cells of its account and Region.
 
         A registered agent (its id is a registry record id) is resolved from
         its record; an agent with no registration is addressed by its Runtime
-        id. Either way the tenant is decided by where the Runtime runs
-        (``containment_rules.tenant_for``), never by what the record claims:
-        a record is written by the people it governs, and a draft naming
+        id. Either way the ARN that is used afterwards is the one the portal
+        builds from the cell (``_locate``), and the tenant is decided by where
+        the Runtime runs (``_tenant``), never by what the record claims: a
+        record is written by the people it governs, and a record naming
         another tenant's Runtime must not put that Runtime in their reach.
+
+        Nothing is read from the cell or from the audit trail here.
         """
         if registrations.RECORD_ID.fullmatch(agent_id):
             try:
@@ -131,55 +217,86 @@ class ContainmentService:
             document = registrations.agent_document(record)
             if document is None:
                 raise ActionError(404, "Agent not found")
-            runtime_arn = document.get("runtimeArn")
-            if not runtime_arn:
+            named = document.get("runtimeArn")
+            if not named:
                 raise ActionError(409, "This registration names no Runtime, so there is nothing to contain")
-            if body.runtime_arn and body.runtime_arn != runtime_arn:
+            if body.runtime_arn and body.runtime_arn != named:
                 raise ActionError(422, [_field_error("runtime_arn", "runtime_arn is not this agent's Runtime")])
-            if not _RUNTIME_ARN.fullmatch(runtime_arn):
+            parsed = arns.parse_runtime_arn(named)
+            if parsed is None:
                 raise ActionError(409, "This registration does not name a Runtime, so there is nothing to contain")
-            cells = self._cells_for(runtime_arn)
-            tenant = rules.tenant_for(
-                {c.tenant_id for c in cells},
-                record_tenant=document.get("tenantId"),
-                record_approved=record.get("status") == "APPROVED",
-            )
-            return runtime_arn, tenant, cells
+            return self._locate(parsed, named, from_body=False)
 
-        if not _RUNTIME_ID.fullmatch(agent_id):
+        if not arns.is_runtime_id(agent_id):
             raise ActionError(404, "Agent not found")
         if body.runtime_arn:
-            if not body.runtime_arn.endswith(f":runtime/{agent_id}"):
+            parsed = arns.parse_runtime_arn(body.runtime_arn)
+            if parsed is None or parsed.runtime_id != agent_id:
                 raise ActionError(422, [_field_error("runtime_arn", "runtime_arn is not this agent's Runtime")])
-            runtime_arn = body.runtime_arn
-        else:
-            scopes = sorted({(c.account_id, c.region) for c in self.settings.cells if c.containment_role_arn})
-            if not scopes:
-                raise ActionError(409, NOT_ENABLED)
-            if len(scopes) > 1:
-                message = "runtime_arn is required to act on an agent that has no registration"
-                raise ActionError(422, [_field_error("runtime_arn", message)])
-            account, region = scopes[0]
-            runtime_arn = f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{agent_id}"
-        cells = self._cells_for(runtime_arn)
-        return runtime_arn, rules.tenant_for({c.tenant_id for c in cells}), cells
+            return self._locate(parsed, body.runtime_arn, from_body=True)
+        scopes = sorted({(c.account_id, c.region) for c in self.settings.cells if c.containment_role_arn})
+        if not scopes:
+            raise ActionError(409, NOT_ENABLED)
+        if len(scopes) > 1:
+            message = "runtime_arn is required to act on an agent that has no registration"
+            raise ActionError(422, [_field_error("runtime_arn", message)])
+        cells = [c for c in self.settings.cells if (c.account_id, c.region) == scopes[0]]
+        cell = next(c for c in cells if c.containment_role_arn)
+        return _Resolved(arns.canonical_runtime_arn(cell, agent_id), cells, cell)
+
+    def _tenant(self, resolved: _Resolved) -> str | None:
+        """The tenant that decides who may act on this Runtime (``containment_rules.tenant_for``).
+
+        With one tenant among the cells of the Runtime's account and Region
+        nothing is read. In an account that several tenants share, the
+        Runtime's own ``tenant-id`` tag is read with the cell's containment
+        role, under the ARN the portal built. If it cannot be read, the
+        tenant is undetermined. This runs only after the caller's role has
+        passed (``run``).
+        """
+        tenants = {c.tenant_id for c in resolved.cells}
+        if len(tenants) <= 1:
+            return rules.tenant_for(tenants)
+        if resolved.cell is None:
+            return None
+        try:
+            control = self._client(resolved.cell, "bedrock-agentcore-control")
+            tag = containment.get_tenant_tag(control, resolved.runtime_arn)
+        except Exception as exc:  # noqa: BLE001 - undetermined, which only the platform role may act on
+            logger.warning("The Runtime's tenant tag could not be read: %s", error_code(exc))
+            return None
+        return rules.tenant_for(tenants, tag)
 
     # --- audit ---------------------------------------------------------------------
 
-    def _events(self, runtime_arn: str) -> list[AuditEvent]:
+    def _holder(self, target: Target) -> tuple[AuditEvent | None, list[AuditEvent]]:
+        """Who holds the containment of the target, and the events recorded since that was settled.
+
+        The history is read back only as far as the event that settles it
+        (``audit.read_holder``). Fails closed twice over: no trail, no
+        decision; and a history in which that event is not among the newest
+        ``audit.MAX_DECISION_EVENTS`` does not say who contained the Runtime,
+        which must not read as "nobody did".
+        """
         try:
-            return audit_reader.query_events(
-                self.dynamodb, self.settings.audit_table, audit_reader.containment_key(runtime_arn)
-            )
+            trail, found = audit_reader.read_holder(self.dynamodb, self.settings.audit_table, target.runtime_arn)
         except Exception as exc:  # noqa: BLE001 - no trail, no decision
             logger.error("Audit trail could not be read: %s", error_code(exc))
             raise ActionError(503, "The audit trail could not be read, so no decision was taken") from exc
+        if not (found.decided or trail.ended):
+            # Not written to the history: one more event there would only lengthen the read.
+            raise self._refuse(409, "release", target.agent_id, target.runtime_arn, HOLDER_NOT_FOUND)
+        events = trail.events
+        if found.event is None:
+            return None, events
+        position = next(i for i, event in enumerate(events) if event.event_id == found.event.event_id)
+        return found.event, events[:position]
 
-    def _write(self, runtime_arn: str, event: AuditEvent) -> bool:
-        """Append to the Runtime's containment history. The key is the resolved Runtime, never a caller's id."""
+    def _write(self, target: Target, event: AuditEvent) -> bool:
+        """Append to the target's containment history. The key is the ARN the portal built, never a caller's."""
         try:
             audit_writer.put_event(
-                self.dynamodb, self.settings.audit_table, audit_reader.containment_key(runtime_arn), event
+                self.dynamodb, self.settings.audit_table, audit_reader.containment_key(target.runtime_arn), event
             )
             return True
         except Exception as exc:  # noqa: BLE001 - the caller decides what a failed write means
@@ -187,16 +304,7 @@ class ContainmentService:
             return False
 
     def _event(
-        self,
-        action: str,
-        agent_id: str,
-        runtime_arn: str | None,
-        tenant: str | None,
-        request_id: str,
-        phase: str,
-        outcome: str,
-        reason: str,
-        **extra: Any,
+        self, action: str, target: Target, request_id: str, phase: str, outcome: str, reason: str, **extra: Any
     ) -> AuditEvent:
         return AuditEvent(
             event_id=str(uuid.uuid4()),
@@ -209,72 +317,131 @@ class ContainmentService:
             actor_subject=self.principal.subject,
             actor_label=self.principal.label,
             actor_role=self.principal.role,
-            tenant_id=tenant,
-            agent_id=agent_id,
-            runtime_arn=runtime_arn,
+            tenant_id=target.tenant_id,
+            agent_id=target.agent_id,
+            runtime_arn=target.runtime_arn,
             **extra,
         )
 
-    def _deny(
-        self, status: int, action: str, agent_id: str, runtime_arn: str, tenant: str | None, reason: str
-    ) -> ActionError:
-        """A refusal about a Runtime that was resolved: recorded in that Runtime's history."""
+    def _refuse(self, status: int, action: str, agent_id: str, runtime_arn: str | None, reason: str) -> ActionError:
+        """A refusal that is logged, not written to the audit trail, and the error to raise.
+
+        For a caller who has no part in the Runtime (the role, or the
+        Runtime's tenant) and for a Runtime that is not in a cell with a
+        containment role. Such a refusal written into a history would let
+        any signed-in responder of one tenant fill the history of another
+        tenant's Runtime, or a history under a name of their own choosing,
+        and a history is never shortened. The function's log keeps the
+        attempt, and the answer carries the same ``request_id``.
+        """
         request_id = audit_writer.new_request_id()
-        denied = self._event(action, agent_id, runtime_arn, tenant, request_id, "result", "denied", reason)
-        self._write(runtime_arn, denied)
+        logger.warning(
+            "Containment refusal logged, not written to the audit trail: action=%s role=%s subject=%s "
+            "agent=%s runtime=%s request_id=%s reason=%s",
+            action,
+            self.principal.role,
+            self.principal.subject,
+            agent_id,
+            runtime_arn or "-",
+            request_id,
+            reason,
+        )
+        return ActionError(status, reason, action=action, request_id=request_id)
+
+    def _deny(self, status: int, action: str, target: Target, reason: str, since: list[AuditEvent]) -> ActionError:
+        """A refusal of a caller who has a part in the Runtime: recorded in the Runtime's history, once.
+
+        ``since`` are the events recorded since the containment that holds
+        was settled. The same refusal of the same person is written once in
+        that time and logged after that: the person a release must not come
+        from could otherwise add an event with every attempt, and each one
+        lengthens the read that finds the holder.
+        """
+        request_id = audit_writer.new_request_id()
+        repeated = any(
+            event.phase == "result"
+            and event.outcome == "denied"
+            and event.action == action
+            and event.actor_subject == self.principal.subject
+            and event.reason == reason
+            for event in since
+        )
+        if repeated:
+            logger.warning(
+                "Containment refusal already on record, not written again: action=%s subject=%s runtime=%s "
+                "request_id=%s reason=%s",
+                action,
+                self.principal.subject,
+                target.runtime_arn,
+                request_id,
+                reason,
+            )
+        else:
+            self._write(target, self._event(action, target, request_id, "result", "denied", reason))
         return ActionError(status, reason, action=action, request_id=request_id)
 
     # --- the action -------------------------------------------------------------------
 
     def run(self, action: str, agent_id: str, body: ContainmentInput) -> ContainmentResult:
         role = self.principal.role
+        caller = {
+            "action": action,
+            "role": role,
+            "principal_id": self.principal.subject,
+            "held_tenants": authorities.tenants_of(self.principal.groups, self.settings.group_tenant_map),
+            "holds_all_tenants": authorities.holds_all_tenants(role),
+        }
         allowed_roles = rules.CONTAIN_ROLES if action == "contain" else rules.RELEASE_ROLES
         if role not in allowed_roles:
             # Refused before anything is looked up, so the answer does not reveal whether the agent exists.
-            decision = rules.evaluate(
+            blind = rules.access_refusal(
                 action=action,
                 role=role,
                 principal_id=self.principal.subject,
                 agent_tenant=None,
                 held_tenants=(),
                 holds_all_tenants=False,
-                contained_by=None,
             )
-            # Not written to the audit table: nothing has been resolved, so the key would be the
-            # caller's own choice, and any signed-in user could fill any agent's history. The
-            # function's log keeps the attempt.
-            request_id = audit_writer.new_request_id()
-            logger.warning(
-                "Containment refused before resolution: action=%s role=%s subject=%s request_id=%s",
-                action,
-                role,
-                self.principal.subject,
-                request_id,
-            )
-            raise ActionError(403, decision.reason, action=action, request_id=request_id)
+            raise self._refuse(403, action, agent_id, None, blind.reason if blind else "refused - fail closed")
 
-        runtime_arn, tenant, cells = self.resolve(agent_id, body)
-        contained_by = audit_reader.container(self._events(runtime_arn))
+        resolved = self.resolve(agent_id, body)
+        tenant = self._tenant(resolved)
+        refusal = rules.access_refusal(**caller, agent_tenant=tenant)
+        if refusal is not None:
+            # The caller does not hold the Runtime's tenant, so has no part in it. Nothing has been
+            # read of its history, and nothing is written into it.
+            raise self._refuse(403, action, agent_id, resolved.runtime_arn, refusal.reason)
+        if resolved.cell is None:
+            raise self._refuse(409, action, agent_id, resolved.runtime_arn, NOT_ENABLED)
+        target = Target(agent_id, resolved.runtime_arn, tenant, resolved.cell)
+
+        # A contain of an agent that was contained a moment ago adds nothing: it is answered at
+        # once, before any intent is written.
+        if action == "contain":
+            repeat, current = self._repeat_too_soon(target)
+            again = self._answer_at_once(target, repeat, current) if repeat is not None else None
+            if again is not None:
+                return again
+
+        # Only a release depends on who contained the Runtime. A contain never fails or waits
+        # for the history, however long it is.
+        contained_by: AuditEvent | None = None
+        since: list[AuditEvent] = []
+        if action == "release":
+            contained_by, since = self._holder(target)
         decision = rules.evaluate(
-            action=action,
-            role=role,
-            principal_id=self.principal.subject,
+            **caller,
             agent_tenant=tenant,
-            held_tenants=authorities.tenants_of(self.principal.groups, self.settings.group_tenant_map),
-            holds_all_tenants=authorities.holds_all_tenants(role),
             contained_by=contained_by.actor_subject if contained_by else None,
+            # The tenant the Runtime had when it was contained: its contain event carries it.
+            contained_tenant=contained_by.tenant_id if contained_by else None,
         )
         if not decision.allowed:
-            raise self._deny(403, action, agent_id, runtime_arn, tenant, decision.reason)
-
-        cell = next((c for c in cells if c.containment_role_arn), None)
-        if cell is None:
-            raise self._deny(409, action, agent_id, runtime_arn, tenant, NOT_ENABLED)
-        target = Target(agent_id, runtime_arn, tenant, cell)
+            raise self._deny(403, action, target, decision.reason, since)
 
         request_id = audit_writer.new_request_id()
-        intent = self._event(action, agent_id, runtime_arn, tenant, request_id, "intent", "allowed", decision.reason)
-        if not self._write(runtime_arn, intent):
+        intent = self._event(action, target, request_id, "intent", "allowed", decision.reason)
+        if not self._write(target, intent):
             raise ActionError(503, "The audit trail could not be written, so the action was not performed")
 
         try:
@@ -285,9 +452,7 @@ class ContainmentService:
         except _Failed as failure:
             failed = self._event(
                 action,
-                agent_id,
-                runtime_arn,
-                tenant,
+                target,
                 request_id,
                 "result",
                 "failed",
@@ -295,7 +460,7 @@ class ContainmentService:
                 status_before=failure.before,
                 status_after=failure.after,
             )
-            self._write(runtime_arn, failed)
+            self._write(target, failed)
             raise ActionError(
                 failure.status,
                 failure.done,
@@ -307,9 +472,7 @@ class ContainmentService:
         sessions = result.sessions
         event = self._event(
             action,
-            agent_id,
-            runtime_arn,
-            tenant,
+            target,
             request_id,
             "result",
             result.outcome,
@@ -319,9 +482,132 @@ class ContainmentService:
             sessions_found=sessions.found if sessions else None,
             sessions_stopped=sessions.stopped if sessions else None,
             sessions_failed=(sessions.failed + sessions.not_attempted) if sessions else None,
+            sweeps_scheduled=len(result.sweeps_scheduled_in_seconds) or None,
             detail=sessions.discovery if sessions else None,
         )
-        result.audit_complete = self._write(runtime_arn, event)
+        result.audit_complete = self._write(target, event)
+        return result
+
+    # --- a contain repeated too soon ------------------------------------------------------------
+
+    def _repeat_too_soon(self, target: Target) -> tuple[sweeps.Repeat | None, list[AuditEvent]]:
+        """Whether a contain comes too soon after the last one, whose background sweeps are still at work.
+
+        One request for the newest events of the history says it. A contain
+        never fails for its history: if that read fails, or says nothing, the
+        contain goes on as it always did. Without a sweep queue no contain
+        schedules a sweep, so none is ever too soon. Also returns the events
+        of the containment that holds, as far as that one request read them.
+        """
+        try:
+            trail = audit_reader.read_back(
+                self.dynamodb,
+                self.settings.audit_table,
+                audit_reader.containment_key(target.runtime_arn),
+                max_events=audit_reader.PAGE_SIZE,
+            )
+        except Exception as exc:  # noqa: BLE001 - the contain does its work
+            logger.warning("The history could not be read before a contain: %s", error_code(exc))
+            return None, []
+        current = trail.events[: audit_reader.holder(trail.events).current]
+        repeat = sweeps.repeat_too_soon(
+            current,
+            _now(),
+            repeat_after_seconds=REPEAT_AFTER_SECONDS,
+            sweeps_over_after_seconds=SWEEPS_OVER_AFTER_SECONDS,
+            recheck_seconds=REPEAT_RECHECK_SECONDS,
+        )
+        return repeat, current
+
+    def _answer_at_once(
+        self, target: Target, repeat: sweeps.Repeat, current: list[AuditEvent]
+    ) -> ContainmentResult | None:
+        """The answer to a contain that comes too soon, or ``None`` when it must do its work after all.
+
+        The history says that the agent was contained a moment ago. The
+        policy has the last word: only when it still holds the portal's
+        statement is the contain answered at once. No session is stopped and
+        nothing is scheduled. If the policy cannot be read, or the statement
+        is not there any more, the contain goes on and says so itself.
+
+        The request changed nothing, so there is no intent. Its result is
+        written once for each person since the last contain that did its
+        work, and logged after that: the history says who asked again, and a
+        request repeated every second adds one event, not one each time.
+        """
+        policy_step = ContainmentStep(id="policy", label=_LABELS["policy"], status="failed")
+        verify_step = ContainmentStep(id="verify", label=_LABELS["verify"], status="skipped")
+        sessions_step = ContainmentStep(id="sessions", label=_LABELS["sessions"], status="skipped")
+        steps = [policy_step, verify_step, sessions_step]
+        try:
+            _, policy = self._open(target, policy_step, steps)
+            if containment_policy.state(policy, target.runtime_arn) != containment_policy.CONTAINED:
+                return None
+            kept = containment_policy.other_statements(policy)
+            denied = containment_policy.denied_actions(policy, target.runtime_arn)
+        except (_Failed, containment_policy.PolicyError):
+            return None
+        policy_step.status, policy_step.detail = "unchanged", "The Runtime was already contained."
+        verify_step.status = "done"
+        wait = delay_words(repeat.wait_seconds)
+        if repeat.sweeps_pending:
+            sessions_step.detail = (
+                "The background sweeps of this containment are still running, so nothing more was done. "
+                f"A contain stops sessions again once they have run: ask again in {wait}."
+            )
+        else:
+            sessions_step.detail = (
+                "The background sweeps of this containment ran less than "
+                f"{delay_words(REPEAT_AFTER_SECONDS)} ago, so nothing more was done. "
+                f"A contain stops sessions again in {wait}."
+            )
+        request_id = audit_writer.new_request_id()
+        result = ContainmentResult(
+            action="contain",
+            outcome="unchanged",
+            reason=f"{ALREADY_CONTAINED} {sessions_step.detail}",
+            request_id=request_id,
+            agent_id=target.agent_id,
+            runtime_arn=target.runtime_arn,
+            state=CONTAINED,
+            changed=False,
+            other_statements_kept=kept,
+            steps=steps,
+            denied_actions=denied,
+            enforcement_delay_seconds=CONTAIN_DELAY_SECONDS,
+            retry_after_seconds=repeat.wait_seconds,
+        )
+        # A result with no session counts: that is how it differs from a contain that did its work.
+        on_record = any(
+            event.action == "contain"
+            and event.phase == "result"
+            and event.outcome == "unchanged"
+            and event.sessions_found is None
+            and event.actor_subject == self.principal.subject
+            and event.at > repeat.since
+            for event in current
+        )
+        if on_record:
+            logger.info(
+                "Contain repeated too soon, answered at once and not written again: subject=%s runtime=%s "
+                "request_id=%s wait_seconds=%s",
+                self.principal.subject,
+                target.runtime_arn,
+                request_id,
+                repeat.wait_seconds,
+            )
+        else:
+            event = self._event(
+                "contain",
+                target,
+                request_id,
+                "result",
+                "unchanged",
+                result.reason,
+                status_before=CONTAINED,
+                status_after=CONTAINED,
+            )
+            result.audit_complete = self._write(target, event)
         return result
 
     def _client(self, cell: Cell, service: str) -> Any:
@@ -349,12 +635,16 @@ class ContainmentService:
 
         control, policy = self._open(target, policy_step, steps)
         try:
-            already = containment_policy.is_contained(policy)
-            kept = len(containment_policy.statements(containment_policy.parse(policy))) - (1 if already else 0)
-            denied = containment_policy.denied_actions(policy)
+            found = containment_policy.state(policy, target.runtime_arn)
+            kept = containment_policy.other_statements(policy)
+            denied = containment_policy.denied_actions(policy, target.runtime_arn)
         except containment_policy.PolicyError as exc:
             policy_step.detail = f"{exc}."
             raise _Failed(409, f"Nothing was changed: {exc}.", steps) from exc
+        # Contained means the statement the portal writes is there. A statement that only carries
+        # the portal's Sid denies nothing that can be relied on: it is replaced, and the result says so.
+        already = found == containment_policy.CONTAINED
+        replaced = found == containment_policy.FOREIGN
         before = CONTAINED if already else NOT_CONTAINED
 
         if already:
@@ -362,6 +652,8 @@ class ContainmentService:
             verify_step.status = "done"
         else:
             denied = self._put_statement(control, target, policy, policy_step, steps, before)
+            if replaced:
+                policy_step.detail = f"{policy_step.detail} {REPLACED_FOREIGN}"
             verify_step.status = "failed"
             try:
                 verified = containment.get_policy(control, target.runtime_arn)
@@ -369,7 +661,7 @@ class ContainmentService:
                 verify_step.detail = f"The policy could not be read back ({error_code(exc)})."
                 done = f"The deny statement was written but could not be verified. {verify_step.detail}"
                 raise _Failed(502, f"{done} Sessions were not stopped.", steps, before, "unknown") from exc
-            if not containment_policy.is_contained(verified):
+            if not containment_policy.is_contained(verified, target.runtime_arn):
                 verify_step.detail = "The statement was not found when the policy was read back."
                 done = "The deny statement was written but was not found when the policy was read back."
                 raise _Failed(502, f"{done} Sessions were not stopped.", steps, before, "unknown")
@@ -377,8 +669,11 @@ class ContainmentService:
 
         sessions = self._stop_sessions(target)
         sessions_step.status, sessions_step.detail = _sessions_status(sessions), _sessions_sentence(sessions)
+        background = self._schedule_sweeps(target, request_id, sessions_step.status == "done")
+        if background is not None:
+            steps.append(background.step)
         if already:
-            done = "The Runtime was already contained; its policy was not changed."
+            done = ALREADY_CONTAINED
         else:
             done = (
                 "Invocation of the Runtime is denied (statement written and verified; "
@@ -386,7 +681,11 @@ class ContainmentService:
             )
             if tuple(denied) != containment_policy.ALL_INVOKE_ACTIONS:
                 done += " The service accepted only the core invoke actions in the statement."
+            if replaced:
+                done += f" {REPLACED_FOREIGN}"
         summary = f"{done} {sessions_step.detail}"
+        if background is not None:
+            summary += f" {background.step.detail}"
         return ContainmentResult(
             action="contain",
             outcome="unchanged" if already else "allowed",
@@ -396,12 +695,14 @@ class ContainmentService:
             runtime_arn=target.runtime_arn,
             state=CONTAINED,
             changed=not already,
+            replaced_foreign_statement=replaced,
             other_statements_kept=kept,
             sessions=sessions,
             steps=steps,
-            partial=sessions_step.status != "done",
+            partial=sessions_step.status != "done" or (background is not None and background.step.status == "failed"),
             denied_actions=denied,
             enforcement_delay_seconds=CONTAIN_DELAY_SECONDS,
+            sweeps_scheduled_in_seconds=background.delays if background is not None else [],
         )
 
     def _put_statement(
@@ -418,18 +719,28 @@ class ContainmentService:
         The statement first names every invoke action the service documents for
         a Runtime policy. If the service rejects that list, the statement with
         the two core invoke actions is written instead, and the response says so.
+
+        A write that the service refused changed nothing. A write whose
+        answer never came, or came as a server error or as throttling after
+        the SDK's own retries, may have been applied all the same. That one
+        is recorded as ``unknown``, so that the person who asked for it is on
+        record as the holder: if the statement is in place, they must not be
+        the one to remove it.
         """
         attempts = (containment_policy.ALL_INVOKE_ACTIONS, containment_policy.CORE_INVOKE_ACTIONS)
         for index, actions in enumerate(attempts):
             updated = containment_policy.with_containment(policy, target.runtime_arn, actions)
             try:
                 containment.put_policy(control, target.runtime_arn, updated)
-            except ClientError as exc:
+            except Exception as exc:  # noqa: BLE001 - every failure of the write is reported, none is raised raw
                 code = error_code(exc)
                 if code == "ValidationException" and index + 1 < len(attempts):
                     logger.warning("The full invoke action list was rejected; writing the core actions instead")
                     continue
                 step.detail = f"The deny statement could not be written ({code})."
+                if containment.may_have_been_applied(exc):
+                    done = f"{step.detail} {NOT_KNOWN_WHETHER_WRITTEN}"
+                    raise _Failed(502, done, steps, before, "unknown") from exc
                 raise _Failed(502, f"{step.detail} Nothing was changed.", steps, before, before) from exc
             step.status = "done"
             if index == 0:
@@ -440,6 +751,54 @@ class ContainmentService:
                 )
             return list(actions)
         raise _Failed(502, "The deny statement could not be written. Nothing was changed.", steps, before, before)
+
+    def _schedule_sweeps(self, target: Target, request_id: str, complete: bool) -> _Background | None:
+        """Leave the background sweeps of this containment on the queue.
+
+        ``complete`` says whether the sweep inside this request dealt with
+        every session it found. If it did, no sweep is needed now, and only
+        the later ones are scheduled. Returns ``None`` when no queue is
+        configured: the contain is then exactly what it was without sweeps.
+
+        A queue setting that is not a queue address does not stop the
+        contain: the step fails and says which setting is wrong.
+        """
+        step = ContainmentStep(id="background", label=_LABELS["background"], status="failed")
+        if self.settings.sweep_queue_error:
+            logger.error("Background sweeps cannot be scheduled: %s", self.settings.sweep_queue_error)
+            step.detail = (
+                f"Background sweeps could not be scheduled: {self.settings.sweep_queue_error}. "
+                "Contain again once it is corrected."
+            )
+            return _Background(step, [])
+        queue_url = self.settings.sweep_queue_url
+        if not queue_url or self.sqs is None:
+            return None
+        numbers = sweeps.sweeps_to_schedule(first_needed=not complete)
+        delays: list[int] = []
+        try:
+            for number in numbers:
+                delay = SWEEP_DELAYS_SECONDS[number - 1]
+                message = sweeps.SweepMessage(number, target.runtime_arn, target.agent_id, request_id)
+                sweep_queue.send(self.sqs, queue_url, sweeps.encode(message), delay)
+                delays.append(delay)
+        except Exception as exc:  # noqa: BLE001 - the deny statement is in place either way
+            logger.error("Background sweeps could not be scheduled: %s", error_code(exc))
+            # With none scheduled, the next contain does its work at once and schedules them. With
+            # some scheduled, it does so once those have run or the pause between two contains is over.
+            again = "Contain again" if not delays else f"Contain again in {delay_words(REPEAT_AFTER_SECONDS)}"
+            step.detail = (
+                f"Background sweeps could not be scheduled ({error_code(exc)}): {len(delays)} of "
+                f"{len(numbers)} were. {again} to schedule them."
+            )
+            return _Background(step, delays)
+        step.status = "scheduled"
+        later = " and ".join(f"in {delay_words(delay)}" for delay in delays if delay)
+        if complete:
+            step.detail = f"No background sweep is needed now. Later sweeps are scheduled {later}."
+        else:
+            step.detail = f"Background sweeps are scheduled: now, {later}."
+        return _Background(step, delays)
 
     def _stop_sessions(self, target: Target) -> SessionsStopped:
         """Stop the Runtime's recent sessions. Best effort: the deny statement is already in place."""
@@ -483,12 +842,13 @@ class ContainmentService:
 
         control, policy = self._open(target, policy_step, steps)
         try:
-            contained = containment_policy.is_contained(policy)
+            found = containment_policy.state(policy, target.runtime_arn)
             remaining = containment_policy.without_containment(policy)
+            kept = containment_policy.other_statements(policy)
         except containment_policy.PolicyError as exc:
             policy_step.detail = f"{exc}."
             raise _Failed(409, f"Nothing was changed: {exc}.", steps) from exc
-        kept = len(containment_policy.statements(containment_policy.parse(remaining)))
+        contained = found == containment_policy.CONTAINED
         common = {
             "action": "release",
             "request_id": request_id,
@@ -502,12 +862,12 @@ class ContainmentService:
         if not contained:
             policy_step.status, policy_step.detail = "unchanged", "The Runtime was not contained."
             verify_step.status = "done"
-            return ContainmentResult(
-                outcome="unchanged",
-                reason="The Runtime was not contained; its policy was not changed.",
-                changed=False,
-                **common,
-            )
+            unchanged = "The Runtime was not contained; its policy was not changed."
+            if found == containment_policy.FOREIGN:
+                # Not the portal's statement, so a release leaves it where it is and says that it is there.
+                policy_step.detail = f"{policy_step.detail} {containment_policy.FOREIGN_STATEMENT}"
+                unchanged = f"{unchanged} {containment_policy.FOREIGN_STATEMENT}"
+            return ContainmentResult(outcome="unchanged", reason=unchanged, changed=False, **common)
         try:
             if remaining is None:
                 containment.delete_policy(control, target.runtime_arn)
@@ -528,7 +888,7 @@ class ContainmentService:
             verify_step.detail = f"The policy could not be read back ({error_code(exc)})."
             failure = f"The deny statement was removed but this could not be verified. {verify_step.detail}"
             raise _Failed(502, failure, steps, CONTAINED, "unknown") from exc
-        if containment_policy.is_contained(verified):
+        if containment_policy.is_contained(verified, target.runtime_arn):
             verify_step.detail = "The statement was still present when the policy was read back."
             failure = (
                 "The deny statement was still present when the policy was read back. The Runtime is still contained."
@@ -546,6 +906,10 @@ class ContainmentService:
             policy_deleted=remaining is None,
             **common,
         )
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
 
 
 def _other(state: str) -> str:

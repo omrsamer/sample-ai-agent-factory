@@ -37,6 +37,9 @@ COLUMNS: tuple[str, ...] = (
     "account_alias",
     "region",
     "updated_at",
+    # Added later, at the end, so that the positions of the columns above never move.
+    "review_by",  # the effective review date
+    "last_reviewed_at",
 )
 
 

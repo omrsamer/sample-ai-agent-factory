@@ -9,6 +9,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Response
 
+from portal_api import evidence as evidence_builder
 from portal_api import export
 from portal_api.deps import CurrentPrincipal, EntityId, Service
 from portal_api.models.portal import ContainmentView
@@ -76,7 +77,8 @@ def export_agents(
 
 @router.get("/{agent_id}", response_model=Agent)
 def get_agent(agent_id: EntityId, _: CurrentPrincipal, service: Service) -> Agent:
-    return service.agent(agent_id).agent
+    """One agent, for its own page: it reflects a decision about the agent that was taken a moment ago."""
+    return service.agent_current(agent_id).agent
 
 
 Stage = Annotated[str | None, Query(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
@@ -129,6 +131,18 @@ def eval_runs(agent_id: EntityId, _: CurrentPrincipal, service: Service) -> Eval
 @router.get("/{agent_id}/containment", response_model=ContainmentView)
 def containment(agent_id: EntityId, principal: CurrentPrincipal, service: Service) -> ContainmentView:
     return service.containment_view(agent_id, principal.subject, principal.role)
+
+
+@router.get("/{agent_id}/evidence")
+def evidence(agent_id: EntityId, principal: CurrentPrincipal, service: Service) -> Response:
+    """The agent's evidence document as a JSON download. The model is ``AgentEvidence``."""
+    document = service.evidence(agent_id, principal)
+    name = evidence_builder.file_name(document.agent.name, document.agent.id, dt.datetime.now(dt.UTC).date())
+    return Response(
+        content=document.model_dump_json(indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"},
+    )
 
 
 @router.get("/{agent_id}/mcp-grants", response_model=list[AgentMcpGrant])

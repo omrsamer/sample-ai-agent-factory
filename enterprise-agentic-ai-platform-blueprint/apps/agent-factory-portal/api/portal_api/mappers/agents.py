@@ -94,6 +94,8 @@ class AgentEntry:
     # A configured cell whose reader role can read this agent's account and Region.
     access_cell: Cell | None = None
     links: list[GatewayLink] = field(default_factory=list)
+    # The registry record a registered agent was built from, as the registry returned it.
+    record: dict[str, Any] | None = None
 
 
 def runtime_from_bundle(bundle: dict[str, Any], cell: Cell) -> Runtime:
@@ -219,6 +221,7 @@ def registered_agent(
         cell=cell,
         access_cell=runtime.cell if runtime and runtime.cell else access_cell,
         links=links,
+        record=record,
     )
 
 

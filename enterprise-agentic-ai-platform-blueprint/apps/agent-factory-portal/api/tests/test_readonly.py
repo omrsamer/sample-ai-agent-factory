@@ -17,12 +17,21 @@ PACKAGE = ROOT / "portal_api"
 ACTIONS = PACKAGE / "actions"
 
 READ_FILES = sorted(p for p in PACKAGE.rglob("*.py") if ACTIONS not in p.parents)
-SHARED_ACTION_FILES = [ACTIONS / "engine.py", ACTIONS / "audit_writer.py", ACTIONS / "authority.py", ACTIONS / "app.py"]
+SHARED_ACTION_FILES = [
+    ACTIONS / "engine.py",
+    ACTIONS / "audit_writer.py",
+    ACTIONS / "authority.py",
+    ACTIONS / "app.py",
+    ACTIONS / "lifecycle_rules.py",  # pure; both functions refuse a change to a retired record
+    ACTIONS / "reference_rules.py",  # pure; both refuse a registration that names another tenant's resources
+]
 REGISTRAR_FILES = [ACTIONS / "registrar.py", ACTIONS / "registrar_flow.py", *SHARED_ACTION_FILES]
-# Only the approver flow reads the audit trail (to find the submitter).
+# Only the approver flow reads the audit trail (to find the submitter). Retire and review are
+# served by the approver function too, and add no operation to it.
 APPROVER_FILES = [
     ACTIONS / "approver.py",
     ACTIONS / "approver_flow.py",
+    ACTIONS / "lifecycle_flow.py",
     PACKAGE / "aws" / "audit.py",
     *SHARED_ACTION_FILES,
 ]
@@ -75,6 +84,7 @@ CONTAINMENT_FILES = [
     ACTIONS / "containment.py",
     ACTIONS / "containment_flow.py",
     ACTIONS / "containment_rules.py",
+    ACTIONS / "sweep_queue.py",  # the contain leaves messages for the sweeper
     ACTIONS / "audit_writer.py",
     PACKAGE / "aws" / "audit.py",
     PACKAGE / "aws" / "logs.py",
@@ -87,13 +97,19 @@ CONTAINMENT_FUNCTION_OPERATIONS = {
     "get_registry_record": {"agent-registry:GetRegistryRecord"},
     "query": {"dynamodb:Query"},
     "put_item": {"dynamodb:PutItem"},
+    "send_message": {"sqs:SendMessage"},
 }
+# The sweeper function runs under the containment function's role and uses a part of the above.
+SWEEPER_FILE = ACTIONS / "sweeper.py"
+SWEEPER_USES_OF_CONTAINMENT = {"get_policy", "discover_sessions", "stop_session", "SessionStop", "Session"}
 CONTAINMENT_CELL_OPERATIONS = {
     "get_resource_policy": {"bedrock-agentcore:GetResourcePolicy"},
     "put_resource_policy": {"bedrock-agentcore:PutResourcePolicy"},
     "delete_resource_policy": {"bedrock-agentcore:DeleteResourcePolicy"},
     "stop_runtime_session": {"bedrock-agentcore:StopRuntimeSession"},
     "list_agent_runtime_endpoints": {"bedrock-agentcore:ListAgentRuntimeEndpoints"},
+    # In an account that several tenants share: the Runtime's own tenant-id tag.
+    "list_tags_for_resource": {"bedrock-agentcore:ListTagsForResource"},
     "start_query": {"logs:StartQuery"},
     "get_query_results": {"logs:GetQueryResults"},
     "describe_log_streams": {"logs:DescribeLogStreams"},
@@ -158,6 +174,23 @@ def test_approver_calls_only_its_allow_listed_operations():
     }
 
 
+def test_retire_and_review_add_no_operation_to_any_role():
+    """Wave 2 needs no new IAM action: the lifecycle code calls nothing of its own."""
+    lifecycle = [ACTIONS / "lifecycle_flow.py", ACTIONS / "lifecycle_rules.py", PACKAGE / "reviews.py"]
+    assert operations(lifecycle) == set()
+    # The evidence document is assembled without any call, from what the read API already reads.
+    assert operations([PACKAGE / "evidence.py", PACKAGE / "models" / "evidence.py"]) == set()
+    # Every action file belongs to a role's list, so none escapes the checks above.
+    listed = {*REGISTRAR_FILES, *APPROVER_FILES, *CONTAINMENT_FILES, SWEEPER_FILE}
+    assert {p for p in ACTIONS.glob("*.py") if p.name != "__init__.py"} <= listed
+
+
+def test_the_lifecycle_rules_are_pure():
+    for path in (ACTIONS / "lifecycle_rules.py", PACKAGE / "reviews.py", PACKAGE / "evidence.py"):
+        text = path.read_text()
+        assert "boto" not in text and "client" not in text.replace("ClientError", ""), path.name
+
+
 def test_containment_calls_only_its_allow_listed_operations():
     found = operations(CONTAINMENT_FILES)
     assert found == set(CONTAINMENT_FUNCTION_OPERATIONS) | set(CONTAINMENT_CELL_OPERATIONS)
@@ -166,6 +199,29 @@ def test_containment_calls_only_its_allow_listed_operations():
     assert not {op for op in found if op.startswith(("invoke_", "delete_agent", "update_agent", "create_"))}
     # It reads the names of log streams, never a log event.
     assert not found & {"get_log_events", "filter_log_events", "get_log_record"}
+
+
+def test_the_sweeper_only_reads_the_policy_and_stops_sessions():
+    """It runs under the containment role, but its code reaches for a small part of what that role can do."""
+    source = SWEEPER_FILE.read_text()
+    # It makes no SDK call of its own: everything goes through the containment module and the audit writer.
+    assert operations([SWEEPER_FILE]) == set()
+    used = set(re.findall(r"\bcontainment\.([A-Za-z_]+)", source))
+    assert used == SWEEPER_USES_OF_CONTAINMENT
+    # So it can never write or delete a resource policy, read the registry, or send a queue message.
+    assert not used & {"put_policy", "delete_policy", "get_record", "stop_sessions"}
+    assert "sweep_queue" not in source and "query_events" not in source and "query_items" not in source
+    # Of the audit table it uses three things, all under the Runtime's own key: the history read
+    # back to the contain a message names, the claim of the sweep, and the sweep's one event.
+    assert set(re.findall(r"\baudit_reader\.([A-Za-z_]+)", source)) == {"read_for_sweep", "holder", "containment_key"}
+    assert set(re.findall(r"\baudit_writer\.([A-Za-z_]+)", source)) == {"claim_sweep", "put_event", "now_stamp"}
+    assert source.count("containment_key(") == 1  # the one place a key is made: the sweep's own event
+    # The queue send is the containment function's, and its one operation is documented for that role.
+    assert operations([ACTIONS / "sweep_queue.py"]) == {"send_message"}
+    assert "sqs:SendMessage" in documented("Containment function role")
+    section = (ROOT / "IAM_ACTIONS.md").read_text().split("## 7. Sweeper function", 1)[1].split("\n## ", 1)[0]
+    for needed in ("sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sweep_handler.handler"):
+        assert needed in section, needed
 
 
 def test_only_the_containment_code_changes_a_resource_policy():

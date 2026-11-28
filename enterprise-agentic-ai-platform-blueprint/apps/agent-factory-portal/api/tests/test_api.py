@@ -15,6 +15,7 @@ from portal_api import deps
 from portal_api.app import create_app
 from portal_api.aws import agentcore, registry
 from portal_api.config import get_settings
+from tests import tokens
 from tests.conftest import (
     CELL_ACCOUNT,
     ENGINE_ARN,
@@ -31,9 +32,20 @@ from tests.conftest import (
     runtime_bundle,
     tool_record,
 )
+from tests.fakes import FakeDynamo
 
-PLATFORM_CLAIMS = {"sub": "user-1", "email": "admin@example.com", "cognito:groups": "[platform-admins devs]"}
-VIEWER_CLAIMS = {"sub": "user-2", "email": "viewer@example.com", "cognito:groups": '["viewers"]'}
+PLATFORM_CLAIMS = {
+    "sub": "user-1",
+    "email": "admin@example.com",
+    "email_verified": "true",  # as API Gateway passes a boolean claim
+    "cognito:groups": "[platform-admins devs]",
+}
+VIEWER_CLAIMS = {
+    "sub": "user-2",
+    "email": "viewer@example.com",
+    "email_verified": "true",
+    "cognito:groups": '["viewers"]',
+}
 ALL_DATA_PATHS = [
     "/users/me",
     "/agents",
@@ -46,6 +58,8 @@ ALL_DATA_PATHS = [
     "/agents/recAgent0001/metrics",
     "/agents/recAgent0001/evals/runs",
     "/agents/recAgent0001/mcp-grants",
+    "/agents/recAgent0001/containment",
+    "/agents/recAgent0001/evidence",
     "/mcp-servers",
     "/mcp-servers/ws1-tools-abcdefghij",
     "/mcp-servers/ws1-tools-abcdefghij/policies",
@@ -86,14 +100,19 @@ def event(
         "routeKey": "$default",
         "stage": "$default",
     }
+    all_headers = {"host": "api.example.com", **(headers or {})}
     if claims is not None:
+        # As API Gateway does for a request whose token its authorizer accepted: the claims in the
+        # context, and the token itself still in the header. The read API takes the caller from the
+        # context. The action functions ignore the context and verify the token.
         context["authorizer"] = {"jwt": {"claims": claims, "scopes": []}}
+        all_headers.setdefault("authorization", f"Bearer {tokens.for_claims(claims)}")
     return {
         "version": "2.0",
         "routeKey": "$default",
         "rawPath": f"/api/v1{path}",
         "rawQueryString": query,
-        "headers": {"host": "api.example.com", **(headers or {})},
+        "headers": all_headers,
         "requestContext": context,
         "isBase64Encoded": False,
     }
@@ -255,6 +274,7 @@ def backend(monkeypatch: pytest.MonkeyPatch):
             ("platform", "agent-registry-control"): FakeClient(),
             ("platform", "codepipeline"): codepipeline,
             ("platform", "bedrock"): bedrock,
+            ("platform", "dynamodb"): FakeDynamo(),
             (CELL_ACCOUNT, "bedrock-agentcore-control"): control,
             (CELL_ACCOUNT, "logs"): cell_logs,
             (CELL_ACCOUNT, "cloudwatch"): cell_cloudwatch,
@@ -596,6 +616,7 @@ def test_mcp_servers_policies_and_grants(call):
     assert call("/mcp-servers/ws1-tools-abcdefghij/policy-enforcement")[1] == {
         "enforcement_mode": "log_only",
         "engine_id": ENGINE_ARN.rsplit("/", 1)[-1],
+        "detail": None,
     }
     grants = call("/mcp-servers/ws1-tools-abcdefghij/grants")[1]
     assert sorted(g["principal_id"] for g in grants) == ["orphan_agent-ZyXwVu9876", "recAgent0001"]
@@ -793,6 +814,9 @@ def test_export_json_and_parameters(backend):
     assert {row["agent_id"] for row in rows} == {"recAgent0001", "orphan_agent-ZyXwVu9876"}
     first = next(row for row in rows if row["agent_id"] == "recAgent0001")
     assert first["unmanaged"] is False and isinstance(first["risk_reasons"], list)
+    # The effective review date and the last review are the last two columns.
+    assert list(first)[-2:] == ["review_by", "last_reviewed_at"]
+    assert (first["review_by"], first["last_reviewed_at"]) == ("2099-12-31", None)
     assert first["detection_sources"] == ["cell_reader"]
     assert raw(backend, "/agents/export", "format=xlsx")[0] == 422
     assert raw(backend, "/agents/export", claims=None)[0] == 401
@@ -835,8 +859,9 @@ def test_fleet_summary_endpoint(call):
         == {"unmanaged", "ownerless", "review_overdue", "inactive", "contained"}
     )
     assert body["flags"]["unmanaged"] == 1
-    assert body["gateways_by_policy_mode"] == {"enforce": 0, "log_only": 1, "none": 0}
+    assert body["gateways_by_policy_mode"] == {"enforce": 0, "log_only": 1, "none": 0, "unknown": 0}
     assert (body["organization_registry"], body["unreachable_cells"]) == ("disabled", 1)
+    assert body["review_attestations"] == "ok"
     assert body["warnings"] == ["1 cell account(s) could not be read."]
     urgent = body["needs_attention"]
     assert [a["agent_id"] for a in urgent] == ["orphan_agent-ZyXwVu9876"]

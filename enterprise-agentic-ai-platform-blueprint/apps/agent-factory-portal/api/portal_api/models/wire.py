@@ -72,11 +72,16 @@ class AgentGovernance(BaseModel):
 
 
 class AgentFlags(BaseModel):
-    """Portal addition. Each flag is true, false, or null when it cannot be known."""
+    """Portal addition. Each flag is true, false, or null.
+
+    Null means that the flag cannot be known, except on an agent whose
+    ``obligations_closed`` is true: there ``unmanaged``, ``ownerless``,
+    ``review_overdue`` and ``inactive`` are null because they do not apply.
+    """
 
     unmanaged: bool | None = None  # no APPROVED registration
     ownerless: bool | None = None  # registered, but no accountable owner
-    review_overdue: bool | None = None  # the registration's review date has passed
+    review_overdue: bool | None = None  # the effective review date has passed
     inactive: bool | None = None  # no invocation in the inactivity window
     contained: bool | None = None  # the Runtime's resource policy holds the containment statement
 
@@ -130,9 +135,19 @@ class Agent(BaseModel):
     inbound_authorizer: str | None = None  # "AWS_IAM" | "CUSTOM_JWT"; null when not known
     flags: AgentFlags = Field(default_factory=AgentFlags)
     risk: AgentRisk = Field(default_factory=AgentRisk)
+    # True for a retired registration with no Runtime known: nothing is left that anyone could
+    # act on. No risk rule applies to it (level low, no reasons), and the flags unmanaged,
+    # ownerless, review_overdue and inactive are null because they do not apply, not because
+    # they could not be read. The fleet summary counts none of its flags. It stays false while
+    # the reader of the Runtime's account could not be used (reader_status "unreachable").
+    obligations_closed: bool = False
     last_invoked_on: str | None = None  # last day with an invocation inside the inactivity window
     sponsor: str | None = None  # the accountable person, from the registration
-    review_by: str | None = None  # YYYY-MM-DD, from the registration
+    # YYYY-MM-DD. The effective review date: the latest attestation's (a review, or an approval of a
+    # document that names a date), else the registration's own.
+    review_by: str | None = None
+    last_reviewed_at: str | None = None  # when the registration was last reviewed or approved with a date
+    last_reviewed_by: str | None = None  # the reviewer's or approver's label
     omni_url: str | None = None  # the cell account's CloudWatch Omni domain, to link out to
     account_alias: str | None = None  # the configured alias of the agent's account; null when none is configured
     # "ok", "unreachable" (a reader is configured but could not be used) or "none" (no reader in the
@@ -362,7 +377,9 @@ class McpServer(BaseModel):
     gateway_arn: str | None = None
     cedar_policy_engine_id: str | None = None
     cedar_policy_engine_arn: str | None = None
-    cedar_enforcement_mode: str = "none"  # "none" | "log_only" | "enforce"
+    # "none" | "log_only" | "enforce", or "unknown" for a gateway that no reader read: "none" would
+    # claim that it has no policy engine, which is not known.
+    cedar_enforcement_mode: str = "none"
     gateway_id: str | None = None
     gateway_url: str | None = None
     runtime_arn: str | None = None
@@ -381,6 +398,13 @@ class McpServer(BaseModel):
     account_id: str | None = None
     agent_id: str | None = None
     detection_sources: list[str] = Field(default_factory=list)  # organization_registry, cell_reader
+    account_alias: str | None = None  # the configured alias of the gateway's account; null when none is configured
+    # "ok": a cell reader read the gateway. Otherwise it is known from the organization registry
+    # only: "none" (no reader in its account and Region), "unreachable" (the reader could not be
+    # used) or "not_listed" (the reader works but did not list this gateway).
+    reader_status: str = "ok"
+    protocol: str | None = None  # for example MCP
+    detail: str | None = None  # for a gateway no reader read: why its targets and policy are not shown
 
 
 class CedarPolicyRow(BaseModel):
@@ -409,8 +433,9 @@ class CedarPolicySet(BaseModel):
 
 
 class PolicyEnforcement(BaseModel):
-    enforcement_mode: str = "none"
+    enforcement_mode: str = "none"  # "none" | "log_only" | "enforce" | "unknown"
     engine_id: str | None = None  # portal addition
+    detail: str | None = None  # portal addition: why the mode is unknown
 
 
 # --- Grants (derived, read-only) ---------------------------------------------
