@@ -197,6 +197,10 @@ function cellsContext(app: App, environment: PortalEnvironment): PortalCell[] {
     if (!isPortalEnvironment(cellEnvironment)) {
       throw new Error(`agenticai/portalCells[${index}].environment must be nonprod or prod.`);
     }
+    const flag = (value: unknown): boolean => value === true || value === "true";
+    if (flag(cell.containmentSpans) && !flag(cell.containment)) {
+      throw new Error(`agenticai/portalCells[${index}].containmentSpans needs containment: true.`);
+    }
     return {
       tenantId: text("tenantId", true)!,
       agentId: text("agentId", true)!,
@@ -208,7 +212,8 @@ function cellsContext(app: App, environment: PortalEnvironment): PortalCell[] {
       alarmNamePrefix: text("alarmNamePrefix", false),
       pipelineName: text("pipelineName", false),
       accountAlias: text("accountAlias", false),
-      containment: cell.containment === true || cell.containment === "true",
+      containment: flag(cell.containment),
+      containmentSpans: flag(cell.containmentSpans),
       omniDomainUrl: httpsUrl(text("omniDomainUrl", false), `agenticai/portalCells[${index}].omniDomainUrl`),
       omniRegion: text("omniRegion", false),
     };
@@ -426,6 +431,10 @@ export function addAgentFactoryPortalStage(
         throw new Error("agent-factory-portal-containment stage requires context 'agenticai/portalExternalId'.");
       }
       const containmentLogGroups = listContext(app, "agenticai/portalSpansLogGroupNames");
+      const containmentSpans = context(app, "agenticai/portalContainmentSpans");
+      if (containmentSpans !== undefined && containmentSpans !== "true" && containmentSpans !== "false") {
+        throw new Error("Context 'agenticai/portalContainmentSpans' must be true or false.");
+      }
       const stack = new AgentFactoryPortalContainmentStack(
         app,
         `AgenticAI-AgentFactoryPortal-Containment-${environment}`,
@@ -434,6 +443,7 @@ export function addAgentFactoryPortalStage(
           environment,
           platformAccountId: platformAccount,
           externalId,
+          spanSessionDiscovery: containmentSpans === "true",
           spansLogGroupNames: containmentLogGroups.length > 0 ? containmentLogGroups : undefined,
           description: `Agent Factory Portal (${environment}) containment authority for this cell.`,
         },

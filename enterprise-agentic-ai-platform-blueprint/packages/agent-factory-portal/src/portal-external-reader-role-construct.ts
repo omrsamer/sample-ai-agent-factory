@@ -9,14 +9,16 @@ import { Construct } from "constructs";
 import { PortalEnvironment, portalExternalReaderRoleName } from "./naming";
 
 /**
- * What an external inventory or governance tool may read: the list and the
- * configuration of Runtimes and Gateways, and CloudWatch metrics. It cannot
- * invoke a model or an agent, cannot read Memory, prompts, traces or logs,
- * and cannot change or delete anything.
+ * What an external inventory or governance tool may read: the list of
+ * Runtimes with their versions and endpoints, the list and configuration of
+ * Gateways, tags, and CloudWatch metrics. It cannot read a Runtime's own
+ * configuration (`GetAgentRuntime` returns its environment variables, which
+ * can hold more than an inventory needs), cannot invoke a model or an agent,
+ * cannot read Memory, prompts, traces or logs, and cannot change or delete
+ * anything.
  */
 export const PORTAL_EXTERNAL_READER_AGENTCORE_ACTIONS: readonly string[] = [
   "bedrock-agentcore:ListAgentRuntimes",
-  "bedrock-agentcore:GetAgentRuntime",
   "bedrock-agentcore:ListAgentRuntimeVersions",
   "bedrock-agentcore:ListAgentRuntimeEndpoints",
   "bedrock-agentcore:ListGateways",

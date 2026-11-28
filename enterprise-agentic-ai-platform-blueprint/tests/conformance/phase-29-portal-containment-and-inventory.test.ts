@@ -7,9 +7,11 @@
  *   - a cell is containable only when it deploys the target role;
  *   - the target role holds five actions on that cell's Runtimes (resource
  *     policy read, put and delete; stop a session; list endpoints), may find
- *     the sessions in the spans log group and in the names of the Runtimes'
- *     log streams, and trusts only the portal's containment function role,
- *     with the cell's external id;
+ *     the sessions in the names of the Runtimes' log streams, and trusts only
+ *     the portal's containment function role, with the cell's external id.
+ *     It cannot run a query: a role that can query the spans log group can
+ *     read span content, so that second source of session ids is a separate,
+ *     explicit opt-in;
  *   - the containment function's own role can only assume those target roles,
  *     read one record of the agent Registry and append to and read the audit
  *     trail: no AgentCore permission of its own, and no Registry write;
@@ -87,6 +89,12 @@ function cell(overrides: Partial<PortalCell> = {}): PortalCell {
   };
 }
 
+/** PORTAL_CELLS is a token-joined string when it holds an account-derived ARN; resolve the literal parts. */
+function resolveJoin(value: unknown): string {
+  const join = (value as { "Fn::Join": [string, unknown[]] })["Fn::Join"];
+  return join[1].map((part) => (typeof part === "string" ? part : "aws")).join(join[0]);
+}
+
 function portal(cells: PortalCell[]): AgentFactoryPortalStack {
   return new AgentFactoryPortalStack(withNag(new App()), "Portal", {
     env: { account: PLATFORM, region: REGION },
@@ -141,11 +149,28 @@ describe("Phase 29 — containment target role (Workstream cell)", () => {
     expect(actions([runtime]).sort()).toEqual([...PORTAL_CONTAINMENT_TARGET_ACTIONS].sort());
     expect(JSON.stringify(runtime.Resource)).toContain(`:bedrock-agentcore:${REGION}:${CELL}:runtime/*`);
     expect(JSON.stringify(runtime.Resource)).not.toMatch(/gateway|memory|"\*"/);
-    expect(actions(statements).sort()).toEqual(
-      [...PORTAL_CONTAINMENT_TARGET_ACTIONS, "logs:StartQuery", "logs:GetQueryResults", "logs:DescribeLogStreams"].sort(),
+    // By default: those five, and the names of session log streams. No query, so no span content.
+    expect(actions(statements).sort()).toEqual([...PORTAL_CONTAINMENT_TARGET_ACTIONS, "logs:DescribeLogStreams"].sort());
+    expect(statements.map((s) => s.Sid).sort()).toEqual(["ContainRuntimes", "FindRuntimeSessionStreams"]);
+  });
+
+  it("can query the spans log group only when the cell asks for that source of session ids", () => {
+    const optIn = new AgentFactoryPortalContainmentStack(withNag(new App()), "TargetWithSpans", {
+      env: { account: CELL, region: REGION },
+      environment: "nonprod",
+      platformAccountId: PLATFORM,
+      externalId: EXTERNAL_ID,
+      spanSessionDiscovery: true,
+    });
+    const withSpans = statementsOfRole(Template.fromStack(optIn), "AgenticAI-PortalContainmentTarget-nonprod");
+    expect(actions(withSpans).sort()).toEqual(
+      [...PORTAL_CONTAINMENT_TARGET_ACTIONS, "logs:DescribeLogStreams", "logs:StartQuery", "logs:GetQueryResults"].sort(),
     );
-    const query = statements.find((s) => s.Sid === "FindRuntimeSessions")!;
+    const query = withSpans.find((s) => s.Sid === "FindRuntimeSessionsInSpans")!;
     expect(JSON.stringify(query.Resource)).toContain(`:logs:${REGION}:${CELL}:log-group:aws/spans:*`);
+    const results = withSpans.find((s) => s.Sid === "ReadSessionQueryResults")!;
+    expect(results.Condition).toEqual({ StringEquals: { "aws:RequestedRegion": REGION } });
+    expect(nagErrors(optIn)).toEqual([]);
   });
 
   it("lists session log stream names only in the log groups of this cell's Runtimes", () => {
@@ -159,7 +184,9 @@ describe("Phase 29 — containment target role (Workstream cell)", () => {
   it("cannot invoke, change or delete a Runtime, read a log event, or touch anything else", () => {
     for (const action of actions(statements)) {
       expect(action).not.toMatch(/:(Invoke|Update|Create|DeleteAgentRuntime|Tag|ListSessions)/);
-      expect(action).not.toMatch(/^logs:(GetLogEvents|FilterLogEvents|GetLogRecord|StartLiveTail|Put|Create|Delete)/);
+      expect(action).not.toMatch(
+        /^logs:(GetLogEvents|FilterLogEvents|GetLogRecord|StartLiveTail|StartQuery|GetQueryResults|Put|Create|Delete)/,
+      );
       expect(action.startsWith("bedrock-agentcore:") || action.startsWith("logs:")).toBe(true);
     }
   });
@@ -189,23 +216,28 @@ describe("Phase 29 — containment target role (Workstream cell)", () => {
     expect(nagErrors(stack)).toEqual([]);
   });
 
-  it("is deployed by its own stage, which honours a custom spans log group", () => {
-    const app = new App({
-      context: {
-        "agenticai/portalEnvironment": "nonprod",
-        "agenticai/portalAccountId": PLATFORM,
-        "agenticai/portalCellAccountId": CELL,
-        "agenticai/portalExternalId": EXTERNAL_ID,
-        "agenticai/portalSpansLogGroupNames": "custom/agent-spans",
-      },
-    });
-    expect(addAgentFactoryPortalStage(app, "agent-factory-portal-containment", REGION)).toBe(true);
-    const staged = Template.fromStack(app.node.findChild("AgenticAI-AgentFactoryPortal-Containment-nonprod") as Stack);
-    const query = statementsOfRole(staged, "AgenticAI-PortalContainmentTarget-nonprod").find(
-      (s) => s.Sid === "FindRuntimeSessions",
+  it("is deployed by its own stage: no query by default, and the spans option honours a custom log group", () => {
+    const base = {
+      "agenticai/portalEnvironment": "nonprod",
+      "agenticai/portalAccountId": PLATFORM,
+      "agenticai/portalCellAccountId": CELL,
+      "agenticai/portalExternalId": EXTERNAL_ID,
+      "agenticai/portalSpansLogGroupNames": "custom/agent-spans",
+    };
+    const staged = (context: Record<string, string>): Statement[] => {
+      const app = new App({ context });
+      expect(addAgentFactoryPortalStage(app, "agent-factory-portal-containment", REGION)).toBe(true);
+      const template = Template.fromStack(app.node.findChild("AgenticAI-AgentFactoryPortal-Containment-nonprod") as Stack);
+      return statementsOfRole(template, "AgenticAI-PortalContainmentTarget-nonprod");
+    };
+    // Naming a spans log group does not grant a query on it.
+    expect(actions(staged(base)).some((a) => a === "logs:StartQuery")).toBe(false);
+    const query = staged({ ...base, "agenticai/portalContainmentSpans": "true" }).find(
+      (s) => s.Sid === "FindRuntimeSessionsInSpans",
     )!;
     expect(JSON.stringify(query.Resource)).toContain(`:logs:${REGION}:${CELL}:log-group:custom/agent-spans:*`);
     expect(JSON.stringify(query.Resource)).not.toContain("aws/spans");
+    expect(() => staged({ ...base, "agenticai/portalContainmentSpans": "yes" })).toThrow(/must be true or false/);
   });
 
   it("refuses to synthesize without the cell's external id", () => {
@@ -251,6 +283,51 @@ describe("Phase 29 — containment function (Platform account)", () => {
     expect(actions(registry)).toEqual(["agent-registry:GetRegistryRecord"]);
     expect(JSON.stringify(registry[0].Resource)).toContain(AGENT_REGISTRY.arn);
     expect(JSON.stringify(registry[0].Resource)).not.toContain(DISCOVERY_REGISTRY.arn);
+  });
+
+  it("tells the functions about the spans option only for a cell that has containment and asked for it", () => {
+    const cellsOf = (portalStack: AgentFactoryPortalStack): Array<Record<string, unknown>> => {
+      const functions = Object.values(Template.fromStack(portalStack).findResources("AWS::Lambda::Function")).map(
+        (f) => (f as { Properties: { Handler: string; Environment?: { Variables: Record<string, unknown> } } }).Properties,
+      );
+      const raw = functions.find((f) => f.Handler === "containment_handler.handler")!.Environment!.Variables.PORTAL_CELLS;
+      return JSON.parse(typeof raw === "string" ? raw : resolveJoin(raw)) as Array<Record<string, unknown>>;
+    };
+    const [contained, other] = cellsOf(
+      portal([cell({ containment: true, containmentSpans: true }), cell({ tenantId: "ws2", accountId: "555555555555" })]),
+    );
+    expect(contained.containmentSpans).toBe(true);
+    expect(String(contained.containmentRoleArn)).toContain("AgenticAI-PortalContainmentTarget-nonprod");
+    expect(other.containmentSpans).toBeUndefined();
+    expect(other.containmentRoleArn).toBeUndefined();
+    // Without the option nothing is said: the default is stream names only.
+    for (const configured of cellsOf(stack)) expect(configured.containmentSpans).toBeUndefined();
+  });
+
+  it("refuses the spans option on a cell that did not enable containment", () => {
+    const app = new App({
+      context: {
+        "agenticai/portalEnvironment": "nonprod",
+        "agenticai/portalAccountId": PLATFORM,
+        "agenticai/portalWebAclArn": WEB_ACL,
+        "agenticai/portalApiCodePath": apiCode,
+        "agenticai/portalWebDistPath": webDist,
+        "agenticai/portalCells": JSON.stringify([
+          { tenantId: "ws1", agentId: "a", accountId: CELL, region: REGION, externalId: EXTERNAL_ID, containmentSpans: true },
+        ]),
+      },
+    });
+    expect(() => addAgentFactoryPortalStage(app, "agent-factory-portal", REGION)).toThrow(
+      /containmentSpans needs containment: true/,
+    );
+  });
+
+  it("gives the containment function more reserved concurrency than the registration functions", () => {
+    const functions = Object.values(template.findResources("AWS::Lambda::Function")).map(
+      (f) => (f as { Properties: { Handler: string; ReservedConcurrentExecutions?: number } }).Properties,
+    );
+    expect(functions.find((f) => f.Handler === "containment_handler.handler")!.ReservedConcurrentExecutions).toBe(20);
+    expect(functions.find((f) => f.Handler === "approver_handler.handler")!.ReservedConcurrentExecutions).toBe(5);
   });
 
   it("serves the two containment routes behind the JWT authorizer", () => {
@@ -355,6 +432,11 @@ describe("Phase 29 — external inventory reader", () => {
   });
   const template = Template.fromStack(stack);
   const statements = statementsOfRole(template, "AgenticAI-ExternalInventoryReader-nonprod");
+
+  it("does not read a Runtime's configuration, which holds its environment variables", () => {
+    expect(PORTAL_EXTERNAL_READER_AGENTCORE_ACTIONS).not.toContain("bedrock-agentcore:GetAgentRuntime");
+    expect(actions(statements)).not.toContain("bedrock-agentcore:GetAgentRuntime");
+  });
 
   it("reads inventory and metrics and nothing else", () => {
     expect(actions(statements).sort()).toEqual(

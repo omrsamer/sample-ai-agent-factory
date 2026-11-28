@@ -62,6 +62,11 @@ export interface PortalCell {
   readonly accountAlias?: string;
   /** The cell has deployed the containment target role (agent-factory-portal-containment stage). */
   readonly containment?: boolean;
+  /**
+   * The cell deployed that role with the spans option (`agenticai/portalContainmentSpans=true`),
+   * so containment may also look for session ids in the cell's spans. Needs `containment`.
+   */
+  readonly containmentSpans?: boolean;
   /** URL of the cell's CloudWatch Omni domain, for "Open in Omni". */
   readonly omniDomainUrl?: string;
   /** Region of the cell's Omni space. */
@@ -89,6 +94,7 @@ export function portalCellsEnvironment(
     containmentRoleArn: c.containment
       ? `arn:${partition}:iam::${c.accountId}:role/${portalContainmentTargetRoleName(environment)}`
       : undefined,
+    containmentSpans: c.containment && c.containmentSpans ? true : undefined,
     omniDomainUrl: c.omniDomainUrl,
     omniRegion: c.omniRegion,
   }));

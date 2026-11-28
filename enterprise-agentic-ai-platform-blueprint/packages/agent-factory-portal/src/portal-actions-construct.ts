@@ -133,6 +133,8 @@ interface ActionFunctionSpec {
   /** Extra statements of this function only. */
   readonly statements?: PolicyStatement[];
   readonly environment?: Record<string, string>;
+  /** Reserved concurrency. Defaults to 5. */
+  readonly reservedConcurrency?: number;
   readonly description: string;
 }
 
@@ -209,7 +211,7 @@ export class PortalActions extends Construct {
         role: role.withoutPolicyUpdates(),
         memorySize: 512,
         timeout: Duration.seconds(29),
-        reservedConcurrentExecutions: 5,
+        reservedConcurrentExecutions: spec.reservedConcurrency ?? 5,
         tracing: Tracing.ACTIVE,
         logGroup: logs,
         environment: {
@@ -314,6 +316,10 @@ export class PortalActions extends Construct {
         actionRole: "containment",
         roleName: portalContainmentRoleName(props.environment),
         handler: "containment_handler.handler",
+        // A contain can hold a slot for most of its timeout while it stops sessions. Refused
+        // requests are cheap (nothing is looked up or written), but they share the same slots,
+        // so this function gets more of them than the registration functions.
+        reservedConcurrency: 20,
         registryActions: PORTAL_CONTAINMENT_REGISTRY_ACTIONS,
         auditActions: PORTAL_APPROVER_AUDIT_ACTIONS,
         statements: [

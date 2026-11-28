@@ -17,9 +17,13 @@ Every refusal has a positive twin in the same run:
   another principal assumes the
     cell's containment role          -> AccessDenied   the portal function -> acts
   an agent whose cell did not opt in -> 409   an agent whose cell did      -> 200
+  the person who contained under one
+    id releases under another        -> 403   a different person, either id -> 200
 
 It also proves that containment keeps every statement of the Runtime's
-resource policy that it did not write.
+resource policy that it did not write, that a registration naming the Runtime
+for another tenant changes neither the tenant that decides nor the history,
+and that the incident record is shown only to the roles that can act.
 
 THE TARGET MUST BE SAFE TO BLOCK. The module blocks the Runtime named by
 PORTAL_CONTAINMENT_RUNTIME_ARN for a few minutes. It refuses to start unless
@@ -36,7 +40,12 @@ Configuration: the variables of test_agent_factory_portal.py, plus
                                        id of an agent with no registration)
   PORTAL_CONTAINMENT_EXPECT_SESSIONS=1 optional: require that the running
                                        session is found and stopped (the
-                                       Runtime must write logs or emit spans)
+                                       Runtime must write output)
+  PORTAL_CONTAINMENT_CLAIMED_TENANT    optional: a tenant the `product-teams`
+                                       group holds that is NOT the tenant of
+                                       the Runtime's cell; enables the check
+                                       that a registration cannot move a
+                                       Runtime into its tenant
   Credentials of the cell account (AWS_PROFILE_WORKLOAD or the *_WORKLOAD
   keys of conftest.py), used only to invoke the Runtime and read its policy.
 
@@ -81,6 +90,7 @@ RUNTIME_ARN = _required("PORTAL_CONTAINMENT_RUNTIME_ARN")
 EXTERNAL_ID = _required("PORTAL_READER_EXTERNAL_ID")
 ENVIRONMENT = os.environ.get("PORTAL_ENVIRONMENT", "nonprod")
 EXPECT_SESSIONS = os.environ.get("PORTAL_CONTAINMENT_EXPECT_SESSIONS") == "1"
+CLAIMED_TENANT = os.environ.get("PORTAL_CONTAINMENT_CLAIMED_TENANT", "")
 
 _ARN = RUNTIME_ARN.split(":")
 if len(_ARN) != 6 or _ARN[2] != "bedrock-agentcore" or not _ARN[5].startswith("runtime/"):
@@ -269,7 +279,7 @@ def live(workload_session):
 
     idp = boto3.client("cognito-idp", region_name=REGION)
     created: list[str] = []
-    state = {"tokens": {}, "cell": cell}
+    state = {"tokens": {}, "cell": cell, "records": []}
     try:
         for persona, group in GROUPS.items():
             email = f"{MARKER}-{persona}@example.com"
@@ -286,8 +296,11 @@ def live(workload_session):
             state["tokens"][persona] = _sign_in(idp, email, password)
         yield state
     finally:
-        # Owned cleanup only: the two statements this module can add, then its users.
+        # Owned cleanup only: the two statements this module can add, its records, then its users.
         cell.remove_statements({CONTAINMENT_SID, KEPT_SID})
+        for record_id in state["records"]:
+            if state["tokens"].get("platform"):
+                _call("DELETE", f"/registrations/{record_id}", state["tokens"]["platform"])
         for email in created:
             idp.admin_delete_user(UserPoolId=POOL, Username=email)
 
@@ -377,6 +390,12 @@ def test_contain_blocks_invocation_and_stops_the_running_session(live):
     assert view["state"] == "contained" and view["contained_by_me"] is True
     assert MARKER in (view["contained_by_label"] or "")
     assert _view(tokens["platform"])["contained_by_me"] is False
+    # The incident record is for the roles that can act. Everyone else sees that it is contained.
+    for persona in ("developer", "readonly"):
+        redacted = _view(tokens[persona])
+        assert redacted["state"] == "contained" and redacted["contained_at"], persona
+        assert redacted["contained_by"] is None and redacted["contained_by_label"] is None, persona
+        assert redacted["reason"] is None and redacted["events"] == [], persona
 
 
 def test_containing_a_contained_agent_changes_nothing(live):
@@ -440,6 +459,12 @@ def test_the_audit_trail_records_the_refusals_and_the_decisions(live):
     } <= results, results
     refused_release = [e for e in mine if e["action"] == "release" and e["outcome"] == "denied"]
     assert any("CON-03-N" in e["reason"] for e in refused_release)
+    # A refusal about this Runtime is in its history (the sre user's tenant). A caller without the
+    # role was refused before anything was looked up: that is in the function's log, not here,
+    # so that a signed-in user cannot fill an agent's history.
+    refused_contain = [e for e in mine if e["action"] == "contain" and e["outcome"] == "denied"]
+    assert refused_contain and all("-sre@" in e["actor_label"] for e in refused_contain), refused_contain
+    assert not [e for e in mine if "-developer@" in e["actor_label"] or "-readonly@" in e["actor_label"]]
     # An intent is recorded before anything is changed, with the same request id as its result.
     contained = next(e for e in mine if e["action"] == "contain" and e["outcome"] == "allowed" and e["phase"] == "result")
     assert contained["request_id"] == live["contain_request"]
@@ -488,6 +513,75 @@ def test_containment_keeps_every_statement_it_did_not_write(live):
 
     cell.remove_statements({KEPT_SID})
     assert cell.policy() is None
+
+
+def test_a_registration_naming_the_runtime_changes_neither_the_tenant_nor_the_history(live):
+    """The attack: register the Runtime under a second id, for another tenant, and use that id."""
+    if not CLAIMED_TENANT:
+        pytest.skip("PORTAL_CONTAINMENT_CLAIMED_TENANT is not set")
+    cell, tokens = live["cell"], live["tokens"]
+    status, created = _call(
+        "POST",
+        "/registrations",
+        tokens["developer"],
+        {
+            "tenant_id": CLAIMED_TENANT,
+            "agent_id": f"live-{RUN}-claim",
+            "environment": ENVIRONMENT,
+            "owner_group": "live-validation",
+            "business_purpose": f"Live validation {MARKER}: a draft that names the validation Runtime.",
+            "risk_class": "limited",
+            "data_classification": "internal",
+            "cost_centre": "validation",
+            "runtime_arn": RUNTIME_ARN,
+        },
+    )
+    assert status == 201, created
+    record_id = created["registration"]["record_id"]
+    live["records"].append(record_id)
+    by_record = f"/agents/{record_id}/containment"
+
+    # The record's id is a second name for the same Runtime. The tenant that decides is the cell's.
+    status, result = _call("POST", f"{by_record}/contain", tokens["security"], {"reason": "Live validation: contain by record id."})
+    assert status == 200, result
+    assert result["runtime_arn"] == RUNTIME_ARN and result["changed"] is True
+    cell.closed()
+    events = _events_of_the_runtime(tokens["platform"], record_id)
+    contained = next(e for e in events if e["request_id"] == result["request_id"] and e["phase"] == "result")
+    assert contained["tenant_id"] and contained["tenant_id"] != CLAIMED_TENANT, "the registration named the tenant"
+
+    # The person who contained it under the record id cannot release it under either id.
+    status, body = _release(tokens["security"])
+    assert status == 403 and "CON-03-N" in json.dumps(body), body
+    status, body = _call("POST", f"{by_record}/release", tokens["security"], {"reason": "Same person, other id."})
+    assert status == 403 and "CON-03-N" in json.dumps(body), body
+    assert CONTAINMENT_SID in cell.sids()
+
+    # A different person can, and the one history holds everything, whichever id each request used.
+    status, released = _release(tokens["platform"])
+    assert status == 200 and released["state"] == "not_contained", released
+    cell.first(200)
+    events = _events_of_the_runtime(tokens["platform"], record_id)
+    outcomes = {(e["action"], e["outcome"]) for e in events if e["request_id"] in (result["request_id"], released["request_id"])}
+    assert {("contain", "allowed"), ("release", "allowed")} <= outcomes
+
+    status, body = _call("DELETE", f"/registrations/{record_id}", tokens["platform"])
+    assert status == 200, body
+    live["records"].remove(record_id)
+
+
+def _events_of_the_runtime(token: str, record_id: str) -> list[dict]:
+    """The Runtime's history. The agent is listed under its Runtime id or, once the read API has
+    seen the registration, under the record id: the history is the same."""
+    deadline = time.monotonic() + 90
+    while True:
+        for agent_id in (record_id, AGENT_ID):
+            status, view = _call("GET", f"/agents/{agent_id}/containment", token)
+            if status == 200:
+                return view["events"]
+        if time.monotonic() > deadline:
+            raise AssertionError("the agent's containment view could not be read under either id")
+        time.sleep(5)
 
 
 def test_an_agent_whose_cell_did_not_opt_in_cannot_be_contained(live):

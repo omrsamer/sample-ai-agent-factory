@@ -17,11 +17,10 @@ import {
  * read and change the resource policy of a Runtime (to add or remove the one
  * deny statement that blocks invocation), stop the Runtime's sessions, and
  * find those sessions. No API lists a Runtime's sessions, so their ids are
- * read from two places: the Runtime's spans, and the names of the log streams
- * the service creates per session in each endpoint's log group (which is why
- * the endpoints are listed). It cannot invoke, update or delete a Runtime,
- * cannot read a log event, and cannot touch a Gateway, Memory, identity or
- * any other resource.
+ * read from the names of the log streams the service creates per session in
+ * each endpoint's log group (which is why the endpoints are listed). It
+ * cannot invoke, update or delete a Runtime, cannot read a log event or run a
+ * query, and cannot touch a Gateway, Memory, identity or any other resource.
  */
 export const PORTAL_CONTAINMENT_TARGET_ACTIONS: readonly string[] = [
   "bedrock-agentcore:GetResourcePolicy",
@@ -31,7 +30,12 @@ export const PORTAL_CONTAINMENT_TARGET_ACTIONS: readonly string[] = [
   "bedrock-agentcore:ListAgentRuntimeEndpoints",
 ];
 
-/** Session discovery from spans: a Logs Insights query and its result. */
+/**
+ * Optional second source of session ids, off by default: a Logs Insights
+ * query over the spans log group and its result. IAM cannot restrict which
+ * query is run, so a role that holds these can read span content, not only
+ * session ids. See `spanSessionDiscovery`.
+ */
 export const PORTAL_CONTAINMENT_TARGET_LOGS_QUERY_ACTIONS: readonly string[] = ["logs:StartQuery"];
 export const PORTAL_CONTAINMENT_TARGET_LOGS_RESULT_ACTIONS: readonly string[] = ["logs:GetQueryResults"];
 /**
@@ -46,7 +50,15 @@ export interface PortalContainmentTargetRoleProps {
   readonly environment: PortalEnvironment;
   readonly platformAccountId: string;
   readonly externalId: string;
-  /** Log groups holding the Runtimes' spans. Defaults to `aws/spans`. */
+  /**
+   * Also let the containment authority look for session ids in the cell's
+   * spans (it finds a session of an instrumented agent that wrote no output).
+   * Off by default: it grants a Logs Insights query on the spans log group,
+   * and a role that can run a query there can read span content, which can
+   * include prompts and tool output.
+   */
+  readonly spanSessionDiscovery?: boolean;
+  /** Log groups holding the Runtimes' spans, for `spanSessionDiscovery`. Defaults to `aws/spans`. */
   readonly spansLogGroupNames?: readonly string[];
 }
 
@@ -93,20 +105,24 @@ export class PortalContainmentTargetRole extends Construct {
           resources: [`arn:${Aws.PARTITION}:bedrock-agentcore:${stack.region}:${stack.account}:runtime/*`],
         }),
         new PolicyStatement({
-          sid: "FindRuntimeSessions",
-          effect: Effect.ALLOW,
-          actions: [...PORTAL_CONTAINMENT_TARGET_LOGS_QUERY_ACTIONS],
-          resources: (props.spansLogGroupNames ?? ["aws/spans"]).map(
-            (name) => `arn:${Aws.PARTITION}:logs:${stack.region}:${stack.account}:log-group:${name}:*`,
-          ),
-        }),
-        new PolicyStatement({
           sid: "FindRuntimeSessionStreams",
           effect: Effect.ALLOW,
           actions: [...PORTAL_CONTAINMENT_TARGET_LOG_STREAM_ACTIONS],
           resources: [
             `arn:${Aws.PARTITION}:logs:${stack.region}:${stack.account}:log-group:${PORTAL_RUNTIME_LOG_GROUP_PREFIX}*`,
           ],
+        }),
+      ],
+    });
+    if (props.spanSessionDiscovery) {
+      policy.addStatements(
+        new PolicyStatement({
+          sid: "FindRuntimeSessionsInSpans",
+          effect: Effect.ALLOW,
+          actions: [...PORTAL_CONTAINMENT_TARGET_LOGS_QUERY_ACTIONS],
+          resources: (props.spansLogGroupNames ?? ["aws/spans"]).map(
+            (name) => `arn:${Aws.PARTITION}:logs:${stack.region}:${stack.account}:log-group:${name}:*`,
+          ),
         }),
         new PolicyStatement({
           sid: "ReadSessionQueryResults",
@@ -115,15 +131,15 @@ export class PortalContainmentTargetRole extends Construct {
           resources: ["*"],
           conditions: { StringEquals: { "aws:RequestedRegion": stack.region } },
         }),
-      ],
-    });
+      );
+    }
     NagSuppressions.addResourceSuppressions(
       policy,
       [
         {
           id: "AwsSolutions-IAM5",
           reason:
-            "SEC-050: containment must reach any Runtime of this cell, including ones deployed after this role; the Runtime statement is scoped to this account and Region's Runtimes and to five actions; log stream names are listed only in the log groups of those Runtimes; Logs Insights results have no resource type and are pinned to the Region.",
+            "SEC-050: containment must reach any Runtime of this cell, including ones deployed after this role; the Runtime statement is scoped to this account and Region's Runtimes and to five actions; log stream names are listed only in the log groups of those Runtimes; with the optional spans source, Logs Insights results have no resource type and are pinned to the Region.",
         },
       ],
       true,

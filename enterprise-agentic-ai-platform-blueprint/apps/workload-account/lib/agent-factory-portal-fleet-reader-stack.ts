@@ -49,7 +49,9 @@ export interface AgentFactoryPortalContainmentStackProps extends StackProps {
   readonly environment: PortalEnvironment;
   readonly platformAccountId: string;
   readonly externalId: string;
-  /** Log groups holding the Runtimes' spans (session discovery). Defaults to `aws/spans`. */
+  /** Also grant the spans query for session discovery. Off by default: it can read span content. */
+  readonly spanSessionDiscovery?: boolean;
+  /** Log groups holding the Runtimes' spans, for the spans option. Defaults to `aws/spans`. */
   readonly spansLogGroupNames?: readonly string[];
 }
 
@@ -61,12 +63,14 @@ export interface AgentFactoryPortalContainmentStackProps extends StackProps {
  */
 export class AgentFactoryPortalContainmentStack extends Stack {
   constructor(scope: Construct, id: string, props: AgentFactoryPortalContainmentStackProps) {
-    const { environment, platformAccountId, externalId, spansLogGroupNames, ...stackProps } = props;
+    const { environment, platformAccountId, externalId, spanSessionDiscovery, spansLogGroupNames, ...stackProps } =
+      props;
     super(scope, id, stackProps);
     const target = new PortalContainmentTargetRole(this, "ContainmentTarget", {
       environment,
       platformAccountId,
       externalId,
+      spanSessionDiscovery,
       spansLogGroupNames,
     });
     new CfnOutput(this, "PortalContainmentTargetRoleArn", { value: target.role.roleArn });
